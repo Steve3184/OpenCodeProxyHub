@@ -1,4 +1,4 @@
-# 本地开发覆盖文件：从当前源码构建镜像，而不是拉取 Docker Hub 上的发布镜像。
+# 本地开发覆盖文件：从当前源码构建镜像，而不是拉取 GHCR 上的发布镜像。
 # 用法：
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 # 其余配置（端口、卷、Redis、健康检查等）继承自 docker-compose.yml。

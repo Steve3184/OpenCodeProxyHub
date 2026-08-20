@@ -188,7 +188,14 @@ export const registerAdminRoutes = async (
 
   app.post<{ Params: { id: string } }>("/admin/proxies/:id/test", async (request, reply) => {
     try {
-      const proxy = await proxyPool.test(request.params.id);
+      const proxy = await proxyPool.test(request.params.id, {
+        hostname: config.zenHost,
+        path: config.zenPath,
+        model: modelStore.isEnabled(config.proxyHealthCheckModel)
+          ? config.proxyHealthCheckModel
+          : modelStore.enabledIds()[0] || config.proxyHealthCheckModel,
+        timeoutMs: config.proxyHealthCheckTimeoutMs,
+      });
       audit(request, "proxy.test", "success", { targetId: request.params.id, targetName: proxy.name });
       return reply.send({ data: proxy });
     } catch (error) {

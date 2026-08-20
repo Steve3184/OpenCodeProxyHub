@@ -23,6 +23,7 @@ const proxyModes = [
 ] as const;
 
 const stateBadge = (proxy: ProxyNode): { label: string; variant: "muted" | "warning" | "info" | "destructive" | "success" } => {
+  if (!proxy.enabled && proxy.autoDisabledBy429) return { label: "429 自动禁用", variant: "warning" };
   if (!proxy.enabled) return { label: "已禁用", variant: "muted" };
   if (proxy.consecutiveRateLimitCount >= 3) return { label: "429 风险", variant: "warning" };
   if (proxy.cooldownUntil && Date.parse(proxy.cooldownUntil) > Date.now()) return { label: "冷却中", variant: "info" };
@@ -67,7 +68,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
           <InfoCard icon={<Route size={16} className="text-primary" />} title="当前策略" value="优先填充" sub="高权重节点优先，同权重按顺序" />
         </motion.div>
         <motion.div variants={fadeUp}>
-          <InfoCard icon={<AlertTriangle size={16} className="text-warning" />} title="429 熔断" value="连续 5 次" sub="触发后自动禁用，需手动开启" />
+          <InfoCard icon={<AlertTriangle size={16} className="text-warning" />} title="429 熔断" value="连续 5 次" sub="每 10 分钟发起模型探测，成功后自动恢复" />
         </motion.div>
         <motion.div variants={fadeUp}>
           <InfoCard icon={<CheckCircle2 size={16} className="text-success" />} title="优先节点" value={prioritized?.name || "无可用"} sub="按权重与可用性选出" />
@@ -217,7 +218,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
             </span>
             <h3 className="mt-3 text-sm font-semibold">尚未配置出口节点</h3>
             <p className="mt-1 max-w-md text-xs text-muted-foreground">
-              添加 HTTP、HTTPS 或 SOCKS5 代理后，网关会优先填充第一个可用节点，连续 5 次 429 会自动禁用该节点。
+              添加 HTTP、HTTPS 或 SOCKS5 代理后，网关会优先填充第一个可用节点；连续 5 次 429 会自动禁用，并在恢复探测成功后重新启用。
             </p>
           </div>
         </Card>
@@ -227,7 +228,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
         variants={staggerContainer}
         initial="hidden"
         animate="show"
-        className="grid grid-cols-1 gap-4 lg:grid-cols-2"
+        className="proxy-grid"
       >
         {proxies.map((proxy) => {
           const badge = stateBadge(proxy);
@@ -287,7 +288,12 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                   </div>
                 </div>
 
-                {proxy.lastError && <p className="mt-2 truncate text-xs text-destructive">最后错误：{proxy.lastError}</p>}
+                {proxy.lastError && <p className="mt-2 break-words text-xs text-destructive">最后错误：{proxy.lastError}</p>}
+                {proxy.autoDisabledBy429 && !proxy.enabled && (
+                  <p className="mt-1 text-xs text-warning/90">
+                    自动恢复探测：{proxy.lastRecoveryTestAt ? new Date(proxy.lastRecoveryTestAt).toLocaleString() : "等待下一轮（10 分钟）"}
+                  </p>
+                )}
 
                 <div className="mt-4 flex flex-wrap gap-2">
                   <Button variant="ghost" size="sm" disabled={busy} onClick={() => toggleProxy(proxy)}>

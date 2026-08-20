@@ -42,6 +42,9 @@ export interface AppConfig {
   proxyMode: "direct" | "optional" | "required";
   outboundPreProxyEnabled: boolean;
   outboundPreProxyUrl: string;
+  proxyHealthCheckModel: string;
+  proxyHealthCheckTimeoutMs: number;
+  proxyRecoveryIntervalMs: number;
 }
 
 export const loadConfig = (): AppConfig => ({
@@ -67,4 +70,7 @@ export const loadConfig = (): AppConfig => ({
   proxyMode: proxyModeFromEnv(),
   outboundPreProxyEnabled: boolFromEnv("OUTBOUND_PRE_PROXY_ENABLED", false),
   outboundPreProxyUrl: process.env.OUTBOUND_PRE_PROXY_URL || "",
+  proxyHealthCheckModel: process.env.PROXY_HEALTH_CHECK_MODEL?.trim() || "deepseek-v4-flash-free",
+  proxyHealthCheckTimeoutMs: Math.max(1000, intFromEnv("PROXY_HEALTH_CHECK_TIMEOUT_MS", 10000)),
+  proxyRecoveryIntervalMs: Math.max(1000, intFromEnv("PROXY_RECOVERY_INTERVAL_MS", 10 * 60 * 1000)),
 });

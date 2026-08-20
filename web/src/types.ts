@@ -63,6 +63,8 @@ export interface ProxyNode {
   dailyCountDate: string;
   autoDisableWhenDailyLimitReached: boolean;
   consecutiveRateLimitCount: number;
+  autoDisabledBy429: boolean;
+  lastRecoveryTestAt: string | null;
   cooldownUntil: string | null;
   successCount: number;
   failCount: number;

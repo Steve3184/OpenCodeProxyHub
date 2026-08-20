@@ -1,6 +1,6 @@
 services:
   app:
-    image: jlny/opencode-proxy-hub:latest
+    image: ${OPENCODE_PROXY_HUB_IMAGE:-ghcr.io/steve3184/opencodeproxyhub:latest}
     restart: unless-stopped
     depends_on:
       redis:

@@ -53,14 +53,21 @@ OpenCodeProxyHub 默认内置以下免费模型，均可通过 OpenAI 兼容接�
 
 ```bash
 # 1. 下载编排文件与环境模板
-curl -O https://raw.githubusercontent.com/JiuliNuoyi/OpenCodeProxyHub/main/docker-compose.yml
-curl -O https://raw.githubusercontent.com/JiuliNuoyi/OpenCodeProxyHub/main/.env.docker.example
+curl -O https://raw.githubusercontent.com/Steve3184/OpenCodeProxyHub/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/Steve3184/OpenCodeProxyHub/main/.env.docker.example
 
 # 2. 准备环境文件，并设置一个强密码
 cp .env.docker.example .env.docker
 #   编辑 .env.docker，把 ADMIN_PASSWORD 改成强密码
 
-# 3. 启动（自动从 Docker Hub 拉取 jlny/opencode-proxy-hub 镜像）
+# 3. 启动（自动从 GHCR 拉取本 fork 的镜像）
+docker compose up -d
+```
+
+默认应用镜像为 `ghcr.io/steve3184/opencodeproxyhub:latest`。如果你部署的是自己的 fork，先设置对应的 GHCR 镜像地址：
+
+```bash
+export OPENCODE_PROXY_HUB_IMAGE=ghcr.io/<你的 GitHub 用户名>/<你的仓库名>:latest
 docker compose up -d
 ```
 
@@ -135,7 +142,7 @@ npm start            # 运行已构建的 dist/main.js
 - **出口代理池**
   - 支持 HTTP / HTTPS / SOCKS5 节点
   - **优先填充**选择策略：按权重从高到低，持续使用第一个可用节点，直到其禁用 / 冷却 / 达到并发或每日上限
-  - 连续 5 次上游 429 自动禁用节点；非 429 失败进入冷却（默认 5 分钟）
+  - 连续 5 次上游 429 自动禁用节点；后台每 10 分钟发起一次最小模型请求探测，成功后自动恢复；非 429 失败进入冷却（默认 5 分钟）
   - 每日请求上限与按日自动重置，可选“达上限自动禁用 / 次日自动恢复”
   - 节点连通性测试、成功/失败计数、最近 20 次请求结果（用于前端可视化）
   - **代理使用模式**：可在控制台选择直连、优先代理或强制代理；优先代理模式下无可用节点会自动直连
@@ -234,7 +241,7 @@ web/src/
 
 ### 代理选择逻辑（优先填充，非轮询）
 
-从所有“启用、未冷却、未达每日上限、未达并发上限”的节点中，**按权重从高到低排序，始终取第一个**。也就是说高权重节点会被持续打满，直到它不可用，才轮到下一个——而不是请求在节点间轮转。节点连续 5 次上游 429 自动禁用（需手动重启用），其他失败进入冷却（默认 5 分钟）。
+从所有“启用、未冷却、未达每日上限、未达并发上限”的节点中，**按权重从高到低排序，始终取第一个**。也就是说高权重节点会被持续打满，直到它不可用，才轮到下一个——而不是请求在节点间轮转。节点连续 5 次上游 429 自动禁用，后台每 10 分钟通过模型请求探测一次，收到 2xx 后自动重新启用；其他失败进入冷却（默认 5 分钟）。
 
 ## 调用示例
 
@@ -305,6 +312,9 @@ PROXY_MODE=optional                     # 代理使用模式：direct / optional
 OUTBOUND_PRE_PROXY_ENABLED=false        # 是否启用链式前置代理
 OUTBOUND_PRE_PROXY_URL=                 # 前置代理地址（http/https）
 REQUIRE_PROXY=false                     # 兼容旧配置；未设置 PROXY_MODE 时 true 等价于 required
+PROXY_HEALTH_CHECK_MODEL=deepseek-v4-flash-free # 429 自动恢复探测使用的模型
+PROXY_HEALTH_CHECK_TIMEOUT_MS=10000     # 单次恢复探测超时（毫秒）
+PROXY_RECOVERY_INTERVAL_MS=600000       # 429 自动恢复探测间隔（默认 10 分钟）
 ```
 
 设置项中的 `upstreamTimeoutMs`、代理使用模式、前置代理开关与地址等也可在运行时通过控制台或 `PATCH /admin/settings` **热更新**，无需重启。
@@ -314,7 +324,7 @@ REQUIRE_PROXY=false                     # 兼容旧配置；未设置 PROXY_MODE
 - 代理使用模式支持三种：`direct` 强制直连，`optional` 有可用代理则使用、否则直连，`required` 必须使用代理、无可用节点则失败。
 - 代理池节点正常情况下**直连**自己配置的代理 URL。
 - 选择策略为**优先填充**：按权重从高到低排序，持续使用第一个“启用、未冷却、未达每日上限、未达并发上限”的节点。
-- 节点连续 5 次收到上游 429 会被自动禁用，需手动重新启用；其他失败会进入冷却（默认 5 分钟）。
+- 节点连续 5 次收到上游 429 会被自动禁用；后台每 10 分钟通过最小模型请求探测，收到 2xx 后自动重新启用。手动禁用和每日上限禁用不会被后台自动开启；其他失败会进入冷却（默认 5 分钟）。
 - 若节点无法直连、需要先经本机代理出网，可启用**链式前置代理**：
 
 ```text
@@ -446,4 +456,3 @@ OpenCodeProxyHub 独立维护，与 OpenCode、`opencode-free-proxy` 及任何�
 - **v0.1.0**：初始发布
 
 完整变更记录见 Git 提交历史。
-

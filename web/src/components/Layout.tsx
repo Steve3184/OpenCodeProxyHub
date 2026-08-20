@@ -54,7 +54,7 @@ export function Layout({ view, onSelect, busy, statusText, authModeLabel, onRefr
           </div>
         </header>
         <main className="oph-scroll flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-6xl px-4 py-6 md:px-6">{children}</div>
+          <div className="mx-auto max-w-[1800px] px-4 py-6 md:px-6">{children}</div>
         </main>
       </div>
     </div>

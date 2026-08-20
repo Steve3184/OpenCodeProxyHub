@@ -41,8 +41,25 @@ export const buildApp = async (config: AppConfig) => {
   keyStore.load();
   const modelStore = new ModelConfigStore(config.modelsFile);
   modelStore.load();
+  const proxyHealthCheckModel = () => modelStore.isEnabled(config.proxyHealthCheckModel)
+    ? config.proxyHealthCheckModel
+    : modelStore.enabledIds()[0] || config.proxyHealthCheckModel;
   const proxyPool = new ProxyPoolStore(config.proxiesFile, settingsStore);
   proxyPool.load();
+  const proxyRecoveryTimer = setInterval(() => {
+    void proxyPool.recoverRateLimitedProxies({
+      hostname: config.zenHost,
+      path: config.zenPath,
+      model: proxyHealthCheckModel(),
+      timeoutMs: config.proxyHealthCheckTimeoutMs,
+      recoveryIntervalMs: config.proxyRecoveryIntervalMs,
+    }).then((summary) => {
+      if (summary.tested > 0) app.log.info(summary, "proxy_recovery_check_completed");
+    }).catch((error) => {
+      app.log.warn({ error }, "proxy_recovery_check_failed");
+    });
+  }, config.proxyRecoveryIntervalMs);
+  proxyRecoveryTimer.unref();
   const sessions = new SessionStore();
   const requestTracker = new RequestTracker();
   const limiter = await createLimiter({
@@ -53,6 +70,7 @@ export const buildApp = async (config: AppConfig) => {
   }, config.redisUrl, config.redisKeyPrefix);
   app.log.info({ limiter: await limiter.snapshot() }, "limiter_ready");
   app.addHook("onClose", async () => {
+    clearInterval(proxyRecoveryTimer);
     const drained = await requestTracker.drain(config.shutdownDrainTimeoutMs);
     if (!drained) app.log.warn({ runtime: requestTracker.snapshot() }, "shutdown_drain_timeout");
     await limiter.close();

@@ -5,6 +5,7 @@ import { SocksProxyAgent } from "socks-proxy-agent";
 import { JsonFileStore } from "../storage/jsonFile.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { HttpPreProxyToHttpAgent, HttpPreProxyToSocksAgent } from "./chainedAgent.js";
+import { ocId } from "../utils/ids.js";
 
 export type ProxyType = "http" | "https" | "socks5";
 
@@ -22,6 +23,8 @@ export interface ProxyNode {
   dailyCountDate: string;
   autoDisableWhenDailyLimitReached: boolean;
   consecutiveRateLimitCount: number;
+  autoDisabledBy429: boolean;
+  lastRecoveryTestAt: string | null;
   cooldownUntil: string | null;
   successCount: number;
   failCount: number;
@@ -59,11 +62,32 @@ export interface ProxyLease {
   requiredUnavailable?: boolean;
 }
 
+export interface ProxyModelTestOptions {
+  hostname: string;
+  path: string;
+  model: string;
+  timeoutMs: number;
+  recoveryIntervalMs?: number;
+}
+
+export interface ProxyRecoverySummary {
+  tested: number;
+  recovered: number;
+}
+
+const DEFAULT_MODEL_TEST_OPTIONS: ProxyModelTestOptions = {
+  hostname: "opencode.ai",
+  path: "/zen/v1/chat/completions",
+  model: "deepseek-v4-flash-free",
+  timeoutMs: 10000,
+};
+
 const today = () => new Date().toISOString().slice(0, 10);
 
 export class ProxyPoolStore {
   private readonly store: JsonFileStore<ProxyFile>;
   private proxies: ProxyNode[] = [];
+  private readonly recoveryTestsInFlight = new Set<string>();
 
   constructor(proxiesFile: string, private readonly settingsStore: SettingsStore) {
     this.store = new JsonFileStore<ProxyFile>(proxiesFile);
@@ -99,7 +123,13 @@ export class ProxyPoolStore {
       node.enabled = input.enabled;
       if (input.enabled) {
         node.consecutiveRateLimitCount = 0;
+        node.autoDisabledBy429 = false;
+        node.lastRecoveryTestAt = null;
         if (node.lastError === "Disabled after 5 consecutive 429 responses") node.lastError = null;
+      } else {
+        // A manual disable must never be mistaken for a 429 circuit break.
+        node.autoDisabledBy429 = false;
+        node.lastRecoveryTestAt = null;
       }
     }
     if (input.weight !== undefined) node.weight = Math.max(1, Math.trunc(input.weight));
@@ -153,9 +183,9 @@ export class ProxyPoolStore {
     const node = this.find(id);
     if (!node) return;
     node.successCount += 1;
-    node.consecutiveRateLimitCount = 0;
+    if (!node.autoDisabledBy429) node.consecutiveRateLimitCount = 0;
     this.recordResult(node, true, 200);
-    node.lastError = null;
+    if (!node.autoDisabledBy429) node.lastError = null;
     node.lastCheckedAt = new Date().toISOString();
     this.release(id);
   }
@@ -171,36 +201,102 @@ export class ProxyPoolStore {
       node.consecutiveRateLimitCount += 1;
       if (node.consecutiveRateLimitCount >= 5) {
         node.enabled = false;
+        node.autoDisabledBy429 = true;
+        node.lastRecoveryTestAt = null;
         node.cooldownUntil = null;
         node.lastError = "Disabled after 5 consecutive 429 responses";
       }
     } else {
-      node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? 5 * 60 * 1000)).toISOString();
+      if (!node.autoDisabledBy429) {
+        node.consecutiveRateLimitCount = 0;
+        node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? 5 * 60 * 1000)).toISOString();
+      }
     }
     this.release(id);
   }
 
-  async test(id: string): Promise<ProxyNode> {
+  async test(id: string, options: ProxyModelTestOptions = DEFAULT_MODEL_TEST_OPTIONS): Promise<ProxyNode> {
     const node = this.find(id);
     if (!node) throw new Error("Proxy not found");
     this.validateNode(node);
 
-    await new Promise<void>((resolve, reject) => {
-      const req = https.get("https://opencode.ai/", { agent: this.createAgent(node), timeout: 10000 }, (res) => {
-        res.resume();
-        res.on("end", () => resolve());
-      });
-      req.on("error", reject);
-      req.on("timeout", () => {
-        req.destroy();
-        reject(new Error("Proxy test timeout"));
-      });
-    });
+    const checkedAt = new Date().toISOString();
+    try {
+      const statusCode = await this.requestModelHealthCheck(node, options);
+      if (statusCode < 200 || statusCode >= 300) {
+        throw new Error(`Model health check returned HTTP ${statusCode}`);
+      }
+      node.lastCheckedAt = checkedAt;
+      if (node.autoDisabledBy429 && !node.enabled) node.lastRecoveryTestAt = checkedAt;
+      node.lastError = null;
+      this.recordResult(node, true, statusCode);
+      this.persist();
+      return { ...node };
+    } catch (error) {
+      node.lastCheckedAt = checkedAt;
+      if (node.autoDisabledBy429 && !node.enabled) node.lastRecoveryTestAt = checkedAt;
+      node.lastError = error instanceof Error ? error.message : "Model health check failed";
+      this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
+      this.persist();
+      throw error;
+    }
+  }
 
-    node.lastCheckedAt = new Date().toISOString();
-    node.lastError = null;
-    this.persist();
-    return { ...node };
+  async recoverRateLimitedProxies(options: ProxyModelTestOptions): Promise<ProxyRecoverySummary> {
+    const now = Date.now();
+    const candidates = this.proxies.filter((node) => {
+      if (node.enabled || !node.autoDisabledBy429 || this.recoveryTestsInFlight.has(node.id)) return false;
+      if (!node.lastRecoveryTestAt) return true;
+      const lastTestAt = Date.parse(node.lastRecoveryTestAt);
+      return !Number.isFinite(lastTestAt) || now - lastTestAt >= (options.recoveryIntervalMs ?? 10 * 60 * 1000);
+    });
+    if (candidates.length === 0) return { tested: 0, recovered: 0 };
+
+    const queue = [...candidates];
+    let tested = 0;
+    let recovered = 0;
+    const worker = async (): Promise<void> => {
+      while (queue.length > 0) {
+        const node = queue.shift();
+        if (!node) return;
+        if (node.enabled || !node.autoDisabledBy429 || this.recoveryTestsInFlight.has(node.id)) continue;
+
+        this.recoveryTestsInFlight.add(node.id);
+        node.lastRecoveryTestAt = new Date().toISOString();
+        this.persist();
+        tested += 1;
+        const wasAutoDisabled = node.autoDisabledBy429 && !node.enabled;
+        try {
+          const statusCode = await this.requestModelHealthCheck(node, options);
+          // Do not overwrite a manual enable/disable that happened while the probe was in flight.
+          if (wasAutoDisabled && node.autoDisabledBy429 && !node.enabled && statusCode >= 200 && statusCode < 300) {
+            node.enabled = true;
+            node.autoDisabledBy429 = false;
+            node.consecutiveRateLimitCount = 0;
+            node.cooldownUntil = null;
+            node.lastError = null;
+            recovered += 1;
+          } else if (wasAutoDisabled && node.autoDisabledBy429 && !node.enabled) {
+            node.lastError = `Model health check returned HTTP ${statusCode}`;
+          }
+          node.lastCheckedAt = new Date().toISOString();
+          this.recordResult(node, statusCode >= 200 && statusCode < 300, statusCode);
+        } catch (error) {
+          if (wasAutoDisabled && node.autoDisabledBy429 && !node.enabled) {
+            node.lastError = error instanceof Error ? error.message : "Model health check failed";
+            node.lastCheckedAt = new Date().toISOString();
+            this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
+          }
+        } finally {
+          this.recoveryTestsInFlight.delete(node.id);
+          this.persist();
+        }
+      }
+    };
+
+    const workerCount = Math.min(4, candidates.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return { tested, recovered };
   }
 
   private buildNode(input: ProxyInput): ProxyNode {
@@ -219,6 +315,8 @@ export class ProxyPoolStore {
       dailyCountDate: today(),
       autoDisableWhenDailyLimitReached: input.autoDisableWhenDailyLimitReached ?? false,
       consecutiveRateLimitCount: 0,
+      autoDisabledBy429: false,
+      lastRecoveryTestAt: null,
       cooldownUntil: null,
       successCount: 0,
       failCount: 0,
@@ -271,6 +369,8 @@ export class ProxyPoolStore {
       dailyRequestCount: node.dailyRequestCount || 0,
       autoDisableWhenDailyLimitReached: Boolean(node.autoDisableWhenDailyLimitReached),
       consecutiveRateLimitCount: node.consecutiveRateLimitCount || 0,
+      autoDisabledBy429: Boolean(node.autoDisabledBy429 || (!node.enabled && node.lastError === "Disabled after 5 consecutive 429 responses")),
+      lastRecoveryTestAt: node.lastRecoveryTestAt || null,
       recentResults: node.recentResults || [],
     };
   }
@@ -283,7 +383,99 @@ export class ProxyPoolStore {
     if (node.dailyRequestLimit === 0 || node.dailyRequestCount < node.dailyRequestLimit) return;
     if (!node.autoDisableWhenDailyLimitReached) return;
     node.enabled = false;
+    node.autoDisabledBy429 = false;
+    node.lastRecoveryTestAt = null;
     node.lastError = "Daily request limit reached";
+  }
+
+  private requestModelHealthCheck(node: ProxyNode, options: ProxyModelTestOptions): Promise<number> {
+    const body = JSON.stringify({
+      model: options.model,
+      messages: [{ role: "user", content: "ping" }],
+      stream: false,
+      max_tokens: 1,
+    });
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        callback();
+      };
+      const req = https.request({
+        hostname: options.hostname,
+        port: 443,
+        path: options.path,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          Authorization: "Bearer public",
+          "User-Agent": "opencode/1.15.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
+          "x-opencode-client": "cli",
+          "x-opencode-project": "global",
+          "x-opencode-request": ocId("proxy-health"),
+          "x-opencode-session": `proxy-health-check-${node.id}`,
+        },
+        agent: this.createAgent(node),
+        timeout: options.timeoutMs,
+      }, (res) => {
+        const statusCode = res.statusCode || 502;
+        const chunks: Buffer[] = [];
+        let responseBytes = 0;
+        res.on("data", (chunk: Buffer) => {
+          responseBytes += chunk.length;
+          if (responseBytes > 64 * 1024) {
+            res.destroy(new Error("Model health check response is too large"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.once("end", () => finish(() => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          if (statusCode >= 200 && statusCode < 300) {
+            try {
+              const parsed = JSON.parse(raw) as { choices?: unknown[]; error?: { message?: string } | string; type?: string };
+              if (parsed.error || parsed.type === "error" || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error")) {
+                const message = typeof parsed.error === "string" ? parsed.error : parsed.error?.message;
+                const error = new Error(`Model health check returned an upstream error${message ? `: ${message}` : ""}`) as Error & { statusCode?: number };
+                error.statusCode = statusCode;
+                reject(error);
+                return;
+              }
+              if (!Array.isArray(parsed.choices) || parsed.choices.length === 0) {
+                const error = new Error("Model health check returned no choices") as Error & { statusCode?: number };
+                error.statusCode = statusCode;
+                reject(error);
+                return;
+              }
+            } catch {
+              const error = new Error("Model health check returned invalid JSON") as Error & { statusCode?: number };
+              error.statusCode = statusCode;
+              reject(error);
+              return;
+            }
+          }
+          resolve(statusCode);
+        }));
+        res.once("error", (error) => finish(() => reject(error)));
+      });
+      req.once("error", (error) => finish(() => reject(error)));
+      req.once("timeout", () => {
+        req.destroy();
+        finish(() => reject(new Error("Proxy model health check timeout")));
+      });
+      req.write(body);
+      req.end();
+    });
+  }
+
+  private statusCodeFromHealthCheckError(error: unknown): number {
+    const statusCode = (error as { statusCode?: unknown })?.statusCode;
+    if (typeof statusCode === "number" && Number.isInteger(statusCode)) return statusCode;
+    const message = error instanceof Error ? error.message : "";
+    const match = message.match(/HTTP (\d{3})/);
+    return match ? Number(match[1]) : 502;
   }
 
   private find(id: string): ProxyNode | undefined {
