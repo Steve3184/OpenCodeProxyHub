@@ -204,4 +204,17 @@ export const registerAdminRoutes = async (
       return reply.code(400).send({ error: { message } });
     }
   });
+
+  app.post<{ Params: { id: string } }>("/admin/proxies/:id/stats/clear", async (request, reply) => {
+    try {
+      const proxy = proxyPool.clearStats(request.params.id);
+      audit(request, "proxy.stats.clear", "success", { targetId: proxy.id, targetName: proxy.name });
+      return reply.send({ data: proxy });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to clear proxy statistics";
+      const status = message === "Proxy not found" ? 404 : 400;
+      audit(request, "proxy.stats.clear", "failure", { targetId: request.params.id, error: message });
+      return reply.code(status).send({ error: { message } });
+    }
+  });
 };

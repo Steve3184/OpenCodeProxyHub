@@ -141,7 +141,7 @@ Proxy-pool node types supported in chained mode: `http`, `https`, and `socks5`.
 
 If `OUTBOUND_PRE_PROXY_ENABLED=false`, proxy-pool nodes use the original direct single-proxy behavior.
 
-Proxy selection uses priority fill. The first available enabled node is used until it is unavailable, full, daily-limited, or disabled. A node is automatically disabled after 5 consecutive upstream 429 responses; every 10 minutes the app sends a minimal model request through each 429-disabled node and re-enables it after a 2xx response. Manual disables and daily-limit disables are not auto-reenabled. Use `PROXY_MODE=required` when requests must never fall back to direct upstream access.
+Proxy selection uses priority fill. The first available enabled node is used until it is unavailable, full, daily-limited, or disabled. On an upstream 429, the request switches to another available node and retries once; a node is automatically disabled after 5 consecutive upstream 429 responses. Every 10 minutes the app sends a minimal model request through each 429-disabled node and re-enables it after a 2xx response. Manual disables and daily-limit disables are not auto-reenabled. Use `PROXY_MODE=required` when requests must never fall back to direct upstream access.
 
 The published application image is hosted on GHCR. The default Compose image for this fork is `ghcr.io/steve3184/opencodeproxyhub:latest`; set `OPENCODE_PROXY_HUB_IMAGE` before starting Compose when deploying a different fork.
 

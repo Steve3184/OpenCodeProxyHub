@@ -4,6 +4,7 @@ import { ocId } from "../utils/ids.js";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
+import { extractTokenUsage } from "../utils/tokenUsage.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -184,6 +185,8 @@ export const pipeAnthropicSseAsOpenAI = (
   res: ServerResponse,
   proxyPool?: ProxyPoolStore,
   metrics?: MetricsStore,
+  retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
+  retryAttempt = false,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -197,6 +200,22 @@ export const pipeAnthropicSseAsOpenAI = (
   let buffer = "";
   let markedFailure = false;
   let receivedData = false;
+  let retryStarted = false;
+  let observedTotalTokens: number | null = null;
+  let observedUsageTokens = 0;
+  let observedUsage = false;
+  let observedOutputChars = 0;
+
+  const retryRateLimited = (): boolean => {
+    if (retryAttempt || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
+    const excluded = new Set<string>();
+    if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
+    const retryPrepared = retryPrepare(excluded);
+    if (retryPrepared.lease?.requiredUnavailable) return false;
+    retryStarted = true;
+    pipeAnthropicSseAsOpenAI(retryPrepared, model, res, proxyPool, metrics, retryPrepare, true);
+    return true;
+  };
 
   const req = https.request(prepared.options, (zenRes) => {
     zenRes.on("data", (chunk: Buffer) => {
@@ -206,8 +225,19 @@ export const pipeAnthropicSseAsOpenAI = (
       if (!res.headersSent && isPlainJson(buffer)) {
         try {
           const parsed = JSON.parse(buffer);
-          if (parsed.error || parsed.type === "error" || zenRes.statusCode && zenRes.statusCode >= 400) {
+          if (parsed.error || parsed.type === "error" || zenRes.statusCode === 429) {
             const message = parsed.error?.message || parsed.message || "Upstream error";
+            const rateLimited = zenRes.statusCode === 429 || buffer.includes("FreeUsageLimitError") || buffer.includes("rate_limit_error") || buffer.toLowerCase().includes("rate limit");
+            if (rateLimited) {
+              if (prepared.lease?.node && proxyPool) {
+                proxyPool.markFailure(prepared.lease.node.id, message, { statusCode: 429 });
+                markedFailure = true;
+              }
+              if (retryRateLimited()) {
+                zenRes.resume();
+                return;
+              }
+            }
             writeOpenAiError(res, zenRes.statusCode || 502, message);
             zenRes.resume();
             return;
@@ -227,7 +257,16 @@ export const pipeAnthropicSseAsOpenAI = (
         }
         if (!block.data) continue;
         try {
-          handleParsedPayload(state, res, JSON.parse(block.data));
+          const parsed = JSON.parse(block.data);
+          const usage = extractTokenUsage(parsed);
+          if (usage.totalTokens !== null) {
+            observedUsage = true;
+            if (usage.inputTokens > 0 && usage.outputTokens > 0) observedTotalTokens = usage.totalTokens;
+            else observedUsageTokens += usage.totalTokens;
+          }
+          const text = parsed.delta?.text || parsed.delta?.thinking || parsed.content_block?.text;
+          if (typeof text === "string") observedOutputChars += text.length;
+          handleParsedPayload(state, res, parsed);
         } catch {
           // Ignore malformed SSE payloads rather than corrupting the OpenAI stream.
         }
@@ -235,9 +274,22 @@ export const pipeAnthropicSseAsOpenAI = (
     });
 
     zenRes.on("end", () => {
+      if (retryStarted) return;
+      if ((zenRes.statusCode || 502) === 429) {
+        if (prepared.lease?.node && proxyPool && !markedFailure) {
+          proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429 });
+          markedFailure = true;
+        }
+        if (retryRateLimited()) return;
+        writeOpenAiError(res, 429, "Upstream returned 429");
+        if (!res.writableEnded) res.end();
+        metrics?.recordUpstream({ statusCode: 429, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+        return;
+      }
       if (prepared.lease?.node && proxyPool && !markedFailure) {
-        if ((zenRes.statusCode || 502) === 429) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429 });
-        else proxyPool.markSuccess(prepared.lease.node.id);
+        proxyPool.markSuccess(prepared.lease.node.id);
+        const inputTokens = Math.ceil(prepared.body.length / 4);
+        proxyPool.recordTokenUsage(prepared.lease.node.id, observedTotalTokens ?? (observedUsage ? observedUsageTokens : inputTokens + Math.ceil(observedOutputChars / 4)));
       }
       metrics?.recordUpstream({ statusCode: zenRes.statusCode || 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
 
@@ -255,6 +307,7 @@ export const pipeAnthropicSseAsOpenAI = (
   });
 
   req.on("error", (error) => {
+    if (retryStarted) return;
     if (prepared.lease?.node && proxyPool && !markedFailure) {
       proxyPool.markFailure(prepared.lease.node.id, error.message);
       markedFailure = true;
@@ -268,6 +321,7 @@ export const pipeAnthropicSseAsOpenAI = (
   });
 
   req.on("timeout", () => {
+    if (retryStarted) return;
     req.destroy();
     if (prepared.lease?.node && proxyPool && !markedFailure) {
       proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout");

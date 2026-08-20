@@ -22,6 +22,30 @@ export interface ToastMessage {
 
 let toastSeq = 0;
 
+const copyText = async (value: string): Promise<void> => {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall through to the legacy path for HTTP and restricted browser contexts.
+    }
+  }
+  if (typeof document === "undefined") throw new Error("当前浏览器不支持复制到剪贴板");
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("复制失败，请手动选择并复制");
+};
+
 export function useConsoleData() {
   const [token, setToken] = useState("");
   const [draftToken, setDraftToken] = useState(() => localStorage.getItem("oph_admin_token") || "");
@@ -179,7 +203,7 @@ export function useConsoleData() {
 
   const copyCreatedKey = async () => {
     if (!lastCreatedKey) return;
-    await navigator.clipboard.writeText(lastCreatedKey);
+    await copyText(lastCreatedKey);
     pushToast("新 API key 已复制到剪贴板", "success");
   };
 
@@ -190,7 +214,7 @@ export function useConsoleData() {
           throw new Error("该 API Key 创建时未保存明文，无法复制；请重新创建一个新 Key。");
         }
         const result = await apiFetch<{ data: { key: string } }>(`/admin/api-keys/${item.id}/secret`, token);
-        await navigator.clipboard.writeText(result.data.key);
+        await copyText(result.data.key);
       },
       { refresh: false, successText: `API Key「${item.name}」已复制到剪贴板` },
     );
@@ -253,6 +277,9 @@ export function useConsoleData() {
   const deleteProxy = (proxy: ProxyNode) =>
     run(() => apiFetch(`/admin/proxies/${proxy.id}`, token, { method: "DELETE" }).then(() => undefined), { successText: `已删除代理「${proxy.name}」` });
 
+  const clearProxyStats = (proxy: ProxyNode) =>
+    run(() => apiFetch(`/admin/proxies/${proxy.id}/stats/clear`, token, { method: "POST" }).then(() => undefined), { successText: `已清空代理「${proxy.name}」统计` });
+
   const refresh = () => run(async () => undefined, { successText: "已刷新数据" });
 
   return {
@@ -295,6 +322,7 @@ export function useConsoleData() {
     toggleProxy,
     testProxy,
     deleteProxy,
+    clearProxyStats,
     refresh,
   };
 }

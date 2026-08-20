@@ -97,7 +97,6 @@ export const registerAnthropicRoutes = async (
         proxyName: node?.name ?? (useProxy(currentSettings) ? null : "direct"),
         proxyType: node?.type ?? null,
         viaPreProxy: Boolean(node && currentSettings.outboundPreProxyEnabled && currentSettings.outboundPreProxyUrl),
-        ...(eventLogger.shouldLogPrompts() ? { promptPreview: eventLogger.truncate(messages) } : {}),
         ...extra,
       });
     };
@@ -105,7 +104,7 @@ export const registerAnthropicRoutes = async (
 
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;
-    const prepared = prepareZenRequest(config, {
+    const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model,
       messages,
       stream: isStream,
@@ -113,16 +112,17 @@ export const registerAnthropicRoutes = async (
       toolChoice,
       parameters,
       sessionId,
-    }, effectiveProxyPool);
+    }, effectiveProxyPool, excludeProxyIds);
+    const prepared = prepareRequest();
 
     if (isStream) {
       reply.hijack();
-      pipeZenAsAnthropic(prepared, model, reply.raw, inputTokens, effectiveProxyPool, metrics);
+      pipeZenAsAnthropic(prepared, model, reply.raw, inputTokens, effectiveProxyPool, metrics, prepareRequest);
       return;
     }
 
     try {
-      const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics);
+      const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest);
       const result = handleAnthropicFullResponse(zenResp, model, inputTokens);
       return reply.code(result.status).send(result.body);
     } catch (error) {

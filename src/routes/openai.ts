@@ -118,7 +118,6 @@ export const registerOpenAIRoutes = async (
         proxyName: node?.name ?? (useProxy(currentSettings) ? null : "direct"),
         proxyType: node?.type ?? null,
         viaPreProxy: Boolean(node && currentSettings.outboundPreProxyEnabled && currentSettings.outboundPreProxyUrl),
-        ...(currentSettings.logPrompts ? { promptPreview: eventLogger.truncate(messages) } : {}),
         transform: resolveTransform(currentSettings),
         ...extra,
       });
@@ -127,7 +126,7 @@ export const registerOpenAIRoutes = async (
 
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;
-    const prepared = prepareZenRequest(config, {
+    const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model,
       messages,
       stream: isStream,
@@ -135,17 +134,18 @@ export const registerOpenAIRoutes = async (
       toolChoice: tool_choice,
       parameters: { temperature, top_p, max_tokens, stop, presence_penalty, frequency_penalty, response_format, seed, user },
       sessionId,
-    }, effectiveProxyPool);
+    }, effectiveProxyPool, excludeProxyIds);
+    const prepared = prepareRequest();
 
     reply.hijack();
     if (isStream && activeSettings.openAiStreamTransformModels.includes(model)) {
-      pipeAnthropicSseAsOpenAI(prepared, model, reply.raw, effectiveProxyPool, metrics);
+      pipeAnthropicSseAsOpenAI(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest);
       return;
     }
     if (isStream && activeSettings.reasoningTagModels.includes(model)) {
-      pipeOpenAiStreamStrippingThink(prepared, model, reply.raw, effectiveProxyPool, metrics);
+      pipeOpenAiStreamStrippingThink(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest);
       return;
     }
-    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics);
+    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics, prepareRequest);
   });
 };

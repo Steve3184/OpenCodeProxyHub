@@ -36,7 +36,6 @@ export interface SystemSettings {
   requestBodyLimitBytes: number;
   upstreamTimeoutMs: number;
   defaultStream: boolean;
-  logPrompts: boolean;
   openAiStreamTransformModels: string[];
   reasoningTagModels: string[];
   proxyMode: "direct" | "optional" | "required";
@@ -45,7 +44,6 @@ export interface SystemSettings {
   logEnabled: boolean;
   logAudit: boolean;
   logApiRequests: boolean;
-  logMaxBodyChars: number;
   logRetentionDays: number;
 }
 
@@ -68,6 +66,9 @@ export interface ProxyNode {
   cooldownUntil: string | null;
   successCount: number;
   failCount: number;
+  totalTokens: number;
+  dailyTokens: number;
+  dailyTokensDate: string;
   recentResults: Array<{ at: string; ok: boolean; statusCode: number }>;
   lastError: string | null;
   lastUsedAt: string | null;

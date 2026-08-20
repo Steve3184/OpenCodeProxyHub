@@ -3,6 +3,7 @@ import type { ServerResponse } from "node:http";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
+import { extractTokenUsage } from "../utils/tokenUsage.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -144,6 +145,8 @@ export const pipeOpenAiStreamStrippingThink = (
   res: ServerResponse,
   proxyPool?: ProxyPoolStore,
   metrics?: MetricsStore,
+  retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
+  retryAttempt = false,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -159,26 +162,51 @@ export const pipeOpenAiStreamStrippingThink = (
   let receivedData = false;
   let firstChunkChecked = false;
   let aborted = false;
+  let retryStarted = false;
+  let observedTotalTokens: number | null = null;
+  let observedUsageTokens = 0;
+  let observedUsage = false;
+  let observedOutputChars = 0;
+  let rateLimitBody = "";
+
+  const retryRateLimited = (): boolean => {
+    if (retryAttempt || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
+    const excluded = new Set<string>();
+    if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
+    const retryPrepared = retryPrepare(excluded);
+    if (retryPrepared.lease?.requiredUnavailable) return false;
+    retryStarted = true;
+    pipeOpenAiStreamStrippingThink(retryPrepared, _model, res, proxyPool, metrics, retryPrepare, true);
+    return true;
+  };
 
   const req = https.request(prepared.options, (zenRes) => {
     zenRes.on("data", (chunk: Buffer) => {
       if (aborted) return;
+      if (zenRes.statusCode === 429) {
+        rateLimitBody += chunk.toString();
+        return;
+      }
       receivedData = true;
       buffer += chunk.toString();
 
       // First-chunk error/rate-limit detection (mirrors pipeZenOpenAIResponse).
       if (!firstChunkChecked) {
         const str = buffer.trim();
-        if (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes('"error"'))) {
+        if (zenRes.statusCode === 429 || (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes("rate_limit_error") || str.toLowerCase().includes("rate limit")))) {
           try {
             const parsed = JSON.parse(str);
-            if (parsed.error || parsed.type === "error") {
+            if (zenRes.statusCode === 429 || parsed.error || parsed.type === "error") {
               firstChunkChecked = true;
               aborted = true;
               const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
               if (prepared.lease?.node && proxyPool) {
                 proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: 429 });
                 markedFailure = true;
+              }
+              if (retryRateLimited()) {
+                zenRes.resume();
+                return;
               }
               if (!res.headersSent) {
                 res.writeHead(429, { "Content-Type": "application/json" });
@@ -207,6 +235,14 @@ export const pipeOpenAiStreamStrippingThink = (
         sendHeaders(res);
         try {
           const parsed = JSON.parse(block.data);
+          const usage = extractTokenUsage(parsed);
+          if (usage.totalTokens !== null) {
+            observedUsage = true;
+            if (usage.inputTokens > 0 && usage.outputTokens > 0) observedTotalTokens = usage.totalTokens;
+            else observedUsageTokens += usage.totalTokens;
+          }
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (typeof content === "string") observedOutputChars += content.length;
           writeSse(res, rewriteChunk(parsed, splitter));
         } catch {
           // Forward unparseable payloads untouched rather than dropping them.
@@ -216,9 +252,32 @@ export const pipeOpenAiStreamStrippingThink = (
     });
 
     zenRes.on("end", () => {
+      if (retryStarted) return;
+      if ((zenRes.statusCode || 502) === 429) {
+        if (prepared.lease?.node && proxyPool && !markedFailure) {
+          let errMsg = "Upstream returned 429";
+          try {
+            const parsed = JSON.parse(rateLimitBody);
+            errMsg = parsed.error?.message || parsed.message || errMsg;
+          } catch {
+            // Keep the generic rate-limit message for malformed upstream bodies.
+          }
+          proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: 429 });
+          markedFailure = true;
+        }
+        if (retryRateLimited()) return;
+        if (!res.headersSent) {
+          res.writeHead(429, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Upstream returned 429", type: "rate_limit_error", code: "rate_limit_exceeded" } }));
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+        metrics?.recordUpstream({ statusCode: 429, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+        return;
+      }
       if (prepared.lease?.node && proxyPool && !markedFailure) {
-        if ((zenRes.statusCode || 502) === 429) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429 });
-        else proxyPool.markSuccess(prepared.lease.node.id);
+        proxyPool.markSuccess(prepared.lease.node.id);
+        proxyPool.recordTokenUsage(prepared.lease.node.id, observedTotalTokens ?? (observedUsage ? observedUsageTokens : Math.ceil(prepared.body.length / 4) + Math.ceil(observedOutputChars / 4)));
       }
       metrics?.recordUpstream({ statusCode: zenRes.statusCode || 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
 
@@ -249,6 +308,7 @@ export const pipeOpenAiStreamStrippingThink = (
   });
 
   req.on("error", (error) => {
+    if (retryStarted) return;
     if (prepared.lease?.node && proxyPool && !markedFailure) {
       proxyPool.markFailure(prepared.lease.node.id, error.message);
       markedFailure = true;
@@ -263,6 +323,7 @@ export const pipeOpenAiStreamStrippingThink = (
   });
 
   req.on("timeout", () => {
+    if (retryStarted) return;
     req.destroy();
     if (prepared.lease?.node && proxyPool && !markedFailure) {
       proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout");

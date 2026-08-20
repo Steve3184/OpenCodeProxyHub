@@ -33,18 +33,6 @@ export class EventLogger {
     this.write("errors", record, settings.logRetentionDays);
   }
 
-  shouldLogPrompts(): boolean {
-    return this.settingsStore.get().logPrompts;
-  }
-
-  truncate(value: unknown): unknown {
-    const maxChars = this.settingsStore.get().logMaxBodyChars;
-    if (value === undefined || value === null) return value;
-    const text = typeof value === "string" ? value : JSON.stringify(value);
-    if (text.length <= maxChars) return value;
-    return `${text.slice(0, maxChars)}...<truncated ${text.length - maxChars} chars>`;
-  }
-
   private write(type: LogType, record: EventRecord, retentionDays: number): void {
     const date = today();
     const file = path.join(this.logsDir, `${type}-${date}.jsonl`);

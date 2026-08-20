@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
-import { AlertTriangle, Check, CheckCircle2, Network, Plus, Route, Trash2, Waypoints } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, Network, Plus, RotateCcw, Route, Trash2, Waypoints } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -32,9 +32,10 @@ const stateBadge = (proxy: ProxyNode): { label: string; variant: "muted" | "warn
 };
 
 export function ProxyView({ data }: { data: ConsoleData }) {
-  const { proxies, settings, busy, createProxy, toggleProxy, testProxy, deleteProxy, updateSettings } = data;
+  const { proxies, settings, busy, createProxy, toggleProxy, testProxy, deleteProxy, clearProxyStats, updateSettings } = data;
   const [draft, setDraft] = useState<ProxyDraft>({ name: "香港节点 1", type: "http", url: "", dailyRequestLimit: 1000, maxConcurrency: 10 });
   const [deleteTarget, setDeleteTarget] = useState<ProxyNode | null>(null);
+  const [statsTarget, setStatsTarget] = useState<ProxyNode | null>(null);
 
   const proxyMode = settings?.proxyMode ?? "optional";
   const preProxyEnabled = Boolean(settings?.outboundPreProxyEnabled);
@@ -273,7 +274,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                   );
                 })()}
 
-                <div className="mt-4 grid grid-cols-3 gap-2 rounded-md border border-border bg-muted/30 p-2 text-center text-xs">
+                <div className="mt-4 grid grid-cols-4 gap-2 rounded-md border border-border bg-muted/30 p-2 text-center text-xs">
                   <div>
                     <div className="text-muted-foreground">成功</div>
                     <div className="font-semibold tabular-nums text-success">{proxy.successCount}</div>
@@ -286,6 +287,14 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                     <div className="text-muted-foreground">权重</div>
                     <div className="font-semibold tabular-nums">{proxy.weight}</div>
                   </div>
+                  <div>
+                    <div className="text-muted-foreground">总 Token</div>
+                    <div className="font-semibold tabular-nums">{proxy.totalTokens.toLocaleString()}</div>
+                  </div>
+                </div>
+                <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
+                  <span>今日 Token</span>
+                  <span className="font-semibold tabular-nums text-foreground">{proxy.dailyTokens.toLocaleString()}</span>
                 </div>
 
                 {proxy.lastError && <p className="mt-2 break-words text-xs text-destructive">最后错误：{proxy.lastError}</p>}
@@ -301,6 +310,9 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                   </Button>
                   <Button variant="outline" size="sm" disabled={busy} onClick={() => testProxy(proxy)}>
                     测试
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={busy} onClick={() => setStatsTarget(proxy)} title="清空统计数据">
+                    <RotateCcw size={14} /> 清空统计
                   </Button>
                   <Button
                     variant="ghost"
@@ -328,6 +340,18 @@ export function ProxyView({ data }: { data: ConsoleData }) {
         onConfirm={() => {
           if (deleteTarget) deleteProxy(deleteTarget);
           setDeleteTarget(null);
+        }}
+      />
+      <ConfirmDialog
+        open={Boolean(statsTarget)}
+        title="清空代理统计"
+        message={`确定清空代理「${statsTarget?.name}」的成功失败、Token 和最近结果统计吗？`}
+        confirmText="清空统计"
+        busy={busy}
+        onCancel={() => setStatsTarget(null)}
+        onConfirm={() => {
+          if (statsTarget) clearProxyStats(statsTarget);
+          setStatsTarget(null);
         }}
       />
     </div>

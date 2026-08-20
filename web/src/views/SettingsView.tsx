@@ -54,9 +54,7 @@ export function SettingsView({ data }: { data: ConsoleData }) {
             {toggleField("启用文件日志", "logEnabled")}
             {toggleField("记录管理审计", "logAudit", !settings.logEnabled)}
             {toggleField("记录 AI 请求摘要", "logApiRequests", !settings.logEnabled)}
-            {toggleField("记录 Prompt", "logPrompts")}
             <div className="grid grid-cols-2 gap-3">
-              {numberField("日志最大正文字符", "logMaxBodyChars", !settings.logEnabled)}
               {numberField("日志保留天数", "logRetentionDays", !settings.logEnabled)}
             </div>
           </div>

@@ -28,6 +28,9 @@ export interface ProxyNode {
   cooldownUntil: string | null;
   successCount: number;
   failCount: number;
+  totalTokens: number;
+  dailyTokens: number;
+  dailyTokensDate: string;
   recentResults: ProxyRequestResult[];
   lastError: string | null;
   lastUsedAt: string | null;
@@ -150,11 +153,12 @@ export class ProxyPoolStore {
     return true;
   }
 
-  acquire(): ProxyLease {
+  acquire(excludeProxyIds: ReadonlySet<string> = new Set()): ProxyLease {
     this.resetDailyIfNeeded();
     const now = Date.now();
     const candidates = this.proxies
       .filter((node) => node.enabled)
+      .filter((node) => !excludeProxyIds.has(node.id))
       .filter((node) => !node.cooldownUntil || Date.parse(node.cooldownUntil) <= now)
       .filter((node) => node.dailyRequestLimit === 0 || node.dailyRequestCount < node.dailyRequestLimit)
       .filter((node) => node.currentConcurrency < node.maxConcurrency)
@@ -213,6 +217,32 @@ export class ProxyPoolStore {
       }
     }
     this.release(id);
+  }
+
+  recordTokenUsage(id: string, totalTokens: number): void {
+    const node = this.find(id);
+    if (!node || !Number.isFinite(totalTokens) || totalTokens <= 0) return;
+    this.resetDailyIfNeeded();
+    const tokens = Math.max(0, Math.trunc(totalTokens));
+    if (tokens === 0) return;
+    node.totalTokens += tokens;
+    node.dailyTokens += tokens;
+    this.persist();
+  }
+
+  clearStats(id: string): ProxyNode {
+    const node = this.find(id);
+    if (!node) throw new Error("Proxy not found");
+    node.successCount = 0;
+    node.failCount = 0;
+    node.dailyRequestCount = 0;
+    node.dailyCountDate = today();
+    node.totalTokens = 0;
+    node.dailyTokens = 0;
+    node.dailyTokensDate = today();
+    node.recentResults = [];
+    this.persist();
+    return { ...node };
   }
 
   async test(id: string, options: ProxyModelTestOptions = DEFAULT_MODEL_TEST_OPTIONS): Promise<ProxyNode> {
@@ -320,6 +350,9 @@ export class ProxyPoolStore {
       cooldownUntil: null,
       successCount: 0,
       failCount: 0,
+      totalTokens: 0,
+      dailyTokens: 0,
+      dailyTokensDate: today(),
       recentResults: [],
       lastError: null,
       lastUsedAt: null,
@@ -348,19 +381,27 @@ export class ProxyPoolStore {
     const current = today();
     let changed = false;
     for (const node of this.proxies) {
-      if (node.dailyCountDate === current) continue;
-      node.dailyCountDate = current;
-      node.dailyRequestCount = 0;
-      if (node.autoDisableWhenDailyLimitReached && node.lastError === "Daily request limit reached") {
-        node.enabled = true;
-        node.lastError = null;
+      if (node.dailyCountDate !== current) {
+        node.dailyCountDate = current;
+        node.dailyRequestCount = 0;
+        if (node.autoDisableWhenDailyLimitReached && node.lastError === "Daily request limit reached") {
+          node.enabled = true;
+          node.lastError = null;
+        }
+        changed = true;
       }
-      changed = true;
+      if (node.dailyTokensDate !== current) {
+        node.dailyTokensDate = current;
+        node.dailyTokens = 0;
+        changed = true;
+      }
     }
     if (changed) this.persist();
   }
 
   private normalizeDaily(node: ProxyNode): ProxyNode {
+    const current = today();
+    const dailyTokensDate = node.dailyTokensDate || current;
     return {
       ...node,
       currentConcurrency: 0,
@@ -371,6 +412,9 @@ export class ProxyPoolStore {
       consecutiveRateLimitCount: node.consecutiveRateLimitCount || 0,
       autoDisabledBy429: Boolean(node.autoDisabledBy429 || (!node.enabled && node.lastError === "Disabled after 5 consecutive 429 responses")),
       lastRecoveryTestAt: node.lastRecoveryTestAt || null,
+      totalTokens: Number.isFinite(node.totalTokens) ? Math.max(0, Math.trunc(node.totalTokens)) : 0,
+      dailyTokens: dailyTokensDate === current && Number.isFinite(node.dailyTokens) ? Math.max(0, Math.trunc(node.dailyTokens)) : 0,
+      dailyTokensDate: current,
       recentResults: node.recentResults || [],
     };
   }

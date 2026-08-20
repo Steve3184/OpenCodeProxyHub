@@ -4,7 +4,6 @@ export interface SystemSettings {
   requestBodyLimitBytes: number;
   upstreamTimeoutMs: number;
   defaultStream: boolean;
-  logPrompts: boolean;
   openAiStreamTransformModels: string[];
   reasoningTagModels: string[];
   proxyMode: "direct" | "optional" | "required";
@@ -13,7 +12,6 @@ export interface SystemSettings {
   logEnabled: boolean;
   logAudit: boolean;
   logApiRequests: boolean;
-  logMaxBodyChars: number;
   logRetentionDays: number;
 }
 
@@ -28,7 +26,6 @@ const DEFAULT_SETTINGS: SystemSettings = {
   requestBodyLimitBytes: 10 * 1024 * 1024,
   upstreamTimeoutMs: 120000,
   defaultStream: false,
-  logPrompts: false,
   openAiStreamTransformModels: [],
   reasoningTagModels: [],
   proxyMode: "optional",
@@ -37,7 +34,6 @@ const DEFAULT_SETTINGS: SystemSettings = {
   logEnabled: false,
   logAudit: true,
   logApiRequests: true,
-  logMaxBodyChars: 2000,
   logRetentionDays: 7,
 };
 
@@ -52,7 +48,8 @@ export class SettingsStore {
 
   load(): void {
     const data = this.store.read({ version: 1, settings: this.settings });
-    this.settings = { ...DEFAULT_SETTINGS, ...this.settings, ...data.settings };
+    const { logPrompts: _legacyLogPrompts, logMaxBodyChars: _legacyLogMaxBodyChars, ...storedSettings } = data.settings as SystemSettings & { logPrompts?: unknown; logMaxBodyChars?: unknown };
+    this.settings = { ...DEFAULT_SETTINGS, ...this.settings, ...storedSettings };
     this.persist();
   }
 
@@ -76,14 +73,9 @@ export class SettingsStore {
     }
 
     if (input.defaultStream !== undefined) this.settings.defaultStream = Boolean(input.defaultStream);
-    if (input.logPrompts !== undefined) this.settings.logPrompts = Boolean(input.logPrompts);
     if (input.logEnabled !== undefined) this.settings.logEnabled = Boolean(input.logEnabled);
     if (input.logAudit !== undefined) this.settings.logAudit = Boolean(input.logAudit);
     if (input.logApiRequests !== undefined) this.settings.logApiRequests = Boolean(input.logApiRequests);
-    if (input.logMaxBodyChars !== undefined) {
-      if (!Number.isFinite(input.logMaxBodyChars) || input.logMaxBodyChars < 0) throw new Error("logMaxBodyChars must be at least 0");
-      this.settings.logMaxBodyChars = Math.trunc(input.logMaxBodyChars);
-    }
     if (input.logRetentionDays !== undefined) {
       if (!Number.isFinite(input.logRetentionDays) || input.logRetentionDays < 0) throw new Error("logRetentionDays must be at least 0");
       this.settings.logRetentionDays = Math.trunc(input.logRetentionDays);

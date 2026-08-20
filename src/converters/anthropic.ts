@@ -5,6 +5,7 @@ import type { AnthropicMessageRequest, ZenFullResponse } from "../types/api.js";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
+import { extractTokenUsage } from "../utils/tokenUsage.js";
 
 export const anthropicToOpenAI = (body: AnthropicMessageRequest): { messages: unknown[]; tools?: unknown[]; toolChoice?: unknown; parameters: Record<string, unknown> } => {
   const messages: any[] = [];
@@ -149,7 +150,16 @@ export const handleAnthropicFullResponse = (zenResp: ZenFullResponse, model: str
   return { status: 200, body: openAIToAnthropic(zenResp.data, model, inputTokens) };
 };
 
-export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, res: ServerResponse, inputTokens: number, proxyPool?: ProxyPoolStore, metrics?: MetricsStore): void => {
+export const pipeZenAsAnthropic = (
+  prepared: ZenPreparedRequest,
+  model: string,
+  res: ServerResponse,
+  inputTokens: number,
+  proxyPool?: ProxyPoolStore,
+  metrics?: MetricsStore,
+  retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
+  retryAttempt = false,
+): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ type: "error", error: { type: "proxy_unavailable", message: "Proxy is required but no proxy node is available" } }));
@@ -159,6 +169,7 @@ export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, 
   const started = process.hrtime.bigint();
   const durationMs = () => Number(process.hrtime.bigint() - started) / 1_000_000;
   let markedFailure = false;
+  let retryStarted = false;
   const req = https.request(prepared.options, (zenRes) => {
     let headersSent = false;
     let buffer = "";
@@ -166,6 +177,21 @@ export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, 
     let contentIdx = 0;
     let toolIdx = -1;
     let firstChunkHandled = false;
+    let observedTotalTokens: number | null = null;
+    let observedUsageTokens = 0;
+    let observedUsage = false;
+    let rateLimitBody = "";
+
+    const retryRateLimited = (): boolean => {
+      if (retryAttempt || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
+      const excluded = new Set<string>();
+      if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
+      const retryPrepared = retryPrepare(excluded);
+      if (retryPrepared.lease?.requiredUnavailable) return false;
+      retryStarted = true;
+      pipeZenAsAnthropic(retryPrepared, model, res, inputTokens, proxyPool, metrics, retryPrepare, true);
+      return true;
+    };
 
     const sendSSE = (event: string, data: unknown) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -196,17 +222,25 @@ export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, 
 
     zenRes.on("data", (chunk: Buffer) => {
       const str = chunk.toString();
+      if (zenRes.statusCode === 429) {
+        rateLimitBody += str;
+        return;
+      }
       if (!firstChunkHandled) {
         firstChunkHandled = true;
         const trimmed = str.trim();
-        if (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes('"error"'))) {
+        if (zenRes.statusCode === 429 || (trimmed.startsWith("{") && (trimmed.includes("FreeUsageLimitError") || trimmed.includes("rate_limit_error") || trimmed.toLowerCase().includes("rate limit")))) {
           try {
             const parsed = JSON.parse(trimmed);
-            if (parsed.error || parsed.type === "error") {
+            if (zenRes.statusCode === 429 || parsed.error || parsed.type === "error") {
               const errMsg = parsed.error?.message || parsed.message || "Rate limit";
               if (prepared.lease?.node && proxyPool) {
                 proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: 429 });
                 markedFailure = true;
+              }
+              if (retryRateLimited()) {
+                zenRes.resume();
+                return;
               }
               if (!res.headersSent) {
                 res.writeHead(429, { "Content-Type": "application/json" });
@@ -235,6 +269,12 @@ export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, 
           parsed = JSON.parse(payload);
         } catch {
           continue;
+        }
+        const usage = extractTokenUsage(parsed);
+        if (usage.totalTokens !== null) {
+          observedUsage = true;
+          if (usage.inputTokens > 0 && usage.outputTokens > 0) observedTotalTokens = usage.totalTokens;
+          else observedUsageTokens += usage.totalTokens;
         }
         const choice = parsed.choices?.[0];
         const delta = choice?.delta;
@@ -281,9 +321,30 @@ export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, 
     });
 
     zenRes.on("end", () => {
+      if (retryStarted) return;
+      if ((zenRes.statusCode || 502) === 429) {
+        let errMsg = "Rate limit";
+        try {
+          const parsed = JSON.parse(rateLimitBody);
+          errMsg = parsed.error?.message || parsed.message || errMsg;
+        } catch {
+          // Keep the generic rate-limit message for malformed upstream bodies.
+        }
+        if (prepared.lease?.node && proxyPool) {
+          proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: 429 });
+          markedFailure = true;
+        }
+        if (retryRateLimited()) return;
+        if (!res.headersSent) {
+          res.writeHead(429, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `${errMsg} (free model rate limit)` } }));
+        }
+        metrics?.recordUpstream({ statusCode: 429, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+        return;
+      }
       if (prepared.lease?.node && proxyPool && !markedFailure) {
-        if ((zenRes.statusCode || 502) === 429) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429 });
-        else proxyPool.markSuccess(prepared.lease.node.id);
+        proxyPool.markSuccess(prepared.lease.node.id);
+        proxyPool.recordTokenUsage(prepared.lease.node.id, observedTotalTokens ?? (observedUsage ? observedUsageTokens : inputTokens + outputTokens));
       }
       metrics?.recordUpstream({ statusCode: zenRes.statusCode || 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
       if (!headersSent) {
@@ -302,6 +363,7 @@ export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, 
   });
 
   req.on("error", (error) => {
+    if (retryStarted) return;
     if (prepared.lease?.node && proxyPool && !markedFailure) proxyPool.markFailure(prepared.lease.node.id, error.message);
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
     if (!res.headersSent) {
@@ -311,6 +373,7 @@ export const pipeZenAsAnthropic = (prepared: ZenPreparedRequest, model: string, 
   });
 
   req.on("timeout", () => {
+    if (retryStarted) return;
     req.destroy();
     if (prepared.lease?.node && proxyPool && !markedFailure) proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout");
     metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });
