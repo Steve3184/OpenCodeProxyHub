@@ -1,5 +1,5 @@
 import { motion } from "motion/react";
-import { Activity, KeyRound, Network, ShieldCheck } from "lucide-react";
+import { Activity, Coins, KeyRound, ListChecks, Network, ShieldCheck } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
@@ -8,10 +8,10 @@ export interface StatItem {
   value: string;
   detail: string;
   tone: "primary" | "success" | "warning" | "info";
-  icon: "shield" | "key" | "net" | "activity";
+  icon: "shield" | "key" | "net" | "activity" | "requests" | "tokens";
 }
 
-const iconMap = { shield: ShieldCheck, key: KeyRound, net: Network, activity: Activity };
+const iconMap = { shield: ShieldCheck, key: KeyRound, net: Network, activity: Activity, requests: ListChecks, tokens: Coins };
 
 const toneStyle: Record<StatItem["tone"], { icon: string; ring: string }> = {
   primary: { icon: "text-primary", ring: "ring-primary/25" },
@@ -22,7 +22,7 @@ const toneStyle: Record<StatItem["tone"], { icon: string; ring: string }> = {
 
 export function StatCards({ items }: { items: StatItem[] }) {
   return (
-    <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+    <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
       {items.map((item, i) => {
         const Icon = iconMap[item.icon];
         const tone = toneStyle[item.tone];

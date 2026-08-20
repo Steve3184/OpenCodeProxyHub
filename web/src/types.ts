@@ -95,6 +95,7 @@ export interface MetricsPayload {
     errorRate: number;
     byStatus: Record<string, number>;
     byRoute: Record<string, number>;
+    byHour?: Record<string, number>;
     latencyMs: { p50: number; p95: number; p99: number };
   };
   upstream: {

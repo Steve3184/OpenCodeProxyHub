@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import type { View } from "../types";
 import { Sidebar } from "./Sidebar";
+import { Switch } from "@/components/ui/switch";
 
 const viewTitles: Record<View, string> = {
   dashboard: "总览",
@@ -22,11 +23,13 @@ interface LayoutProps {
   statusText: string;
   authModeLabel: string;
   onRefresh: () => void;
+  autoRefresh: boolean;
+  onAutoRefreshChange: (enabled: boolean) => void;
   onLogout: () => void;
   children: ReactNode;
 }
 
-export function Layout({ view, onSelect, busy, statusText, authModeLabel, onRefresh, onLogout, children }: LayoutProps) {
+export function Layout({ view, onSelect, busy, statusText, authModeLabel, onRefresh, autoRefresh, onAutoRefreshChange, onLogout, children }: LayoutProps) {
   return (
     <div className="flex h-dvh overflow-hidden bg-background">
       <Sidebar view={view} onSelect={onSelect} />
@@ -43,6 +46,10 @@ export function Layout({ view, onSelect, busy, statusText, authModeLabel, onRefr
             <Badge variant="muted" className="hidden md:inline-flex">
               {authModeLabel}
             </Badge>
+            <label className="flex items-center gap-2 text-xs text-muted-foreground" title="每 5 秒静默更新数据，不会锁定页面控件">
+              <span className="hidden sm:inline">自动刷新</span>
+              <Switch checked={autoRefresh} onCheckedChange={onAutoRefreshChange} aria-label="开启每 5 秒自动刷新" />
+            </label>
             <Button variant="outline" size="sm" onClick={onRefresh} disabled={busy}>
               <RefreshCw size={16} className={busy ? "animate-spin" : ""} />
               <span className="hidden sm:inline">刷新</span>

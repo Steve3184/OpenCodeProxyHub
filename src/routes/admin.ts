@@ -1,7 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import type { ApiKeyPolicy, ApiKeyStore } from "../auth/apiKeys.js";
 import type { AppConfig } from "../config/env.js";
-import { adminAuthMode, isAdminRequest } from "../auth/adminAuth.js";
+import { adminAuthMode, isAdminRequest, passwordMatches, tokenFromRequest } from "../auth/adminAuth.js";
+import type { AdminSessionStore } from "../auth/adminSessions.js";
 import type { ModelConfigStore, ModelUpdateInput } from "../models/catalog.js";
 import type { SettingsStore, SystemSettingsUpdate } from "../settings/settingsStore.js";
 import type { ProxyInput, ProxyPoolStore } from "../proxy/proxyPool.js";
@@ -22,6 +23,10 @@ interface UpdateKeyBody {
   policy?: ApiKeyPolicy;
 }
 
+interface LoginBody {
+  password?: string;
+}
+
 export const registerAdminRoutes = async (
   app: FastifyInstance,
   config: AppConfig,
@@ -33,6 +38,7 @@ export const registerAdminRoutes = async (
   requestTracker: RequestTracker,
   metrics: MetricsStore,
   eventLogger: EventLogger,
+  adminSessions: AdminSessionStore,
 ): Promise<void> => {
   const audit = (request: { headers: Record<string, string | string[] | undefined>; ip?: string }, action: string, result: "success" | "failure", details: Record<string, unknown> = {}) => {
     eventLogger.audit({
@@ -48,16 +54,34 @@ export const registerAdminRoutes = async (
 
   app.addHook("preHandler", async (request, reply) => {
     if (!request.url.startsWith("/admin/")) return;
-    if (isAdminRequest(request, config.adminPassword)) return;
+    if (request.url.split("?", 1)[0] === "/admin/login") return;
+    if (isAdminRequest(request, adminSessions)) return;
     return reply.code(401).send({ error: { message: "Unauthorized" } });
+  });
+
+  app.post<{ Body: LoginBody }>("/admin/login", async (request, reply) => {
+    const password = typeof request.body?.password === "string" ? request.body.password : "";
+    if (!passwordMatches(password, config.adminPassword)) {
+      audit(request, "admin.login", "failure", { reason: "invalid_password" });
+      return reply.code(401).send({ error: { message: "控制台密码不正确" } });
+    }
+    const token = adminSessions.create();
+    audit(request, "admin.login", "success");
+    return reply.send({ data: { authenticated: true, mode: "password", token } });
   });
 
   app.get("/admin/session", async (request) => ({
     data: {
       authenticated: true,
-      mode: adminAuthMode(request, config.adminPassword),
+      mode: adminAuthMode(request, adminSessions),
     },
   }));
+
+  app.post("/admin/logout", async (request, reply) => {
+    adminSessions.revoke(tokenFromRequest(request));
+    audit(request, "admin.logout", "success");
+    return reply.code(204).send();
+  });
 
   app.get("/admin/api-keys", async () => ({ data: keyStore.list() }));
 

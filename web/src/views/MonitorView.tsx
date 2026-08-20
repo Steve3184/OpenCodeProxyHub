@@ -17,7 +17,7 @@ function statusColor(code: string) {
   return COLORS.primary;
 }
 
-function ChartTooltip({ active, payload, label }: any) {
+function ChartTooltip({ active, payload, label, suffix = "ms" }: any) {
   if (!active || !payload?.length) return null;
   return (
     <div className="rounded-md border border-border bg-popover px-3 py-2 text-xs shadow-xl shadow-black/40">
@@ -26,7 +26,7 @@ function ChartTooltip({ active, payload, label }: any) {
         <div key={p.dataKey} className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full" style={{ background: p.color || p.fill }} />
           <span className="text-muted-foreground">{p.name}:</span>
-          <span className="font-medium tabular-nums">{p.value}ms</span>
+          <span className="font-medium tabular-nums">{p.value}{suffix}</span>
         </div>
       ))}
     </div>
@@ -74,6 +74,14 @@ export function MonitorView({ data }: { data: ConsoleData }) {
 
   const routeEntries = Object.entries(metricsData.http.byRoute).sort((a, b) => b[1] - a[1]);
   const maxRoute = Math.max(1, ...routeEntries.map((r) => r[1]));
+  const hourlyData = Object.entries(metricsData.http.byHour || {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(-24)
+    .map(([hour, requests]) => ({
+      hour,
+      label: new Date(hour).toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit" }),
+      requests,
+    }));
 
   return (
     <div className="space-y-4">
@@ -94,6 +102,42 @@ export function MonitorView({ data }: { data: ConsoleData }) {
             </Card>
           </motion.div>
         ))}
+      </motion.div>
+
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1], delay: 0.04 }}
+      >
+        <Card className="p-5">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold">每小时请求数</h3>
+            <span className="text-xs text-muted-foreground">最近 24 个小时（UTC）</span>
+          </div>
+          {hourlyData.length === 0 ? (
+            <p className="mt-12 text-center text-sm text-muted-foreground/70">暂无请求数据</p>
+          ) : (
+            <div className="mt-4 h-56">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={hourlyData} margin={{ top: 4, right: 8, bottom: 20, left: -16 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+                  <XAxis
+                    dataKey="label"
+                    tick={AXIS}
+                    axisLine={{ stroke: GRID }}
+                    tickLine={false}
+                    minTickGap={18}
+                    angle={-25}
+                    textAnchor="end"
+                  />
+                  <YAxis tick={AXIS} axisLine={false} tickLine={false} width={48} allowDecimals={false} />
+                  <Tooltip cursor={{ fill: "rgba(255,255,255,0.04)" }} content={<ChartTooltip suffix="" />} />
+                  <Bar dataKey="requests" name="请求数" fill={COLORS.primary} radius={[4, 4, 0, 0]} maxBarSize={32} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </Card>
       </motion.div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">

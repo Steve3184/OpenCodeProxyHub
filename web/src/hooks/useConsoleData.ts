@@ -74,20 +74,30 @@ export function useConsoleData() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const logout = useCallback((message = "已退出控制台") => {
+  const logout = useCallback(async (message = "已退出控制台") => {
+    const activeToken = token;
+    if (activeToken) {
+      try {
+        await apiFetch<void>("/admin/logout", activeToken, { method: "POST" });
+      } catch {
+        // The session may already be expired; local cleanup still applies.
+      }
+    }
     localStorage.removeItem("oph_admin_token");
     setToken("");
+    setDraftToken("");
     setAuthMode(null);
     setApiKeys([]);
+    setModels([]);
     setSettings(null);
     setProxies([]);
     setRuntime(null);
     setMetricsData(null);
     pushToast(message, "info");
-  }, [pushToast]);
+  }, [pushToast, token]);
 
-  const loadPublic = useCallback(async (activeToken: string) => {
-    setBusy(true);
+  const loadPublic = useCallback(async (activeToken: string, options: { silent?: boolean } = {}) => {
+    if (!options.silent) setBusy(true);
     try {
       const [healthData, publicModels] = await Promise.all([
         fetch("/health").then((res) => res.json()),
@@ -114,7 +124,7 @@ export function useConsoleData() {
         setModels(publicModels.data.map((item: any) => ({ id: item.id, enabled: true, ownedBy: item.owned_by, created: item.created })));
       }
     } finally {
-      setBusy(false);
+      if (!options.silent) setBusy(false);
     }
   }, []);
 
@@ -127,13 +137,16 @@ export function useConsoleData() {
     setBusy(true);
     setLoginError(null);
     try {
-      const session = await apiFetch<{ data: { authenticated: boolean; mode: AuthMode } }>("/admin/session", cleanToken);
-      localStorage.setItem("oph_admin_token", cleanToken);
-      setToken(cleanToken);
-      setDraftToken(cleanToken);
+      const session = await apiFetch<{ data: { authenticated: boolean; mode: AuthMode; token: string } }>("/admin/login", "", {
+        method: "POST",
+        body: JSON.stringify({ password: cleanToken }),
+      });
+      localStorage.setItem("oph_admin_token", session.data.token);
+      setToken(session.data.token);
+      setDraftToken("");
       setAuthMode(session.data.mode);
       pushToast("控制台已解锁", "success");
-      await loadPublic(cleanToken);
+      await loadPublic(session.data.token);
     } catch (err) {
       localStorage.removeItem("oph_admin_token");
       setToken("");
@@ -145,15 +158,35 @@ export function useConsoleData() {
     }
   }, [loadPublic, pushToast]);
 
+  const restoreSession = useCallback(async (savedToken: string) => {
+    setBusy(true);
+    try {
+      const session = await apiFetch<{ data: { authenticated: boolean; mode: AuthMode } }>("/admin/session", savedToken);
+      if (!session.data.authenticated) throw new Error("登录状态已失效");
+      setToken(savedToken);
+      setAuthMode(session.data.mode);
+      setDraftToken("");
+      await loadPublic(savedToken);
+    } catch {
+      localStorage.removeItem("oph_admin_token");
+      setToken("");
+      setAuthMode(null);
+      setDraftToken("");
+    } finally {
+      setAuthChecked(true);
+      setBusy(false);
+    }
+  }, [loadPublic]);
+
   useEffect(() => {
     const saved = localStorage.getItem("oph_admin_token") || "";
     if (saved) {
-      login(saved);
+      void restoreSession(saved);
       return;
     }
     setAuthChecked(true);
-    loadPublic("").catch((err: Error) => setLoginError(err.message));
-  }, [login, loadPublic]);
+    void loadPublic("").catch((err: Error) => setLoginError(err.message));
+  }, [loadPublic, restoreSession]);
 
   // Wraps an action: runs it, refreshes data, and routes errors (401 -> logout) to toast.
   const run = useCallback(
@@ -280,7 +313,18 @@ export function useConsoleData() {
   const clearProxyStats = (proxy: ProxyNode) =>
     run(() => apiFetch(`/admin/proxies/${proxy.id}/stats/clear`, token, { method: "POST" }).then(() => undefined), { successText: `已清空代理「${proxy.name}」统计` });
 
-  const refresh = () => run(async () => undefined, { successText: "已刷新数据" });
+  const refresh = useCallback(async (options: { silent?: boolean } = {}) => {
+    try {
+      await loadPublic(token, options);
+      if (!options.silent) pushToast("已刷新数据", "success");
+    } catch (err) {
+      if (err instanceof ApiFetchError && err.status === 401) {
+        await logout("登录状态已失效，请重新登录");
+      } else if (!options.silent) {
+        pushToast(err instanceof Error ? err.message : "刷新失败", "error");
+      }
+    }
+  }, [loadPublic, logout, pushToast, token]);
 
   return {
     // state

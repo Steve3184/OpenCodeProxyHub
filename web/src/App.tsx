@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import "./styles.css";
 import type { View } from "./types";
@@ -13,16 +13,29 @@ import { ModelsView } from "./views/ModelsView";
 import { SettingsView } from "./views/SettingsView";
 import { ProxyView } from "./views/ProxyView";
 import { MonitorView } from "./views/MonitorView";
+import { formatCompactTokens } from "./lib/format";
 
 export default function App() {
   const data = useConsoleData();
   const [view, setView] = useState<View>("dashboard");
+  const [autoRefresh, setAutoRefresh] = useState(false);
 
   const activeProxies = useMemo(() => data.proxies.filter((p) => p.enabled).length, [data.proxies]);
   const aiRequestCount = useMemo(() => {
     const routes = data.metricsData?.http.byRoute || {};
     return (routes["POST /v1/chat/completions"] || 0) + (routes["POST /v1/messages"] || 0);
   }, [data.metricsData]);
+
+  const todayTokens = useMemo(() => data.proxies.reduce((sum, proxy) => sum + proxy.dailyTokens, 0), [data.proxies]);
+  const todayRequestCount = useMemo(() => data.proxies.reduce((sum, proxy) => sum + proxy.dailyRequestCount, 0), [data.proxies]);
+
+  useEffect(() => {
+    if (!autoRefresh || !data.token) return;
+    const timer = window.setInterval(() => {
+      void data.refresh({ silent: true });
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, data.refresh, data.token]);
 
   if (!data.authChecked && !data.token) {
     return (
@@ -57,9 +70,13 @@ export default function App() {
     { label: "API Keys", value: String(data.apiKeys.length), detail: `${data.apiKeys.filter((k) => k.enabled).length} 个启用`, tone: "primary", icon: "key" },
     { label: "代理节点", value: String(data.proxies.length), detail: `${activeProxies} 个启用`, tone: "warning", icon: "net" },
     { label: "AI 请求数", value: data.metricsData ? String(aiRequestCount) : "0", detail: "OpenAI + Anthropic", tone: "success", icon: "activity" },
+    { label: "今日请求", value: String(todayRequestCount), detail: "代理节点累计", tone: "info", icon: "requests" },
+    { label: "今日 Tokens", value: formatCompactTokens(todayTokens), detail: "所有代理节点", tone: "primary", icon: "tokens" },
   ];
 
-  const statusText = data.health ? `网关 ${data.health.status} · ${data.health.models} 个模型在线` : "控制台就绪";
+  const statusText = view === "dashboard" && data.health
+    ? `网关 ${data.health.status} · ${data.health.models} 个模型在线`
+    : "控制台就绪";
 
   return (
     <>
@@ -69,11 +86,13 @@ export default function App() {
         busy={data.busy}
         statusText={statusText}
         authModeLabel={data.authMode === "password" ? "控制台密码" : "已登录"}
-        onRefresh={data.refresh}
+        onRefresh={() => { void data.refresh(); }}
+        autoRefresh={autoRefresh}
+        onAutoRefreshChange={setAutoRefresh}
         onLogout={() => data.logout()}
       >
         <div className="space-y-6">
-          <StatCards items={stats} />
+          {view === "dashboard" && <StatCards items={stats} />}
           <AnimatePresence mode="wait">
             <motion.div
               key={view}

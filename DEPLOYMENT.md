@@ -17,7 +17,7 @@ Create the Docker environment file:
 cp .env.docker.example .env.docker
 ```
 
-Edit `.env.docker` and set a strong `ADMIN_PASSWORD` before exposing the service. The default password is `admin`.
+Edit `.env.docker` and set a strong `ADMIN_PASSWORD` before exposing the service. The template value is only suitable for local development.
 
 Start the stack:
 

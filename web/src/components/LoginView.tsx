@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { Radar, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,10 @@ interface LoginViewProps {
 
 export function LoginView({ draftToken, setDraftToken, busy, error, onLogin, checking = false }: LoginViewProps) {
   const [local, setLocal] = useState(draftToken);
+
+  useEffect(() => {
+    setLocal(draftToken);
+  }, [draftToken]);
 
   if (checking) {
     return (
@@ -52,9 +56,7 @@ export function LoginView({ draftToken, setDraftToken, busy, error, onLogin, che
           </div>
         </div>
         <p className="mb-5 text-sm text-muted-foreground">
-          输入控制台密码进入管理页面。初始密码为{" "}
-          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[12px] text-foreground/80">admin</code>
-          ，建议在 Docker 环境变量中修改 ADMIN_PASSWORD。
+          输入已配置的控制台密码。密码只用于本次登录，服务端验证后会签发临时会话令牌；生产环境请通过 HTTPS 访问控制台以保护传输安全。
         </p>
         <div className="space-y-2">
           <Label htmlFor="login-pw">控制台密码</Label>

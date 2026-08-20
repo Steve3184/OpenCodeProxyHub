@@ -25,10 +25,13 @@ const increment = (record: Record<string, number>, key: string, amount = 1): voi
   record[key] = (record[key] || 0) + amount;
 };
 
+const currentHourKey = (): string => `${new Date().toISOString().slice(0, 13)}:00:00Z`;
+
 export class MetricsStore {
   private readonly startedAt = new Date().toISOString();
   private readonly httpByRoute: Record<string, number> = {};
   private readonly httpByStatus: Record<string, number> = {};
+  private readonly httpByHour: Record<string, number> = {};
   private readonly httpLatencies: number[] = [];
   private upstreamRequests = 0;
   private upstreamErrors = 0;
@@ -40,6 +43,8 @@ export class MetricsStore {
   recordHttp(input: HttpMetricInput): void {
     increment(this.httpByRoute, `${input.method} ${input.route}`);
     increment(this.httpByStatus, String(input.statusCode));
+    increment(this.httpByHour, currentHourKey());
+    this.pruneHourlyRequests();
     this.httpLatencies.push(input.durationMs);
     if (this.httpLatencies.length > 1000) this.httpLatencies.shift();
     if (input.statusCode >= 500) this.recordError("http", `HTTP ${input.statusCode} ${input.method} ${input.route}`, input.statusCode);
@@ -76,6 +81,7 @@ export class MetricsStore {
         errorRate: totalHttp ? Number((httpErrors / totalHttp).toFixed(4)) : 0,
         byStatus: this.httpByStatus,
         byRoute: this.httpByRoute,
+        byHour: this.httpByHour,
         latencyMs: {
           p50: percentile(this.httpLatencies, 50),
           p95: percentile(this.httpLatencies, 95),
@@ -96,6 +102,14 @@ export class MetricsStore {
       },
       recentErrors: this.recentErrors,
     };
+  }
+
+  private pruneHourlyRequests(): void {
+    const keys = Object.keys(this.httpByHour).sort();
+    while (keys.length > 168) {
+      const key = keys.shift();
+      if (key) delete this.httpByHour[key];
+    }
   }
 }
 

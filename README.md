@@ -118,7 +118,7 @@ npm run typecheck    # 类型检查（不产出）
 npm start            # 运行已构建的 dist/main.js
 ```
 
-> 首次启动会在 `api-keys.json` 自动生成 `admin` 与 `user-default` 两个 Key，明文仅在启动日志中显示一次，文件里只保存 SHA-256 哈希。管理接口与控制台默认密码为 `admin`（即 `ADMIN_PASSWORD`），**对外暴露前务必修改**。
+> 首次启动会在 `api-keys.json` 自动生成 `admin` 与 `user-default` 两个 Key，明文仅在启动日志中显示一次，文件里只保存 SHA-256 哈希。控制台密码来自 `ADMIN_PASSWORD`（未配置时仅保留开发环境默认值），**对外暴露前务必设置强密码并通过 HTTPS 访问**。控制台登录后由服务端签发临时会话令牌，后续管理请求不再携带管理员密码。
 
 更多健康检查、冒烟测试、备份、反向代理与升级说明见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)。公网部署建议在前面再放一层 Nginx/Caddy 等 HTTPS 反向代理（需保留 `Authorization`/`x-api-key` 头、支持长连接 SSE、关闭对流式路径的缓冲）。
 
@@ -151,11 +151,11 @@ npm start            # 运行已构建的 dist/main.js
   - 全局每分钟请求数 + 单 Key 每分钟请求数 + 单 Key 并发请求/并发流上限
   - 默认内存实现；配置 `REDIS_URL` 后自动切换为基于 Redis Lua 脚本的分布式限流（支持多实例）
 - **可观测性**
-  - HTTP / 上游请求计数、错误率、P50/P95/P99 延迟、按状态码与路由分布、按代理分布、最近错误
+  - HTTP / 上游请求计数、最近小时请求趋势、错误率、P50/P95/P99 延迟、按状态码与路由分布、按代理分布、最近错误
   - 可配置的文件日志：管理审计日志、AI 请求摘要日志（含出口代理字段）、错误日志，JSONL 按天切分、按保留天数自动清理
 - **内置 Web 控制台**（`/app`）
   - 总览、API Keys、模型、设置、代理池、监控六大页面
-  - 代理池含成功率、近 N 次请求结果色条、用量/并发/连续 429 仪表
+  - 代理池含成功率、近 N 次请求结果色条、用量/并发/连续 429 数值与 Token 统计
 - **运维友好**
   - 优雅停机：关闭前排空在途请求（可配置超时）
   - 健康检查 `GET /health`
@@ -278,11 +278,11 @@ curl http://127.0.0.1:6446/v1/messages \
 - **总览**：网关状态、Key 数量、代理节点、AI 请求数等关键指标
 - **API Keys**：创建（明文显示一次并可复制）、启用/禁用、删除、备注与标签、每 Key 策略（RPM、并发、模型白名单、是否允许代理）、查看请求量与最近客户端
 - **模型**：启用/禁用模型，按模型开启 `anthropic-sse-to-openai` 与 `think-to-reasoning` 两种流式转换
-- **设置**：上游超时、请求体限制、默认流式、文件日志与审计开关、日志保留天数
-- **代理池**：新增/编辑/删除/测试节点，查看优先节点、成功率、近 N 次请求结果色条、用量/并发/连续 429 仪表，切换代理使用模式，开关与配置链式前置代理（热重载）
-- **监控**：HTTP/上游请求量、错误率、延迟分位、状态码与路由分布、限流器后端、运行时长、最近错误
+- **设置**：上游超时、请求体限制、默认流式、代理使用模式、链式前置代理、文件日志与审计开关、日志保留天数
+- **代理池**：新增/编辑/删除/测试节点，查看优先节点、成功率、近 N 次请求结果色条、用量/并发/连续 429 数值与 Token 统计
+- **监控**：HTTP/上游请求量、按小时请求趋势、错误率、延迟分位、状态码与路由分布、限流器后端、运行时长、最近错误
 
-控制台密码或开发 API Key 保存在浏览器本地存储中。
+控制台仅在浏览器本地存储临时会话令牌，不保存控制台密码。
 
 ## 配置（环境变量）
 
@@ -342,10 +342,12 @@ OUTBOUND_PRE_PROXY_URL=http://host.docker.internal:7897
 
 ## 管理 API
 
-所有 `/admin/*` 接口需在 `Authorization: Bearer <ADMIN_PASSWORD>` 下访问。
+除登录接口外，所有 `/admin/*` 接口需在 `Authorization: Bearer <SESSION_TOKEN>` 下访问。控制台登录会把密码提交给一次性登录接口，服务端验证后返回内存中的临时会话令牌；生产环境请使用 HTTPS。
 
 ```text
-GET    /admin/session            # 当前鉴权状态
+POST   /admin/login              # Body: {"password":"..."}，返回临时 session token
+GET    /admin/session            # 当前会话鉴权状态
+POST   /admin/logout             # 撤销当前会话
 GET    /admin/api-keys           # 列出 API Key
 POST   /admin/api-keys           # 创建 API Key（明文仅返回一次）
 GET    /admin/api-keys/:id/secret# 读取可恢复明文（需开启明文存储）
@@ -369,7 +371,7 @@ GET    /admin/metrics            # 指标快照
 
 ```bash
 curl -X POST http://127.0.0.1:6446/admin/api-keys \
-  -H "Authorization: Bearer YOUR_ADMIN_PASSWORD" \
+  -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"default-user"}'
 ```
@@ -378,7 +380,7 @@ curl -X POST http://127.0.0.1:6446/admin/api-keys \
 
 ```bash
 curl -X PATCH http://127.0.0.1:6446/admin/settings \
-  -H "Authorization: Bearer YOUR_ADMIN_PASSWORD" \
+  -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"reasoningTagModels":["deepseek-v4-flash-free"]}'
 ```

@@ -2,6 +2,7 @@ import cors from "@fastify/cors";
 import Fastify from "fastify";
 import type { AppConfig } from "./config/env.js";
 import { ApiKeyStore } from "./auth/apiKeys.js";
+import { AdminSessionStore } from "./auth/adminSessions.js";
 import { SessionStore } from "./sessions/sessionStore.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerModelRoutes } from "./routes/models.js";
@@ -61,6 +62,7 @@ export const buildApp = async (config: AppConfig) => {
   }, config.proxyRecoveryIntervalMs);
   proxyRecoveryTimer.unref();
   const sessions = new SessionStore();
+  const adminSessions = new AdminSessionStore();
   const requestTracker = new RequestTracker();
   const limiter = await createLimiter({
     globalRequestsPerMinute: config.globalRequestsPerMinute,
@@ -78,7 +80,7 @@ export const buildApp = async (config: AppConfig) => {
 
   await registerHealthRoutes(app, modelStore);
   await registerModelRoutes(app, modelStore);
-  await registerAdminRoutes(app, config, keyStore, modelStore, settingsStore, proxyPool, limiter, requestTracker, metrics, eventLogger);
+  await registerAdminRoutes(app, config, keyStore, modelStore, settingsStore, proxyPool, limiter, requestTracker, metrics, eventLogger, adminSessions);
   await registerOpenAIRoutes(app, config, keyStore, modelStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
   await registerAnthropicRoutes(app, config, keyStore, modelStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
   await registerWebRoutes(app);
