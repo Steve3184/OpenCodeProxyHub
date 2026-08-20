@@ -208,13 +208,6 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                   </div>
                 </div>
 
-                {proxy.lastError && <p className="mt-2 break-words text-xs text-destructive">最后错误：{proxy.lastError}</p>}
-                {proxy.autoDisabledBy429 && !proxy.enabled && (
-                  <p className="mt-1 text-xs text-warning/90">
-                    自动恢复探测：{proxy.lastRecoveryTestAt ? new Date(proxy.lastRecoveryTestAt).toLocaleString() : "等待下一轮（10 分钟）"}
-                  </p>
-                )}
-
                 {showProxyDetails && <div className="mt-3 flex flex-wrap gap-2">
                   <Button variant="ghost" size="sm" disabled={busy} onClick={() => toggleProxy(proxy)}>
                     {proxy.enabled ? "禁用" : "启用"}
@@ -227,12 +220,14 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                   </Button>
                   <Button
                     variant="ghost"
-                    size="sm"
-                    className="text-destructive hover:text-destructive"
+                    size="icon"
+                    className="h-8 w-8 text-destructive hover:text-destructive"
                     disabled={busy}
                     onClick={() => setDeleteTarget(proxy)}
+                    title="删除代理"
+                    aria-label={`删除代理 ${proxy.name}`}
                   >
-                    <Trash2 size={14} /> 删除
+                    <Trash2 size={14} />
                   </Button>
                 </div>}
               </Card>
