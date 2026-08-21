@@ -13,6 +13,10 @@ export interface SystemSettings {
   logAudit: boolean;
   logApiRequests: boolean;
   logRetentionDays: number;
+  globalRequestsPerMinute: number;
+  apiKeyRequestsPerMinute: number;
+  apiKeyMaxConcurrentRequests: number;
+  apiKeyMaxConcurrentStreams: number;
 }
 
 interface SettingsFile {
@@ -35,6 +39,10 @@ const DEFAULT_SETTINGS: SystemSettings = {
   logAudit: true,
   logApiRequests: true,
   logRetentionDays: 7,
+  globalRequestsPerMinute: 120,
+  apiKeyRequestsPerMinute: 60,
+  apiKeyMaxConcurrentRequests: 10,
+  apiKeyMaxConcurrentStreams: 5,
 };
 
 export class SettingsStore {
@@ -80,6 +88,35 @@ export class SettingsStore {
       if (!Number.isFinite(input.logRetentionDays) || input.logRetentionDays < 0) throw new Error("logRetentionDays must be at least 0");
       this.settings.logRetentionDays = Math.trunc(input.logRetentionDays);
     }
+
+    if (input.globalRequestsPerMinute !== undefined) {
+      if (!Number.isFinite(input.globalRequestsPerMinute) || input.globalRequestsPerMinute < 0) {
+        throw new Error("globalRequestsPerMinute must be at least 0 (0 = unlimited)");
+      }
+      this.settings.globalRequestsPerMinute = Math.trunc(input.globalRequestsPerMinute);
+    }
+
+    if (input.apiKeyRequestsPerMinute !== undefined) {
+      if (!Number.isFinite(input.apiKeyRequestsPerMinute) || input.apiKeyRequestsPerMinute < 0) {
+        throw new Error("apiKeyRequestsPerMinute must be at least 0 (0 = unlimited)");
+      }
+      this.settings.apiKeyRequestsPerMinute = Math.trunc(input.apiKeyRequestsPerMinute);
+    }
+
+    if (input.apiKeyMaxConcurrentRequests !== undefined) {
+      if (!Number.isFinite(input.apiKeyMaxConcurrentRequests) || input.apiKeyMaxConcurrentRequests < 0) {
+        throw new Error("apiKeyMaxConcurrentRequests must be at least 0 (0 = unlimited)");
+      }
+      this.settings.apiKeyMaxConcurrentRequests = Math.trunc(input.apiKeyMaxConcurrentRequests);
+    }
+
+    if (input.apiKeyMaxConcurrentStreams !== undefined) {
+      if (!Number.isFinite(input.apiKeyMaxConcurrentStreams) || input.apiKeyMaxConcurrentStreams < 0) {
+        throw new Error("apiKeyMaxConcurrentStreams must be at least 0 (0 = unlimited)");
+      }
+      this.settings.apiKeyMaxConcurrentStreams = Math.trunc(input.apiKeyMaxConcurrentStreams);
+    }
+
     if (input.openAiStreamTransformModels !== undefined) {
       if (!Array.isArray(input.openAiStreamTransformModels)) {
         throw new Error("openAiStreamTransformModels must be an array");

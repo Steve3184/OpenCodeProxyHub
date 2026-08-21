@@ -1,5 +1,5 @@
 import { motion } from "motion/react";
-import { Activity } from "lucide-react";
+import { Activity, RefreshCw } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,7 @@ import { fadeIn, fadeUp, staggerContainer } from "@/lib/motion";
 import type { ConsoleData } from "../hooks/useConsoleData";
 
 export function ModelsView({ data }: { data: ConsoleData }) {
-  const { models, settings, busy, toggleModel, toggleOpenAiStreamTransform, toggleReasoningTag } = data;
+  const { models, settings, busy, toggleModel, toggleOpenAiStreamTransform, toggleReasoningTag, syncFreeModels } = data;
 
   return (
     <div className="space-y-4">
@@ -22,6 +22,19 @@ export function ModelsView({ data }: { data: ConsoleData }) {
             OpenAI 流式转换会把白名单模型的 Anthropic SSE 转为 ChatCompletions SSE；保存后热重载，新请求立即生效。
           </p>
         </Card>
+      </motion.div>
+
+      <motion.div variants={fadeIn} initial="hidden" animate="show" className="flex justify-end">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy}
+          onClick={() => syncFreeModels()}
+          className="gap-2"
+        >
+          <RefreshCw size={14} />
+          同步免费模型列表
+        </Button>
       </motion.div>
 
       <motion.div

@@ -24,6 +24,10 @@ export const buildApp = async (config: AppConfig) => {
     proxyMode: config.proxyMode,
     outboundPreProxyEnabled: config.outboundPreProxyEnabled,
     outboundPreProxyUrl: config.outboundPreProxyUrl,
+    globalRequestsPerMinute: config.globalRequestsPerMinute,
+    apiKeyRequestsPerMinute: config.apiKeyRequestsPerMinute,
+    apiKeyMaxConcurrentRequests: config.apiKeyMaxConcurrentRequests,
+    apiKeyMaxConcurrentStreams: config.apiKeyMaxConcurrentStreams,
   });
   settingsStore.load();
   const settings = settingsStore.get();
@@ -65,10 +69,10 @@ export const buildApp = async (config: AppConfig) => {
   const adminSessions = new AdminSessionStore();
   const requestTracker = new RequestTracker();
   const limiter = await createLimiter({
-    globalRequestsPerMinute: config.globalRequestsPerMinute,
-    apiKeyRequestsPerMinute: config.apiKeyRequestsPerMinute,
-    apiKeyMaxConcurrentRequests: config.apiKeyMaxConcurrentRequests,
-    apiKeyMaxConcurrentStreams: config.apiKeyMaxConcurrentStreams,
+    globalRequestsPerMinute: settings.globalRequestsPerMinute,
+    apiKeyRequestsPerMinute: settings.apiKeyRequestsPerMinute,
+    apiKeyMaxConcurrentRequests: settings.apiKeyMaxConcurrentRequests,
+    apiKeyMaxConcurrentStreams: settings.apiKeyMaxConcurrentStreams,
   }, config.redisUrl, config.redisKeyPrefix);
   app.log.info({ limiter: await limiter.snapshot() }, "limiter_ready");
   app.addHook("onClose", async () => {

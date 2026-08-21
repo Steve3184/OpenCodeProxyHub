@@ -45,6 +45,10 @@ export interface SystemSettings {
   logAudit: boolean;
   logApiRequests: boolean;
   logRetentionDays: number;
+  globalRequestsPerMinute: number;
+  apiKeyRequestsPerMinute: number;
+  apiKeyMaxConcurrentRequests: number;
+  apiKeyMaxConcurrentStreams: number;
 }
 
 export interface ProxyNode {

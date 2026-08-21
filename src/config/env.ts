@@ -70,7 +70,7 @@ export const loadConfig = (): AppConfig => ({
   proxyMode: proxyModeFromEnv(),
   outboundPreProxyEnabled: boolFromEnv("OUTBOUND_PRE_PROXY_ENABLED", false),
   outboundPreProxyUrl: process.env.OUTBOUND_PRE_PROXY_URL || "",
-  proxyHealthCheckModel: process.env.PROXY_HEALTH_CHECK_MODEL?.trim() || "deepseek-v4-flash-free",
+  proxyHealthCheckModel: process.env.PROXY_HEALTH_CHECK_MODEL?.trim() || "big-pickle",
   proxyHealthCheckTimeoutMs: Math.max(1000, intFromEnv("PROXY_HEALTH_CHECK_TIMEOUT_MS", 10000)),
   proxyRecoveryIntervalMs: Math.max(1000, intFromEnv("PROXY_RECOVERY_INTERVAL_MS", 10 * 60 * 1000)),
 });

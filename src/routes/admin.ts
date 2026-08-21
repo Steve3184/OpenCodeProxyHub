@@ -150,6 +150,46 @@ export const registerAdminRoutes = async (
     return reply.code(204).send();
   });
 
+  app.post("/admin/models/sync-free", async (request, reply) => {
+    try {
+      const upstreamUrl = "https://opencode.ai/zen/v1/models";
+      const response = await fetch(upstreamUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch models from upstream: ${response.status}`);
+      }
+      const data = await response.json() as { data?: Array<{ id: string; object: string; created: number; owned_by: string }> };
+      if (!data.data || !Array.isArray(data.data)) {
+        throw new Error("Invalid response format from upstream");
+      }
+
+      const freeModels = data.data.filter((model) =>
+        model.id.endsWith("-free") || model.id === "big-pickle"
+      );
+
+      let syncedCount = 0;
+      for (const model of freeModels) {
+        modelStore.upsert(model.id, {
+          enabled: true,
+          ownedBy: model.owned_by || "opencode-free",
+          created: model.created || Math.floor(Date.now() / 1000),
+        });
+        syncedCount++;
+      }
+
+      audit(request, "models.sync_free", "success", { syncedCount, totalUpstream: data.data.length });
+      return reply.send({
+        data: {
+          synced: syncedCount,
+          models: freeModels.map((m) => m.id)
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to sync free models";
+      audit(request, "models.sync_free", "failure", { error: message });
+      return reply.code(500).send({ error: { message } });
+    }
+  });
+
   app.get("/admin/settings", async () => ({ data: settingsStore.get() }));
 
   app.patch<{ Body: SystemSettingsUpdate }>("/admin/settings", async (request, reply) => {

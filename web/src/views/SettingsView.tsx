@@ -65,6 +65,19 @@ export function SettingsView({ data }: { data: ConsoleData }) {
 
       <motion.div variants={fadeUp}>
         <Card className="p-5">
+          <h2 className="text-sm font-semibold">速率限制</h2>
+          <p className="mt-1 text-xs text-muted-foreground">设为 0 表示不限制</p>
+          <div className="mt-4 space-y-4">
+            {numberField("全局请求数/分钟", "globalRequestsPerMinute")}
+            {numberField("API Key 请求数/分钟", "apiKeyRequestsPerMinute")}
+            {numberField("API Key 最大并发请求", "apiKeyMaxConcurrentRequests")}
+            {numberField("API Key 最大并发流", "apiKeyMaxConcurrentStreams")}
+          </div>
+        </Card>
+      </motion.div>
+
+      <motion.div variants={fadeUp}>
+        <Card className="p-5">
           <h2 className="text-sm font-semibold">日志与审计</h2>
           <div className="mt-4 space-y-3">
             {toggleField("启用文件日志", "logEnabled")}

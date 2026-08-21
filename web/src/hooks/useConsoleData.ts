@@ -287,6 +287,11 @@ export function useConsoleData() {
       { refresh: false },
     );
 
+  const syncFreeModels = () =>
+    run(() => apiFetch<{ data: { synced: number; models: string[] } }>("/admin/models/sync-free", token, { method: "POST" }).then((result) => {
+      pushToast(`成功同步 ${result.data.synced} 个免费模型`, "success");
+    }), { successText: undefined });
+
   // ---- Settings ----
   const updateSettings = (patch: Partial<SystemSettings>) =>
     run(
@@ -361,6 +366,7 @@ export function useConsoleData() {
     toggleModel,
     toggleOpenAiStreamTransform,
     toggleReasoningTag,
+    syncFreeModels,
     updateSettings,
     createProxy,
     toggleProxy,
