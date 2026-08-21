@@ -58,7 +58,8 @@ export class MetricsStore {
     if (this.upstreamLatencies.length > 1000) this.upstreamLatencies.shift();
     if (input.error || input.statusCode >= 500 || input.statusCode === 429) {
       this.upstreamErrors += 1;
-      this.recordError("upstream", input.error || `Upstream HTTP ${input.statusCode}`, input.statusCode);
+      const proxySuffix = input.proxyId ? ` via proxy ${input.proxyId}` : "";
+      this.recordError("upstream", input.error || `Upstream HTTP ${input.statusCode}${proxySuffix}`, input.statusCode);
     }
   }
 

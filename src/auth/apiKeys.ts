@@ -317,13 +317,14 @@ export class ApiKeyStore {
   }
 
   private normalizePolicy(policy: ApiKeyPolicy | undefined): ApiKeyPolicy {
-    if (!policy) return {};
+    if (!policy) return { allowProxy: true };
     return {
       ...(policy.requestsPerMinute !== undefined ? { requestsPerMinute: Math.max(0, Math.trunc(policy.requestsPerMinute)) } : {}),
       ...(policy.maxConcurrentRequests !== undefined ? { maxConcurrentRequests: Math.max(0, Math.trunc(policy.maxConcurrentRequests)) } : {}),
       ...(policy.maxConcurrentStreams !== undefined ? { maxConcurrentStreams: Math.max(0, Math.trunc(policy.maxConcurrentStreams)) } : {}),
       ...(policy.allowedModels !== undefined ? { allowedModels: policy.allowedModels.map((model) => model.trim()).filter(Boolean) } : {}),
-      ...(policy.allowProxy !== undefined ? { allowProxy: Boolean(policy.allowProxy) } : {}),
+      // Proxy usage is enabled by default. Only an explicit false disables it.
+      allowProxy: policy.allowProxy !== false,
     };
   }
 }

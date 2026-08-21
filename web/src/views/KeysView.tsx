@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { motion } from "motion/react";
-import { Copy, KeyRound, Pencil, Plus, ShieldCheck, SlidersHorizontal, Trash2 } from "lucide-react";
+import { AlertTriangle, Copy, KeyRound, Pencil, Plus, ShieldCheck, SlidersHorizontal, Trash2 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -264,7 +264,10 @@ function PolicyModal({
   const [maxReq, setMaxReq] = useState(p.maxConcurrentRequests?.toString() ?? "");
   const [maxStream, setMaxStream] = useState(p.maxConcurrentStreams?.toString() ?? "");
   const [models, setModels] = useState((p.allowedModels || []).join(", "));
-  const [allowProxy, setAllowProxy] = useState(p.allowProxy ?? false);
+  // The backend treats an omitted allowProxy policy as allowed. Keep the
+  // policy editor consistent so saving unrelated limits does not silently
+  // disable the proxy pool for this key.
+  const [allowProxy, setAllowProxy] = useState(p.allowProxy ?? true);
 
   const num = (v: string) => (v.trim() === "" ? undefined : Number(v));
 
@@ -320,6 +323,12 @@ function PolicyModal({
         <Switch checked={allowProxy} onCheckedChange={setAllowProxy} />
         <span className="text-sm">允许使用出口代理</span>
       </label>
+      {!allowProxy && (
+        <p className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 p-2 text-xs text-warning" role="alert">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" aria-hidden="true" />
+          <span>已关闭代理：此 API Key 的请求将绕过代理池，不参与代理切号、代理失败和 Token 用量统计。</span>
+        </p>
+      )}
     </Modal>
   );
 }

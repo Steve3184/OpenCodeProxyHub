@@ -53,7 +53,7 @@ export function AliasesView({ data }: { data: ConsoleData }) {
           </div>
           <div className="mt-3 space-y-2">
             {aliases.map((alias, index) => (
-              <div key={`${index}-${alias.downstreamModelId}`} className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto] items-center gap-2">
+              <div key={index} className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto] items-center gap-2">
                 <Input
                   value={alias.upstreamModelId}
                   disabled={busy}
