@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { ApiKeyStore } from "../auth/apiKeys.js";
 import type { AppConfig } from "../config/env.js";
 import type { ModelConfigStore } from "../models/catalog.js";
+import type { ModelAliasStore } from "../models/aliases.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { prepareZenRequest, pipeZenOpenAIResponse } from "../providers/zenClient.js";
 import { pipeAnthropicSseAsOpenAI } from "../converters/anthropicSseToOpenAi.js";
@@ -19,6 +20,7 @@ export const registerOpenAIRoutes = async (
   config: AppConfig,
   keyStore: ApiKeyStore,
   modelStore: ModelConfigStore,
+  modelAliasStore: ModelAliasStore,
   settingsStore: SettingsStore,
   sessions: SessionStore,
   proxyPool: ProxyPoolStore,
@@ -42,7 +44,7 @@ export const registerOpenAIRoutes = async (
     keyStore.recordClientUsage(auth.id, request.headers);
 
     const {
-      model,
+      model: downstreamModel,
       messages,
       stream,
       tools,
@@ -57,6 +59,7 @@ export const registerOpenAIRoutes = async (
       seed,
       user,
     } = request.body || {} as OpenAIChatRequest;
+    const model = downstreamModel;
     const isStream = Boolean(stream);
     const limit = await limiter.acquire(auth.id, isStream, {
       requestsPerMinute: auth.policy.requestsPerMinute,
@@ -78,7 +81,12 @@ export const registerOpenAIRoutes = async (
     reply.raw.once("close", release);
     reply.raw.once("finish", release);
 
-    if (!model || !modelStore.isEnabled(model)) {
+    if (!model || !modelAliasStore.isAllowed(model)) {
+      release();
+      return reply.code(400).send({ error: { message: `Model alias is required: ${model}`, type: "invalid_request_error" } });
+    }
+    const upstreamModel = modelAliasStore.resolveUpstream(model);
+    if (!modelAliasStore.find(model) && !modelStore.isEnabled(upstreamModel)) {
       release();
       return reply.code(400).send({ error: { message: `Unknown or disabled model: ${model}. Available: ${modelStore.enabledIds().join(", ")}` } });
     }
@@ -92,7 +100,7 @@ export const registerOpenAIRoutes = async (
     }
 
     const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "openai", model, request.headers));
-    app.log.info({ user: auth.name, model, stream: isStream, messageCount: messages.length }, "openai_request");
+    app.log.info({ user: auth.name, model, upstreamModel, stream: isStream, messageCount: messages.length }, "openai_request");
     const resolveTransform = (settings: ReturnType<typeof settingsStore.get>): string => {
       if (!isStream) return "passthrough";
       if (settings.openAiStreamTransformModels.includes(model)) return "anthropic-sse-to-openai";
@@ -109,7 +117,7 @@ export const registerOpenAIRoutes = async (
         apiKeyId: auth.id,
         apiKeyName: auth.name,
         clientId: clientIdFromHeaders(request.headers),
-        model,
+        model: downstreamModel,
         stream: isStream,
         messageCount: messages.length,
         statusCode,
@@ -127,7 +135,7 @@ export const registerOpenAIRoutes = async (
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
-      model,
+      model: upstreamModel,
       messages,
       stream: isStream,
       tools,
@@ -146,6 +154,6 @@ export const registerOpenAIRoutes = async (
       pipeOpenAiStreamStrippingThink(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest);
       return;
     }
-    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics, prepareRequest);
+    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, model);
   });
 };

@@ -1,5 +1,5 @@
 import { motion } from "motion/react";
-import { Activity, BarChart3, Gauge, KeyRound, Network, SlidersHorizontal, Workflow } from "lucide-react";
+import { Activity, BarChart3, Gauge, KeyRound, Network, SlidersHorizontal, Workflow, Waypoints } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { View } from "../types";
 
@@ -7,6 +7,7 @@ const navItems: Array<{ view: View; label: string; icon: React.ComponentType<{ s
   { view: "dashboard", label: "总览", icon: Gauge },
   { view: "keys", label: "API Keys", icon: KeyRound },
   { view: "models", label: "模型", icon: Activity },
+  { view: "aliases", label: "模型别名", icon: Waypoints },
   { view: "settings", label: "设置", icon: SlidersHorizontal },
   { view: "proxy", label: "代理池", icon: Network },
   { view: "monitor", label: "监控", icon: BarChart3 },

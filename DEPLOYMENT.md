@@ -41,6 +41,7 @@ The Compose file stores JSON runtime configuration under `./data`:
 ```text
 data/api-keys.json
 data/models.json
+data/model-aliases.json
 data/settings.json
 data/proxies.json
 ```

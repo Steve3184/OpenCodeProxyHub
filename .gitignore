@@ -8,6 +8,7 @@ coverage/
 logs/
 api-keys.json
 models.json
+model-aliases.json
 settings.json
 proxies.json
 data/

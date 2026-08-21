@@ -10,6 +10,7 @@ import { Toasts } from "./components/Toasts";
 import { DashboardView } from "./views/DashboardView";
 import { KeysView } from "./views/KeysView";
 import { ModelsView } from "./views/ModelsView";
+import { AliasesView } from "./views/AliasesView";
 import { SettingsView } from "./views/SettingsView";
 import { ProxyView } from "./views/ProxyView";
 import { MonitorView } from "./views/MonitorView";
@@ -104,6 +105,7 @@ export default function App() {
               {view === "dashboard" && <DashboardView data={data} onSelect={setView} />}
               {view === "keys" && <KeysView data={data} />}
               {view === "models" && <ModelsView data={data} />}
+              {view === "aliases" && <AliasesView data={data} />}
               {view === "settings" && <SettingsView data={data} />}
               {view === "proxy" && <ProxyView data={data} />}
               {view === "monitor" && <MonitorView data={data} />}

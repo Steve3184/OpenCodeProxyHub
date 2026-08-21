@@ -7,6 +7,7 @@ import type {
   HealthPayload,
   MetricsPayload,
   ModelItem,
+  ModelAliasConfig,
   ProxyDraft,
   ProxyNode,
   RuntimePayload,
@@ -55,6 +56,7 @@ export function useConsoleData() {
   const [health, setHealth] = useState<HealthPayload | null>(null);
   const [apiKeys, setApiKeys] = useState<ApiKeyItem[]>([]);
   const [models, setModels] = useState<ModelItem[]>([]);
+  const [modelAliases, setModelAliases] = useState<ModelAliasConfig>({ onlyConfiguredAliases: false, aliases: [] });
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [proxies, setProxies] = useState<ProxyNode[]>([]);
   const [runtime, setRuntime] = useState<RuntimePayload | null>(null);
@@ -89,6 +91,7 @@ export function useConsoleData() {
     setAuthMode(null);
     setApiKeys([]);
     setModels([]);
+    setModelAliases({ onlyConfiguredAliases: false, aliases: [] });
     setSettings(null);
     setProxies([]);
     setRuntime(null);
@@ -106,9 +109,10 @@ export function useConsoleData() {
       setHealth(healthData);
       if (!activeToken) return;
 
-      const [keysData, modelsData, settingsData, proxiesData, runtimeData, metricsResult] = await Promise.all([
+      const [keysData, modelsData, aliasesData, settingsData, proxiesData, runtimeData, metricsResult] = await Promise.all([
         apiFetch<{ data: ApiKeyItem[] }>("/admin/api-keys", activeToken),
         apiFetch<{ data: ModelItem[] }>("/admin/models", activeToken),
+        apiFetch<{ data: ModelAliasConfig }>("/admin/model-aliases", activeToken),
         apiFetch<{ data: SystemSettings }>("/admin/settings", activeToken),
         apiFetch<{ data: ProxyNode[] }>("/admin/proxies", activeToken),
         apiFetch<{ data: RuntimePayload }>("/admin/runtime", activeToken),
@@ -116,6 +120,7 @@ export function useConsoleData() {
       ]);
       setApiKeys(keysData.data);
       setModels(modelsData.data);
+      setModelAliases(aliasesData.data);
       setSettings(settingsData.data);
       setProxies(proxiesData.data);
       setRuntime(runtimeData.data);
@@ -292,6 +297,18 @@ export function useConsoleData() {
       pushToast(`成功同步 ${result.data.synced} 个免费模型`, "success");
     }), { successText: undefined });
 
+  const updateModelAliases = (config: ModelAliasConfig) =>
+    run(
+      async () => {
+        const result = await apiFetch<{ data: ModelAliasConfig }>("/admin/model-aliases", token, {
+          method: "PUT",
+          body: JSON.stringify(config),
+        });
+        setModelAliases(result.data);
+      },
+      { refresh: false, successText: "模型别名已更新" },
+    );
+
   // ---- Settings ----
   const updateSettings = (patch: Partial<SystemSettings>) =>
     run(
@@ -341,6 +358,7 @@ export function useConsoleData() {
     health,
     apiKeys,
     models,
+    modelAliases,
     settings,
     proxies,
     runtime,
@@ -367,6 +385,7 @@ export function useConsoleData() {
     toggleOpenAiStreamTransform,
     toggleReasoningTag,
     syncFreeModels,
+    updateModelAliases,
     updateSettings,
     createProxy,
     toggleProxy,

@@ -24,6 +24,7 @@ export interface AppConfig {
   port: number;
   keysFile: string;
   modelsFile: string;
+  modelAliasesFile: string;
   settingsFile: string;
   proxiesFile: string;
   logsDir: string;
@@ -52,6 +53,7 @@ export const loadConfig = (): AppConfig => ({
   port: intFromEnv("PROXY_PORT", 6446),
   keysFile: process.env.KEYS_FILE || "./api-keys.json",
   modelsFile: process.env.MODELS_FILE || "./models.json",
+  modelAliasesFile: process.env.MODEL_ALIASES_FILE || "./model-aliases.json",
   settingsFile: process.env.SETTINGS_FILE || "./settings.json",
   proxiesFile: process.env.PROXIES_FILE || "./proxies.json",
   logsDir: process.env.LOGS_DIR || "./logs",

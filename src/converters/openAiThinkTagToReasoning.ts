@@ -3,7 +3,7 @@ import type { ServerResponse } from "node:http";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
-import { extractTokenUsage } from "../utils/tokenUsage.js";
+import { createTokenUsageAccumulator } from "../utils/tokenUsage.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -119,11 +119,11 @@ const sendHeaders = (res: ServerResponse): void => {
  * `choices[0].delta.reasoning_content`, leaving only the visible text in `content`.
  * Chunks without a content delta are forwarded unchanged.
  */
-const rewriteChunk = (parsed: any, splitter: ThinkTagSplitter): unknown => {
+const rewriteChunk = (parsed: any, splitter: ThinkTagSplitter, responseModel?: string): unknown => {
   const choice = Array.isArray(parsed?.choices) ? parsed.choices[0] : undefined;
   const delta = choice?.delta;
   if (!delta || typeof delta.content !== "string" || delta.content.length === 0) {
-    return parsed;
+    return responseModel ? { ...parsed, model: responseModel } : parsed;
   }
 
   const { reasoning, content } = splitter.push(delta.content);
@@ -135,6 +135,7 @@ const rewriteChunk = (parsed: any, splitter: ThinkTagSplitter): unknown => {
 
   return {
     ...parsed,
+    ...(responseModel ? { model: responseModel } : {}),
     choices: [{ ...choice, delta: nextDelta }, ...parsed.choices.slice(1)],
   };
 };
@@ -163,9 +164,8 @@ export const pipeOpenAiStreamStrippingThink = (
   let firstChunkChecked = false;
   let aborted = false;
   let retryStarted = false;
-  let observedTotalTokens: number | null = null;
-  let observedUsageTokens = 0;
-  let observedUsage = false;
+  let settled = false;
+  const usageAccumulator = createTokenUsageAccumulator();
   let observedOutputChars = 0;
   let rateLimitBody = "";
 
@@ -182,7 +182,7 @@ export const pipeOpenAiStreamStrippingThink = (
 
   const req = https.request(prepared.options, (zenRes) => {
     zenRes.on("data", (chunk: Buffer) => {
-      if (aborted) return;
+      if (settled || retryStarted || aborted) return;
       if (zenRes.statusCode === 429) {
         rateLimitBody += chunk.toString();
         return;
@@ -193,25 +193,30 @@ export const pipeOpenAiStreamStrippingThink = (
       // First-chunk error/rate-limit detection (mirrors pipeZenOpenAIResponse).
       if (!firstChunkChecked) {
         const str = buffer.trim();
-        if (zenRes.statusCode === 429 || (str.startsWith("{") && (str.includes("FreeUsageLimitError") || str.includes("rate_limit_error") || str.toLowerCase().includes("rate limit")))) {
+        if (str.startsWith("{")) {
           try {
             const parsed = JSON.parse(str);
-            if (zenRes.statusCode === 429 || parsed.error || parsed.type === "error") {
+            const rateLimited = zenRes.statusCode === 429 || str.includes("FreeUsageLimitError") || str.includes("rate_limit_error") || str.toLowerCase().includes("rate limit");
+            if (parsed.error || parsed.type === "error") {
               firstChunkChecked = true;
               aborted = true;
               const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
-              if (prepared.lease?.node && proxyPool) {
-                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: 429 });
+              if (prepared.lease?.node && proxyPool && !markedFailure) {
+                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : 502, leaseId: prepared.lease.leaseId });
                 markedFailure = true;
               }
-              if (retryRateLimited()) {
+              if (rateLimited && retryRateLimited()) {
+                settled = true;
                 zenRes.resume();
                 return;
               }
+              settled = true;
               if (!res.headersSent) {
-                res.writeHead(429, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: { message: `${errMsg} (free model rate limit)`, type: "rate_limit_error", code: "rate_limit_exceeded" } }));
+                const responseStatus = rateLimited ? 429 : 502;
+                res.writeHead(responseStatus, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: { message: rateLimited ? `${errMsg} (free model rate limit)` : errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
               }
+              metrics?.recordUpstream({ statusCode: rateLimited ? 429 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
               zenRes.resume();
               return;
             }
@@ -235,15 +240,10 @@ export const pipeOpenAiStreamStrippingThink = (
         sendHeaders(res);
         try {
           const parsed = JSON.parse(block.data);
-          const usage = extractTokenUsage(parsed);
-          if (usage.totalTokens !== null) {
-            observedUsage = true;
-            if (usage.inputTokens > 0 && usage.outputTokens > 0) observedTotalTokens = usage.totalTokens;
-            else observedUsageTokens += usage.totalTokens;
-          }
+          usageAccumulator.observe(parsed);
           const content = parsed.choices?.[0]?.delta?.content;
           if (typeof content === "string") observedOutputChars += content.length;
-          writeSse(res, rewriteChunk(parsed, splitter));
+          writeSse(res, rewriteChunk(parsed, splitter, _model));
         } catch {
           // Forward unparseable payloads untouched rather than dropping them.
           res.write(`data: ${block.data}\n\n`);
@@ -252,32 +252,42 @@ export const pipeOpenAiStreamStrippingThink = (
     });
 
     zenRes.on("end", () => {
-      if (retryStarted) return;
-      if ((zenRes.statusCode || 502) === 429) {
+      if (settled || retryStarted) return;
+      settled = true;
+      const status = zenRes.statusCode || 502;
+      if (status >= 400) {
+        const rateLimited = status === 429 || rateLimitBody.includes("FreeUsageLimitError") || rateLimitBody.includes("rate_limit_error") || rateLimitBody.toLowerCase().includes("rate limit");
+        let errMsg = rateLimited ? "Upstream returned 429" : `Upstream returned HTTP ${status}`;
+        try {
+          const parsed = JSON.parse(rateLimitBody);
+          errMsg = parsed.error?.message || parsed.message || errMsg;
+        } catch {
+          // Keep the generic upstream message for malformed bodies.
+        }
         if (prepared.lease?.node && proxyPool && !markedFailure) {
-          let errMsg = "Upstream returned 429";
-          try {
-            const parsed = JSON.parse(rateLimitBody);
-            errMsg = parsed.error?.message || parsed.message || errMsg;
-          } catch {
-            // Keep the generic rate-limit message for malformed upstream bodies.
-          }
-          proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: 429 });
+          proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : status, leaseId: prepared.lease.leaseId });
           markedFailure = true;
         }
-        if (retryRateLimited()) return;
+        if (rateLimited && retryRateLimited()) return;
         if (!res.headersSent) {
-          res.writeHead(429, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "Upstream returned 429", type: "rate_limit_error", code: "rate_limit_exceeded" } }));
+          const responseStatus = rateLimited ? 429 : status;
+          res.writeHead(responseStatus, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: rateLimited ? "Upstream returned 429" : errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
         } else if (!res.writableEnded) {
           res.end();
         }
-        metrics?.recordUpstream({ statusCode: 429, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+        metrics?.recordUpstream({ statusCode: rateLimited ? 429 : status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
         return;
       }
       if (prepared.lease?.node && proxyPool && !markedFailure) {
-        proxyPool.markSuccess(prepared.lease.node.id);
-        proxyPool.recordTokenUsage(prepared.lease.node.id, observedTotalTokens ?? (observedUsage ? observedUsageTokens : Math.ceil(prepared.body.length / 4) + Math.ceil(observedOutputChars / 4)));
+        const status = zenRes.statusCode || 502;
+        if (status >= 200 && status < 300) {
+          proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
+          proxyPool.recordTokenUsage(prepared.lease.node.id, usageAccumulator.totalTokens() ?? (Math.ceil(prepared.body.length / 4) + Math.ceil(observedOutputChars / 4)));
+        } else {
+          proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${status}`, { statusCode: status, leaseId: prepared.lease.leaseId });
+          markedFailure = true;
+        }
       }
       metrics?.recordUpstream({ statusCode: zenRes.statusCode || 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
 
@@ -296,6 +306,7 @@ export const pipeOpenAiStreamStrippingThink = (
         sendHeaders(res);
         writeSse(res, {
           object: "chat.completion.chunk",
+          model: _model,
           choices: [{ index: 0, delta: { ...(tail.reasoning ? { reasoning_content: tail.reasoning } : {}), ...(tail.content ? { content: tail.content } : {}) }, finish_reason: null }],
         });
       }
@@ -304,13 +315,19 @@ export const pipeOpenAiStreamStrippingThink = (
   });
 
   res.on("close", () => {
+    if (!settled && !retryStarted) {
+      settled = true;
+      if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);
+    }
     if (!req.destroyed) req.destroy();
   });
 
   req.on("error", (error) => {
-    if (retryStarted) return;
+    if (settled || retryStarted) return;
+    if (markedFailure) return;
+    settled = true;
     if (prepared.lease?.node && proxyPool && !markedFailure) {
-      proxyPool.markFailure(prepared.lease.node.id, error.message);
+      proxyPool.markFailure(prepared.lease.node.id, error.message, { leaseId: prepared.lease.leaseId });
       markedFailure = true;
     }
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
@@ -323,10 +340,12 @@ export const pipeOpenAiStreamStrippingThink = (
   });
 
   req.on("timeout", () => {
-    if (retryStarted) return;
+    if (settled || retryStarted) return;
+    if (markedFailure) return;
+    settled = true;
     req.destroy();
     if (prepared.lease?.node && proxyPool && !markedFailure) {
-      proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout");
+      proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout", { statusCode: 504, leaseId: prepared.lease.leaseId });
       markedFailure = true;
     }
     metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });

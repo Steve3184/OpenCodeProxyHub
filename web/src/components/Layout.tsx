@@ -11,6 +11,7 @@ const viewTitles: Record<View, string> = {
   dashboard: "总览",
   keys: "API Key 管理",
   models: "模型",
+  aliases: "模型别名",
   settings: "系统设置",
   proxy: "出口代理池",
   monitor: "运行监控",

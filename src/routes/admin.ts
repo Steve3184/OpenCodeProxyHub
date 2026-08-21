@@ -4,6 +4,7 @@ import type { AppConfig } from "../config/env.js";
 import { adminAuthMode, isAdminRequest, passwordMatches, tokenFromRequest } from "../auth/adminAuth.js";
 import type { AdminSessionStore } from "../auth/adminSessions.js";
 import type { ModelConfigStore, ModelUpdateInput } from "../models/catalog.js";
+import type { ModelAliasStore, ModelAliasUpdateInput } from "../models/aliases.js";
 import type { SettingsStore, SystemSettingsUpdate } from "../settings/settingsStore.js";
 import type { ProxyInput, ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { AsyncLimiter } from "../rateLimit/limiter.js";
@@ -32,6 +33,7 @@ export const registerAdminRoutes = async (
   config: AppConfig,
   keyStore: ApiKeyStore,
   modelStore: ModelConfigStore,
+  modelAliasStore: ModelAliasStore,
   settingsStore: SettingsStore,
   proxyPool: ProxyPoolStore,
   limiter: AsyncLimiter,
@@ -127,6 +129,23 @@ export const registerAdminRoutes = async (
   });
 
   app.get("/admin/models", async () => ({ data: modelStore.list() }));
+
+  app.get("/admin/model-aliases", async () => ({ data: modelAliasStore.get() }));
+
+  app.put<{ Body: ModelAliasUpdateInput }>("/admin/model-aliases", async (request, reply) => {
+    try {
+      const config = modelAliasStore.update(request.body || {});
+      audit(request, "model_aliases.update", "success", {
+        aliasCount: config.aliases.length,
+        onlyConfiguredAliases: config.onlyConfiguredAliases,
+      });
+      return reply.send({ data: config });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to save model aliases";
+      audit(request, "model_aliases.update", "failure", { error: message });
+      return reply.code(400).send({ error: { message } });
+    }
+  });
 
   app.put<{ Params: { id: string }; Body: ModelUpdateInput }>("/admin/models/:id", async (request, reply) => {
     try {

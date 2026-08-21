@@ -4,7 +4,7 @@ import { ocId } from "../utils/ids.js";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
-import { extractTokenUsage } from "../utils/tokenUsage.js";
+import { createTokenUsageAccumulator } from "../utils/tokenUsage.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -117,7 +117,9 @@ const handleParsedPayload = (state: TransformState, res: ServerResponse, parsed:
 
   if (Array.isArray(parsed?.choices)) {
     sendHeaders(res);
-    writeSse(res, parsed);
+    // Some upstream deployments emit OpenAI-shaped chunks even on this path.
+    // Keep the downstream alias visible in those raw chunks too.
+    writeSse(res, { ...parsed, model: state.model });
     return;
   }
 
@@ -201,9 +203,8 @@ export const pipeAnthropicSseAsOpenAI = (
   let markedFailure = false;
   let receivedData = false;
   let retryStarted = false;
-  let observedTotalTokens: number | null = null;
-  let observedUsageTokens = 0;
-  let observedUsage = false;
+  let settled = false;
+  const usageAccumulator = createTokenUsageAccumulator();
   let observedOutputChars = 0;
 
   const retryRateLimited = (): boolean => {
@@ -219,6 +220,7 @@ export const pipeAnthropicSseAsOpenAI = (
 
   const req = https.request(prepared.options, (zenRes) => {
     zenRes.on("data", (chunk: Buffer) => {
+      if (settled || retryStarted) return;
       receivedData = true;
       buffer += chunk.toString();
 
@@ -228,17 +230,20 @@ export const pipeAnthropicSseAsOpenAI = (
           if (parsed.error || parsed.type === "error" || zenRes.statusCode === 429) {
             const message = parsed.error?.message || parsed.message || "Upstream error";
             const rateLimited = zenRes.statusCode === 429 || buffer.includes("FreeUsageLimitError") || buffer.includes("rate_limit_error") || buffer.toLowerCase().includes("rate limit");
-            if (rateLimited) {
-              if (prepared.lease?.node && proxyPool) {
-                proxyPool.markFailure(prepared.lease.node.id, message, { statusCode: 429 });
-                markedFailure = true;
-              }
-              if (retryRateLimited()) {
-                zenRes.resume();
-                return;
-              }
+            if (prepared.lease?.node && proxyPool && !markedFailure) {
+              proxyPool.markFailure(prepared.lease.node.id, message, { statusCode: rateLimited ? 429 : 502, leaseId: prepared.lease.leaseId });
+              markedFailure = true;
             }
-            writeOpenAiError(res, zenRes.statusCode || 502, message);
+            if (rateLimited && retryRateLimited()) {
+              settled = true;
+              zenRes.resume();
+              return;
+            }
+            settled = true;
+            const upstreamStatus = zenRes.statusCode || 502;
+            const responseStatus = rateLimited ? 429 : (upstreamStatus >= 400 ? upstreamStatus : 502);
+            writeOpenAiError(res, responseStatus, message);
+            metrics?.recordUpstream({ statusCode: responseStatus, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
             zenRes.resume();
             return;
           }
@@ -258,12 +263,7 @@ export const pipeAnthropicSseAsOpenAI = (
         if (!block.data) continue;
         try {
           const parsed = JSON.parse(block.data);
-          const usage = extractTokenUsage(parsed);
-          if (usage.totalTokens !== null) {
-            observedUsage = true;
-            if (usage.inputTokens > 0 && usage.outputTokens > 0) observedTotalTokens = usage.totalTokens;
-            else observedUsageTokens += usage.totalTokens;
-          }
+          usageAccumulator.observe(parsed);
           const text = parsed.delta?.text || parsed.delta?.thinking || parsed.content_block?.text;
           if (typeof text === "string") observedOutputChars += text.length;
           handleParsedPayload(state, res, parsed);
@@ -274,22 +274,30 @@ export const pipeAnthropicSseAsOpenAI = (
     });
 
     zenRes.on("end", () => {
-      if (retryStarted) return;
-      if ((zenRes.statusCode || 502) === 429) {
+      if (settled || retryStarted) return;
+      settled = true;
+      const status = zenRes.statusCode || 502;
+      if (status >= 400) {
+        const rateLimited = status === 429 || buffer.includes("FreeUsageLimitError") || buffer.includes("rate_limit_error") || buffer.toLowerCase().includes("rate limit");
         if (prepared.lease?.node && proxyPool && !markedFailure) {
-          proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429 });
+          proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${status}`, { statusCode: rateLimited ? 429 : status, leaseId: prepared.lease.leaseId });
           markedFailure = true;
         }
-        if (retryRateLimited()) return;
-        writeOpenAiError(res, 429, "Upstream returned 429");
+        if (rateLimited && retryRateLimited()) return;
+        writeOpenAiError(res, rateLimited ? 429 : status, rateLimited ? "Upstream returned 429" : `Upstream returned HTTP ${status}`);
         if (!res.writableEnded) res.end();
-        metrics?.recordUpstream({ statusCode: 429, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+        metrics?.recordUpstream({ statusCode: rateLimited ? 429 : status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
         return;
       }
       if (prepared.lease?.node && proxyPool && !markedFailure) {
-        proxyPool.markSuccess(prepared.lease.node.id);
+        const status = zenRes.statusCode || 502;
+        if (status >= 200 && status < 300) proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
+        else {
+          proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${status}`, { statusCode: status, leaseId: prepared.lease.leaseId });
+          markedFailure = true;
+        }
         const inputTokens = Math.ceil(prepared.body.length / 4);
-        proxyPool.recordTokenUsage(prepared.lease.node.id, observedTotalTokens ?? (observedUsage ? observedUsageTokens : inputTokens + Math.ceil(observedOutputChars / 4)));
+        if (status >= 200 && status < 300) proxyPool.recordTokenUsage(prepared.lease.node.id, usageAccumulator.totalTokens() ?? (inputTokens + Math.ceil(observedOutputChars / 4)));
       }
       metrics?.recordUpstream({ statusCode: zenRes.statusCode || 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
 
@@ -303,13 +311,19 @@ export const pipeAnthropicSseAsOpenAI = (
   });
 
   res.on("close", () => {
+    if (!settled && !retryStarted) {
+      settled = true;
+      if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);
+    }
     if (!req.destroyed) req.destroy();
   });
 
   req.on("error", (error) => {
-    if (retryStarted) return;
+    if (settled || retryStarted) return;
+    if (markedFailure) return;
+    settled = true;
     if (prepared.lease?.node && proxyPool && !markedFailure) {
-      proxyPool.markFailure(prepared.lease.node.id, error.message);
+      proxyPool.markFailure(prepared.lease.node.id, error.message, { leaseId: prepared.lease.leaseId });
       markedFailure = true;
     }
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
@@ -321,10 +335,12 @@ export const pipeAnthropicSseAsOpenAI = (
   });
 
   req.on("timeout", () => {
-    if (retryStarted) return;
+    if (settled || retryStarted) return;
+    if (markedFailure) return;
+    settled = true;
     req.destroy();
     if (prepared.lease?.node && proxyPool && !markedFailure) {
-      proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout");
+      proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout", { statusCode: 504, leaseId: prepared.lease.leaseId });
       markedFailure = true;
     }
     metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });

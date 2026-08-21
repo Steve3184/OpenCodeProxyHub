@@ -154,7 +154,7 @@ npm start            # 运行已构建的 dist/main.js
   - HTTP / 上游请求计数、最近小时请求趋势、错误率、P50/P95/P99 延迟、按状态码与路由分布、按代理分布、最近错误
   - 可配置的文件日志：管理审计日志、AI 请求摘要日志（含出口代理字段）、错误日志，JSONL 按天切分、按保留天数自动清理
 - **内置 Web 控制台**（`/app`）
-  - 总览、API Keys、模型、设置、代理池、监控六大页面
+  - 总览、API Keys、模型、模型别名、设置、代理池、监控七大页面
   - 代理池含成功率、近 N 次请求结果色条、用量/并发/连续 429 数值与 Token 统计
 - **运维友好**
   - 优雅停机：关闭前排空在途请求（可配置超时）
@@ -278,6 +278,7 @@ curl http://127.0.0.1:6446/v1/messages \
 - **总览**：网关状态、Key 数量、代理节点、AI 请求数等关键指标
 - **API Keys**：创建（明文显示一次并可复制）、启用/禁用、删除、备注与标签、每 Key 策略（RPM、并发、模型白名单、是否允许代理）、查看请求量与最近客户端
 - **模型**：启用/禁用模型，按模型开启 `anthropic-sse-to-openai` 与 `think-to-reasoning` 两种流式转换
+- **模型别名**：配置下游 model ID 到上游 model ID 的映射，可开启“只允许使用已配置的别名”来屏蔽未配置的默认模型
 - **设置**：上游超时、请求体限制、默认流式、代理使用模式、链式前置代理、文件日志与审计开关、日志保留天数
 - **代理池**：新增/编辑/删除/测试节点，查看优先节点、成功率、近 N 次请求结果色条、用量/并发/连续 429 数值与 Token 统计
 - **监控**：HTTP/上游请求量、按小时请求趋势、错误率、延迟分位、状态码与路由分布、限流器后端、运行时长、最近错误
@@ -293,6 +294,7 @@ PROXY_PORT=6446                         # 监听端口
 PROXY_HOST=0.0.0.0                      # 监听地址
 KEYS_FILE=./api-keys.json               # API Key 持久化文件
 MODELS_FILE=./models.json               # 模型配置文件
+MODEL_ALIASES_FILE=./model-aliases.json # 模型别名配置文件
 SETTINGS_FILE=./settings.json           # 系统设置文件
 PROXIES_FILE=./proxies.json             # 代理池文件
 LOGS_DIR=./logs                         # 日志目录
@@ -356,6 +358,8 @@ DELETE /admin/api-keys/:id       # 删除 API Key
 GET    /admin/models             # 列出模型
 PUT    /admin/models/:id         # 新增或更新模型
 DELETE /admin/models/:id         # 删除模型
+GET    /admin/model-aliases      # 读取模型别名配置
+PUT    /admin/model-aliases      # 更新模型别名配置
 GET    /admin/settings           # 读取系统设置
 PATCH  /admin/settings           # 更新系统设置（热生效）
 GET    /admin/proxies            # 列出代理节点
@@ -392,6 +396,7 @@ curl -X PATCH http://127.0.0.1:6446/admin/settings \
 ```text
 api-keys.json    # API Key（哈希，可选明文）
 models.json      # 模型开关与元数据
+model-aliases.json # 下游到上游的模型别名映射
 settings.json    # 系统设置
 proxies.json     # 代理池节点与运行计数
 ```

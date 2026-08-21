@@ -61,6 +61,8 @@ export interface ProxyInput {
 
 export interface ProxyLease {
   node: ProxyNode | null;
+  /** Unique lease token used to make settlement/release idempotent. */
+  leaseId?: string;
   agent?: https.Agent;
   requiredUnavailable?: boolean;
 }
@@ -91,6 +93,7 @@ export class ProxyPoolStore {
   private readonly store: JsonFileStore<ProxyFile>;
   private proxies: ProxyNode[] = [];
   private readonly recoveryTestsInFlight = new Set<string>();
+  private readonly activeLeases = new Map<string, string>();
 
   constructor(proxiesFile: string, private readonly settingsStore: SettingsStore) {
     this.store = new JsonFileStore<ProxyFile>(proxiesFile);
@@ -149,6 +152,9 @@ export class ProxyPoolStore {
     const before = this.proxies.length;
     this.proxies = this.proxies.filter((node) => node.id !== id);
     if (this.proxies.length === before) return false;
+    for (const [leaseId, nodeId] of this.activeLeases) {
+      if (nodeId === id) this.activeLeases.delete(leaseId);
+    }
     this.persist();
     return true;
   }
@@ -167,36 +173,56 @@ export class ProxyPoolStore {
     const node = candidates[0];
     if (!node) return { node: null, requiredUnavailable: this.settingsStore.get().proxyMode === "required" };
 
+    // Construct the agent before mutating counters. A malformed persisted proxy
+    // must not consume a concurrency slot when agent construction throws.
+    let agent: https.Agent;
+    try {
+      agent = this.createAgent(node);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to create proxy agent";
+      node.failCount += 1;
+      node.lastError = message;
+      node.lastCheckedAt = new Date().toISOString();
+      node.cooldownUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      this.recordResult(node, false, 502);
+      this.persist();
+      // Try another node immediately; optional mode can still fall back to direct.
+      return this.acquire(new Set([...excludeProxyIds, node.id]));
+    }
     node.currentConcurrency += 1;
     node.dailyRequestCount += 1;
     node.lastUsedAt = new Date().toISOString();
     this.disableIfDailyLimitReached(node);
     this.persist();
 
-    return { node: { ...node }, agent: this.createAgent(node) };
+    const leaseId = crypto.randomUUID();
+    this.activeLeases.set(leaseId, node.id);
+    return { node: { ...node }, leaseId, agent };
   }
 
-  release(id: string): void {
+  release(id: string, leaseId?: string): void {
     const node = this.find(id);
     if (!node) return;
-    node.currentConcurrency = Math.max(0, node.currentConcurrency - 1);
+    if (!this.takeLease(id, leaseId)) return;
     this.persist();
   }
 
-  markSuccess(id: string): void {
+  markSuccess(id: string, leaseId?: string, statusCode = 200): void {
     const node = this.find(id);
     if (!node) return;
+    if (!this.takeLease(id, leaseId)) return;
     node.successCount += 1;
     if (!node.autoDisabledBy429) node.consecutiveRateLimitCount = 0;
-    this.recordResult(node, true, 200);
+    this.recordResult(node, true, statusCode);
     if (!node.autoDisabledBy429) node.lastError = null;
     node.lastCheckedAt = new Date().toISOString();
-    this.release(id);
+    this.persist();
   }
 
-  markFailure(id: string, error: string, options: { statusCode?: number; cooldownMs?: number } = {}): void {
+  markFailure(id: string, error: string, options: { statusCode?: number; cooldownMs?: number; leaseId?: string } = {}): void {
     const node = this.find(id);
     if (!node) return;
+    if (!this.takeLease(id, options.leaseId)) return;
     node.failCount += 1;
     this.recordResult(node, false, options.statusCode || 502);
     node.lastError = error;
@@ -216,7 +242,7 @@ export class ProxyPoolStore {
         node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? 5 * 60 * 1000)).toISOString();
       }
     }
-    this.release(id);
+    this.persist();
   }
 
   recordTokenUsage(id: string, totalTokens: number): void {
@@ -524,6 +550,21 @@ export class ProxyPoolStore {
 
   private find(id: string): ProxyNode | undefined {
     return this.proxies.find((node) => node.id === id);
+  }
+
+  private takeLease(id: string, leaseId?: string): boolean {
+    const node = this.find(id);
+    if (!node) return false;
+    if (leaseId !== undefined) {
+      if (this.activeLeases.get(leaseId) !== id) return false;
+      this.activeLeases.delete(leaseId);
+    } else {
+      const legacyLease = [...this.activeLeases.entries()].find(([, nodeId]) => nodeId === id);
+      if (!legacyLease) return false;
+      this.activeLeases.delete(legacyLease[0]);
+    }
+    node.currentConcurrency = Math.max(0, node.currentConcurrency - 1);
+    return true;
   }
 
   private persist(): void {

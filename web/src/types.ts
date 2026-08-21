@@ -1,4 +1,4 @@
-export type View = "dashboard" | "keys" | "models" | "settings" | "proxy" | "monitor";
+export type View = "dashboard" | "keys" | "models" | "aliases" | "settings" | "proxy" | "monitor";
 export type AuthMode = "password";
 
 export interface ApiKeyItem {
@@ -30,6 +30,16 @@ export interface ModelItem {
   ownedBy: string;
   created: number;
   displayName?: string;
+}
+
+export interface ModelAlias {
+  downstreamModelId: string;
+  upstreamModelId: string;
+}
+
+export interface ModelAliasConfig {
+  onlyConfiguredAliases: boolean;
+  aliases: ModelAlias[];
 }
 
 export interface SystemSettings {

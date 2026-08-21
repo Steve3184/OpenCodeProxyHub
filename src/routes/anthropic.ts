@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { ApiKeyStore } from "../auth/apiKeys.js";
 import type { AppConfig } from "../config/env.js";
 import type { ModelConfigStore } from "../models/catalog.js";
+import type { ModelAliasStore } from "../models/aliases.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { prepareZenRequest, requestZenFull } from "../providers/zenClient.js";
 import { SessionStore, sessionScopeFromHeaders } from "../sessions/sessionStore.js";
@@ -18,6 +19,7 @@ export const registerAnthropicRoutes = async (
   config: AppConfig,
   keyStore: ApiKeyStore,
   modelStore: ModelConfigStore,
+  modelAliasStore: ModelAliasStore,
   settingsStore: SettingsStore,
   sessions: SessionStore,
   proxyPool: ProxyPoolStore,
@@ -40,7 +42,8 @@ export const registerAnthropicRoutes = async (
     }
     keyStore.recordClientUsage(auth.id, request.headers);
 
-    const { model, stream } = request.body || {} as AnthropicMessageRequest;
+    const { model: downstreamModel, stream } = request.body || {} as AnthropicMessageRequest;
+    const model = downstreamModel;
     const isStream = Boolean(stream);
     const limit = await limiter.acquire(auth.id, isStream, {
       requestsPerMinute: auth.policy.requestsPerMinute,
@@ -62,7 +65,12 @@ export const registerAnthropicRoutes = async (
     reply.raw.once("close", release);
     reply.raw.once("finish", release);
 
-    if (!model || !modelStore.isEnabled(model)) {
+    if (!model || !modelAliasStore.isAllowed(model)) {
+      release();
+      return reply.code(400).send({ type: "error", error: { type: "invalid_request_error", message: `Model alias is required: ${model}` } });
+    }
+    const upstreamModel = modelAliasStore.resolveUpstream(model);
+    if (!modelAliasStore.find(model) && !modelStore.isEnabled(upstreamModel)) {
       release();
       return reply.code(400).send({
         type: "error",
@@ -77,7 +85,7 @@ export const registerAnthropicRoutes = async (
     const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "anthropic", model, request.headers));
     const { messages, tools, toolChoice, parameters } = anthropicToOpenAI(request.body);
     const inputTokens = Math.trunc(JSON.stringify(messages).length / 4);
-    app.log.info({ user: auth.name, model, stream: isStream, messageCount: messages.length }, "anthropic_request");
+    app.log.info({ user: auth.name, model, upstreamModel, stream: isStream, messageCount: messages.length }, "anthropic_request");
     const useProxy = (settings: ReturnType<typeof settingsStore.get>): boolean => settings.proxyMode !== "direct" && auth.policy.allowProxy !== false;
     const logRequest = (statusCode: number, extra: Record<string, unknown> = {}) => {
       const currentSettings = settingsStore.get();
@@ -105,7 +113,7 @@ export const registerAnthropicRoutes = async (
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
-      model,
+      model: upstreamModel,
       messages,
       stream: isStream,
       tools,
