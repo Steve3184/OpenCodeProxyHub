@@ -80,12 +80,24 @@ export interface ProxyRecoverySummary {
   recovered: number;
 }
 
+interface RecoveryProbeState {
+  enabled: boolean;
+  autoDisabledBy429: boolean;
+  currentConcurrency: number;
+  lastError: string | null;
+  lastCheckedAt: string | null;
+  lastRecoveryTestAt: string;
+  endpoint: string;
+}
+
 const DEFAULT_MODEL_TEST_OPTIONS: ProxyModelTestOptions = {
   hostname: "opencode.ai",
   path: "/zen/v1/chat/completions",
   model: "deepseek-v4-flash-free",
   timeoutMs: 10000,
 };
+
+const DEFAULT_PROXY_COOLDOWN_MS = 5 * 60 * 1000;
 
 const today = () => new Date().toISOString().slice(0, 10);
 
@@ -183,7 +195,8 @@ export class ProxyPoolStore {
       node.failCount += 1;
       node.lastError = message;
       node.lastCheckedAt = new Date().toISOString();
-      node.cooldownUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
+      node.lastRecoveryTestAt = null;
       this.recordResult(node, false, 502);
       this.persist();
       // Try another node immediately; optional mode can still fall back to direct.
@@ -213,6 +226,7 @@ export class ProxyPoolStore {
     if (!this.takeLease(id, leaseId)) return;
     node.successCount += 1;
     if (!node.autoDisabledBy429) node.consecutiveRateLimitCount = 0;
+    if (!node.autoDisabledBy429) node.lastRecoveryTestAt = null;
     this.recordResult(node, true, statusCode);
     if (!node.autoDisabledBy429) node.lastError = null;
     node.lastCheckedAt = new Date().toISOString();
@@ -239,7 +253,9 @@ export class ProxyPoolStore {
     } else {
       if (!node.autoDisabledBy429) {
         node.consecutiveRateLimitCount = 0;
-        node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? 5 * 60 * 1000)).toISOString();
+        node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? DEFAULT_PROXY_COOLDOWN_MS)).toISOString();
+        // A new failure should be eligible for the next recovery cycle after its cooldown.
+        node.lastRecoveryTestAt = null;
       }
     }
     this.persist();
@@ -285,6 +301,10 @@ export class ProxyPoolStore {
       node.lastCheckedAt = checkedAt;
       if (node.autoDisabledBy429 && !node.enabled) node.lastRecoveryTestAt = checkedAt;
       node.lastError = null;
+      if (!node.autoDisabledBy429) {
+        node.cooldownUntil = null;
+        node.lastRecoveryTestAt = null;
+      }
       this.recordResult(node, true, statusCode);
       this.persist();
       return { ...node };
@@ -298,13 +318,13 @@ export class ProxyPoolStore {
     }
   }
 
+  /** Probe 429-disabled nodes and cooled-down nodes currently shown as abnormal. */
   async recoverRateLimitedProxies(options: ProxyModelTestOptions): Promise<ProxyRecoverySummary> {
     const now = Date.now();
+    const recoveryIntervalMs = options.recoveryIntervalMs ?? 10 * 60 * 1000;
     const candidates = this.proxies.filter((node) => {
-      if (node.enabled || !node.autoDisabledBy429 || this.recoveryTestsInFlight.has(node.id)) return false;
-      if (!node.lastRecoveryTestAt) return true;
-      const lastTestAt = Date.parse(node.lastRecoveryTestAt);
-      return !Number.isFinite(lastTestAt) || now - lastTestAt >= (options.recoveryIntervalMs ?? 10 * 60 * 1000);
+      if (this.recoveryTestsInFlight.has(node.id)) return false;
+      return this.isRecoveryCandidate(node, now, recoveryIntervalMs);
     });
     if (candidates.length === 0) return { tested: 0, recovered: 0 };
 
@@ -315,31 +335,47 @@ export class ProxyPoolStore {
       while (queue.length > 0) {
         const node = queue.shift();
         if (!node) return;
-        if (node.enabled || !node.autoDisabledBy429 || this.recoveryTestsInFlight.has(node.id)) continue;
+        const candidateNow = Date.now();
+        if (this.recoveryTestsInFlight.has(node.id) || !this.isRecoveryCandidate(node, candidateNow, recoveryIntervalMs)) continue;
 
         this.recoveryTestsInFlight.add(node.id);
-        node.lastRecoveryTestAt = new Date().toISOString();
+        const recoveryTestAt = new Date().toISOString();
+        node.lastRecoveryTestAt = recoveryTestAt;
         this.persist();
         tested += 1;
         const wasAutoDisabled = node.autoDisabledBy429 && !node.enabled;
+        const expectedState: RecoveryProbeState = {
+          enabled: node.enabled,
+          autoDisabledBy429: node.autoDisabledBy429,
+          currentConcurrency: node.currentConcurrency,
+          lastError: node.lastError,
+          lastCheckedAt: node.lastCheckedAt,
+          lastRecoveryTestAt: recoveryTestAt,
+          endpoint: this.proxyEndpoint(node),
+        };
         try {
           const statusCode = await this.requestModelHealthCheck(node, options);
-          // Do not overwrite a manual enable/disable that happened while the probe was in flight.
-          if (wasAutoDisabled && node.autoDisabledBy429 && !node.enabled && statusCode >= 200 && statusCode < 300) {
-            node.enabled = true;
-            node.autoDisabledBy429 = false;
-            node.consecutiveRateLimitCount = 0;
+          if (!this.recoveryStateUnchanged(node, expectedState)) continue;
+          if (statusCode >= 200 && statusCode < 300) {
+            if (wasAutoDisabled) {
+              node.enabled = true;
+              node.autoDisabledBy429 = false;
+              node.consecutiveRateLimitCount = 0;
+            }
             node.cooldownUntil = null;
+            node.lastRecoveryTestAt = null;
             node.lastError = null;
             recovered += 1;
-          } else if (wasAutoDisabled && node.autoDisabledBy429 && !node.enabled) {
+          } else {
             node.lastError = `Model health check returned HTTP ${statusCode}`;
+            if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
           }
           node.lastCheckedAt = new Date().toISOString();
           this.recordResult(node, statusCode >= 200 && statusCode < 300, statusCode);
         } catch (error) {
-          if (wasAutoDisabled && node.autoDisabledBy429 && !node.enabled) {
+          if (this.recoveryStateUnchanged(node, expectedState)) {
             node.lastError = error instanceof Error ? error.message : "Model health check failed";
+            if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
             node.lastCheckedAt = new Date().toISOString();
             this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
           }
@@ -456,6 +492,32 @@ export class ProxyPoolStore {
     node.autoDisabledBy429 = false;
     node.lastRecoveryTestAt = null;
     node.lastError = "Daily request limit reached";
+  }
+
+  private isRecoveryCandidate(node: ProxyNode, now: number, recoveryIntervalMs: number): boolean {
+    if (node.currentConcurrency > 0) return false;
+    const autoDisabledBy429 = !node.enabled && node.autoDisabledBy429;
+    const cooldownUntil = node.cooldownUntil ? Date.parse(node.cooldownUntil) : Number.NaN;
+    const cooldownExpired = !node.cooldownUntil || !Number.isFinite(cooldownUntil) || cooldownUntil <= now;
+    const abnormal = node.enabled && !node.autoDisabledBy429 && Boolean(node.lastError) && cooldownExpired;
+    if (!autoDisabledBy429 && !abnormal) return false;
+    if (!node.lastRecoveryTestAt) return true;
+    const lastTestAt = Date.parse(node.lastRecoveryTestAt);
+    return !Number.isFinite(lastTestAt) || now - lastTestAt >= recoveryIntervalMs;
+  }
+
+  private recoveryStateUnchanged(node: ProxyNode, expected: RecoveryProbeState): boolean {
+    return node.enabled === expected.enabled
+      && node.autoDisabledBy429 === expected.autoDisabledBy429
+      && node.currentConcurrency === expected.currentConcurrency
+      && node.lastError === expected.lastError
+      && node.lastCheckedAt === expected.lastCheckedAt
+      && node.lastRecoveryTestAt === expected.lastRecoveryTestAt
+      && this.proxyEndpoint(node) === expected.endpoint;
+  }
+
+  private proxyEndpoint(node: ProxyNode): string {
+    return `${node.type}\n${node.url}`;
   }
 
   private requestModelHealthCheck(node: ProxyNode, options: ProxyModelTestOptions): Promise<number> {
