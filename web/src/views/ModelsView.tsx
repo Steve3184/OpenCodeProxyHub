@@ -9,7 +9,7 @@ import { fadeIn, fadeUp, staggerContainer } from "@/lib/motion";
 import type { ConsoleData } from "../hooks/useConsoleData";
 
 export function ModelsView({ data }: { data: ConsoleData }) {
-  const { models, settings, busy, toggleModel, toggleOpenAiStreamTransform, toggleReasoningTag, syncFreeModels } = data;
+  const { models, settings, busy, toggleModel, toggleUseResponses, toggleOpenAiStreamTransform, toggleReasoningTag, syncFreeModels } = data;
 
   return (
     <div className="space-y-4">
@@ -46,6 +46,7 @@ export function ModelsView({ data }: { data: ConsoleData }) {
         {models.map((model) => {
           const transformEnabled = Boolean(settings?.openAiStreamTransformModels?.includes(model.id));
           const reasoningEnabled = Boolean(settings?.reasoningTagModels?.includes(model.id));
+          const responsesEnabled = Boolean(model.useResponses);
           return (
             <motion.div key={model.id} variants={fadeUp}>
               <Card className={cn("h-full p-4", !model.enabled && "opacity-60")}>
@@ -61,6 +62,13 @@ export function ModelsView({ data }: { data: ConsoleData }) {
                 </div>
 
                 <div className="mt-4 space-y-2">
+                  <SettingRow
+                    title="使用 Responses 上游"
+                    desc={responsesEnabled ? "全部协议自动转换并连接 /responses" : "连接上游 Chat Completions"}
+                    checked={responsesEnabled}
+                    disabled={busy}
+                    onToggle={() => toggleUseResponses(model)}
+                  />
                   <SettingRow
                     title="OpenAI 流式转换"
                     desc={transformEnabled ? "Anthropic SSE → OpenAI SSE" : "直通上游流式响应"}

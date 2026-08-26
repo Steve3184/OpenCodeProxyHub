@@ -13,6 +13,11 @@ const requestBodies = [
     path: "/v1/messages",
     body: { model: "deepseek-v4-flash-free", max_tokens: 4, messages: [{ role: "user", content: "ping" }] },
   },
+  {
+    name: "responses-invalid-auth",
+    path: "/v1/responses",
+    body: { model: "deepseek-v4-flash-free", input: "ping", max_output_tokens: 4 },
+  },
 ];
 
 let next = 0;

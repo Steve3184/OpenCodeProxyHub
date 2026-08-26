@@ -262,8 +262,23 @@ export function useConsoleData() {
     run(() =>
       apiFetch(`/admin/models/${encodeURIComponent(model.id)}`, token, {
         method: "PUT",
-        body: JSON.stringify({ enabled: !model.enabled, ownedBy: model.ownedBy, created: model.created, displayName: model.displayName }),
+        body: JSON.stringify({ enabled: !model.enabled, ownedBy: model.ownedBy, created: model.created, displayName: model.displayName, useResponses: model.useResponses }),
       }).then(() => undefined),
+    );
+
+  const toggleUseResponses = (model: ModelItem) =>
+    run(
+      () => apiFetch(`/admin/models/${encodeURIComponent(model.id)}`, token, {
+        method: "PUT",
+        body: JSON.stringify({
+          enabled: model.enabled,
+          ownedBy: model.ownedBy,
+          created: model.created,
+          displayName: model.displayName,
+          useResponses: !model.useResponses,
+        }),
+      }).then(() => undefined),
+      { successText: `模型「${model.id}」已${model.useResponses ? "关闭" : "启用"} Responses 上游` },
     );
 
   const toggleOpenAiStreamTransform = (model: ModelItem) =>
@@ -382,6 +397,7 @@ export function useConsoleData() {
     copyCreatedKey,
     copyStoredKey,
     toggleModel,
+    toggleUseResponses,
     toggleOpenAiStreamTransform,
     toggleReasoningTag,
     syncFreeModels,

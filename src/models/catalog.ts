@@ -36,6 +36,8 @@ export interface ModelConfig {
   ownedBy: string;
   created: number;
   displayName?: string;
+  /** Route this model to the upstream OpenAI Responses endpoint. */
+  useResponses?: boolean;
 }
 
 interface ModelConfigFile {
@@ -48,6 +50,7 @@ export interface ModelUpdateInput {
   ownedBy?: string;
   created?: number;
   displayName?: string;
+  useResponses?: boolean;
 }
 
 export class ModelConfigStore {
@@ -76,6 +79,10 @@ export class ModelConfigStore {
     return this.models.some((model) => model.id === modelId && model.enabled);
   }
 
+  usesResponses(modelId: string): boolean {
+    return this.models.some((model) => model.id === modelId && model.useResponses === true);
+  }
+
   enabledIds(): string[] {
     return this.listEnabled().map((model) => model.id);
   }
@@ -94,6 +101,7 @@ export class ModelConfigStore {
     if (input.ownedBy !== undefined) model.ownedBy = input.ownedBy.trim() || "opencode-free";
     if (input.created !== undefined) model.created = input.created;
     if (input.displayName !== undefined) model.displayName = input.displayName.trim() || undefined;
+    if (input.useResponses !== undefined) model.useResponses = input.useResponses;
 
     this.persist();
     return { ...model };

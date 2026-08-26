@@ -24,7 +24,7 @@ export default function App() {
   const activeProxies = useMemo(() => data.proxies.filter((p) => p.enabled).length, [data.proxies]);
   const aiRequestCount = useMemo(() => {
     const routes = data.metricsData?.http.byRoute || {};
-    return (routes["POST /v1/chat/completions"] || 0) + (routes["POST /v1/messages"] || 0);
+    return (routes["POST /v1/chat/completions"] || 0) + (routes["POST /v1/responses"] || 0) + (routes["POST /v1/messages"] || 0);
   }, [data.metricsData]);
 
   const todayTokens = useMemo(() => data.proxies.reduce((sum, proxy) => sum + proxy.dailyTokens, 0), [data.proxies]);
@@ -70,7 +70,7 @@ export default function App() {
     { label: "网关状态", value: data.health?.status || "未知", detail: data.health?.version || "等待连接", tone: "info", icon: "shield" },
     { label: "API Keys", value: String(data.apiKeys.length), detail: `${data.apiKeys.filter((k) => k.enabled).length} 个启用`, tone: "primary", icon: "key" },
     { label: "代理节点", value: String(data.proxies.length), detail: `${activeProxies} 个启用`, tone: "warning", icon: "net" },
-    { label: "AI 请求数", value: data.metricsData ? String(aiRequestCount) : "0", detail: "OpenAI + Anthropic", tone: "success", icon: "activity" },
+    { label: "AI 请求数", value: data.metricsData ? String(aiRequestCount) : "0", detail: "Chat + Responses + Anthropic", tone: "success", icon: "activity" },
     { label: "今日请求", value: String(todayRequestCount), detail: "代理节点累计", tone: "info", icon: "requests" },
     { label: "今日 Tokens", value: formatCompactTokens(todayTokens), detail: "所有代理节点", tone: "primary", icon: "tokens" },
   ];

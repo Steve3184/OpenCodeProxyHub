@@ -73,6 +73,7 @@ export interface ProxyModelTestOptions {
   model: string;
   timeoutMs: number;
   recoveryIntervalMs?: number;
+  protocol?: "chat_completions" | "responses";
 }
 
 export interface ProxyRecoverySummary {
@@ -95,6 +96,7 @@ const DEFAULT_MODEL_TEST_OPTIONS: ProxyModelTestOptions = {
   path: "/zen/v1/chat/completions",
   model: "deepseek-v4-flash-free",
   timeoutMs: 10000,
+  protocol: "chat_completions",
 };
 
 const DEFAULT_PROXY_COOLDOWN_MS = 5 * 60 * 1000;
@@ -521,12 +523,10 @@ export class ProxyPoolStore {
   }
 
   private requestModelHealthCheck(node: ProxyNode, options: ProxyModelTestOptions): Promise<number> {
-    const body = JSON.stringify({
-      model: options.model,
-      messages: [{ role: "user", content: "ping" }],
-      stream: false,
-      max_tokens: 1,
-    });
+    const usesResponses = options.protocol === "responses";
+    const body = JSON.stringify(usesResponses
+      ? { model: options.model, input: "ping", stream: false, max_output_tokens: 1 }
+      : { model: options.model, messages: [{ role: "user", content: "ping" }], stream: false, max_tokens: 1 });
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (callback: () => void) => {
@@ -567,7 +567,7 @@ export class ProxyPoolStore {
           const raw = Buffer.concat(chunks).toString("utf8");
           if (statusCode >= 200 && statusCode < 300) {
             try {
-              const parsed = JSON.parse(raw) as { choices?: unknown[]; error?: { message?: string } | string; type?: string };
+              const parsed = JSON.parse(raw) as { choices?: unknown[]; output?: unknown[]; object?: string; error?: { message?: string } | string; type?: string };
               if (parsed.error || parsed.type === "error" || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error")) {
                 const message = typeof parsed.error === "string" ? parsed.error : parsed.error?.message;
                 const error = new Error(`Model health check returned an upstream error${message ? `: ${message}` : ""}`) as Error & { statusCode?: number };
@@ -575,8 +575,11 @@ export class ProxyPoolStore {
                 reject(error);
                 return;
               }
-              if (!Array.isArray(parsed.choices) || parsed.choices.length === 0) {
-                const error = new Error("Model health check returned no choices") as Error & { statusCode?: number };
+              const validResponse = usesResponses
+                ? parsed.object === "response" || Array.isArray(parsed.output)
+                : Array.isArray(parsed.choices) && parsed.choices.length > 0;
+              if (!validResponse) {
+                const error = new Error(usesResponses ? "Model health check returned no response output" : "Model health check returned no choices") as Error & { statusCode?: number };
                 error.statusCode = statusCode;
                 reject(error);
                 return;

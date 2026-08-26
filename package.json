@@ -14,7 +14,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke:protocol": "node scripts/protocol-smoke.mjs",
     "smoke:load": "node scripts/load-smoke.mjs",
-    "check:stability": "node scripts/stability-check.mjs"
+    "check:stability": "node scripts/stability-check.mjs",
+    "check:responses": "tsx scripts/responses-conversion-check.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

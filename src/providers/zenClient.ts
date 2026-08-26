@@ -12,12 +12,14 @@ const noProxyAvailableError = "Proxy is required but no proxy node is available"
 
 export interface ZenRequestInput {
   model: string;
-  messages: unknown[];
+  messages?: unknown[];
   stream?: boolean;
   tools?: unknown[];
   toolChoice?: unknown;
   parameters?: Record<string, unknown>;
   sessionId: string;
+  protocol?: "chat_completions" | "responses";
+  responseBody?: Record<string, unknown>;
 }
 
 export interface ZenPreparedRequest {
@@ -26,16 +28,50 @@ export interface ZenPreparedRequest {
   lease?: ProxyLease;
 }
 
+export interface ZenStreamTransform {
+  write(chunk: Buffer): Buffer;
+  flush(): Buffer;
+  errorBody?: (message: string, rateLimited: boolean) => unknown;
+}
+
+const requestInputForTokenEstimate = (body: string): unknown => {
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    return parsed.messages ?? parsed.input ?? parsed.instructions ?? "";
+  } catch {
+    return "";
+  }
+};
+
+const responseTextForTokenEstimate = (data: any): unknown => {
+  const chatText = data?.choices?.[0]?.message?.content;
+  if (chatText !== undefined) return chatText;
+  if (Array.isArray(data?.output)) {
+    return data.output.map((item: any) => item?.content ?? item?.arguments ?? "");
+  }
+  return "";
+};
+
 export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, proxyPool?: ProxyPoolStore, excludeProxyIds: ReadonlySet<string> = new Set()): ZenPreparedRequest => {
-  const requestBody: Record<string, unknown> = {
-    model: input.model,
-    messages: input.messages,
-    stream: Boolean(input.stream),
-  };
-  if (input.tools?.length) requestBody.tools = input.tools;
-  if (input.toolChoice) requestBody.tool_choice = input.toolChoice;
-  for (const [key, value] of Object.entries(input.parameters || {})) {
-    if (value !== undefined) requestBody[key] = value;
+  const protocol = input.protocol || "chat_completions";
+  let requestBody: Record<string, unknown>;
+  if (protocol === "responses") {
+    requestBody = {
+      ...(input.responseBody || {}),
+      model: input.model,
+      stream: Boolean(input.stream),
+    };
+  } else {
+    requestBody = {
+      model: input.model,
+      messages: input.messages || [],
+      stream: Boolean(input.stream),
+    };
+    if (input.tools?.length) requestBody.tools = input.tools;
+    if (input.toolChoice) requestBody.tool_choice = input.toolChoice;
+    for (const [key, value] of Object.entries(input.parameters || {})) {
+      if (value !== undefined) requestBody[key] = value;
+    }
   }
 
   const body = JSON.stringify(requestBody);
@@ -47,7 +83,7 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
     options: {
       hostname: config.zenHost,
       port: 443,
-      path: config.zenPath,
+      path: protocol === "responses" ? config.zenResponsesPath : config.zenPath,
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -105,7 +141,7 @@ export const requestZenFull = (
           else if (status >= 200 && status < 300 && !protocolError) {
             proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
             const usage = extractTokenUsage(data);
-            proxyPool.recordTokenUsage(prepared.lease.node.id, usage.totalTokens ?? estimateTokens(JSON.parse(prepared.body).messages) + estimateTokens(data?.choices?.[0]?.message?.content || ""));
+            proxyPool.recordTokenUsage(prepared.lease.node.id, usage.totalTokens ?? estimateTokens(requestInputForTokenEstimate(prepared.body)) + estimateTokens(responseTextForTokenEstimate(data)));
           } else {
             proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${effectiveErrorStatus}`, { statusCode: effectiveErrorStatus, leaseId: prepared.lease.leaseId });
           }
@@ -175,10 +211,11 @@ export const pipeZenOpenAIResponse = (
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
   retryAttempt = false,
   responseModel?: string,
+  streamTransform?: ZenStreamTransform,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: noProxyAvailableError, type: "proxy_unavailable" } }));
+    res.end(JSON.stringify(streamTransform?.errorBody?.(noProxyAvailableError, false) ?? { error: { message: noProxyAvailableError, type: "proxy_unavailable" } }));
     return;
   }
   const started = process.hrtime.bigint();
@@ -192,6 +229,15 @@ export const pipeZenOpenAIResponse = (
   let responseErrorBody = "";
   let responseRewriteBuffer = "";
   const nonStreamChunks: Buffer[] = [];
+  const errorBody = (message: string, rateLimited: boolean): string => JSON.stringify(
+    streamTransform?.errorBody?.(message, rateLimited) ?? {
+      error: {
+        message,
+        type: rateLimited ? "rate_limit_error" : "upstream_error",
+        ...(rateLimited ? { code: "rate_limit_exceeded" } : {}),
+      },
+    },
+  );
   const rewriteStreamChunk = (chunk: Buffer | string, flush = false): Buffer => {
     if (!responseModel || !stream) return Buffer.from(chunk);
     responseRewriteBuffer += chunk.toString();
@@ -204,12 +250,22 @@ export const pipeZenOpenAIResponse = (
       if (!match || !match[2] || match[2] === "[DONE]") return line;
       try {
         const parsed = JSON.parse(match[2]) as Record<string, unknown>;
-        if (typeof parsed === "object" && parsed !== null) parsed.model = responseModel;
+        if (typeof parsed === "object" && parsed !== null) {
+          parsed.model = responseModel;
+          const response = parsed.response;
+          if (response && typeof response === "object" && !Array.isArray(response)) {
+            (response as Record<string, unknown>).model = responseModel;
+          }
+        }
         return `${match[1]}${JSON.stringify(parsed)}${match[3] || ""}`;
       } catch {
         return line;
       }
     }).join("\n") + (complete.length ? "\n" : ""));
+  };
+  const transformStreamChunk = (chunk: Buffer | string, flush = false): Buffer => {
+    if (streamTransform) return flush ? streamTransform.flush() : streamTransform.write(Buffer.from(chunk));
+    return rewriteStreamChunk(chunk, flush);
   };
   const scanUsage = (chunk: Buffer | string) => {
     scanBuffer += chunk.toString();
@@ -221,7 +277,9 @@ export const pipeZenOpenAIResponse = (
       try {
         const parsed = JSON.parse(payload);
         usageAccumulator.observe(parsed);
-        const content = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content;
+        const content = parsed.choices?.[0]?.delta?.content
+          ?? parsed.choices?.[0]?.message?.content
+          ?? (typeof parsed.delta === "string" ? parsed.delta : undefined);
         if (typeof content === "string") observedOutputChars += content.length;
       } catch {
         // The next chunk may complete this JSON payload.
@@ -235,7 +293,7 @@ export const pipeZenOpenAIResponse = (
     const retryPrepared = retryPrepare(excluded);
     if (retryPrepared.lease?.requiredUnavailable) return false;
     retryStarted = true;
-    pipeZenOpenAIResponse(retryPrepared, stream, res, proxyPool, metrics, retryPrepare, true, responseModel);
+    pipeZenOpenAIResponse(retryPrepared, stream, res, proxyPool, metrics, retryPrepare, true, responseModel, streamTransform);
     return true;
   };
   const handleRequestSetupError = (error: unknown): void => {
@@ -247,7 +305,7 @@ export const pipeZenOpenAIResponse = (
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: message });
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message: `Upstream error: ${message}`, type: "upstream_error" } }));
+      res.end(errorBody(`Upstream error: ${message}`, false));
     }
   };
   let req: ReturnType<typeof https.request>;
@@ -285,7 +343,7 @@ export const pipeZenOpenAIResponse = (
               if (!res.headersSent) {
                 const responseStatus = rateLimited ? 429 : 502;
                 res.writeHead(responseStatus, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: { message: rateLimited ? `${errMsg} (free model rate limit)` : errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
+                res.end(errorBody(rateLimited ? `${errMsg} (free model rate limit)` : errMsg, rateLimited));
               }
               metrics?.recordUpstream({ statusCode: rateLimited ? 429 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
               zenRes.resume();
@@ -316,7 +374,7 @@ export const pipeZenOpenAIResponse = (
         } else {
           res.writeHead(zenRes.statusCode || 502, { "Content-Type": "application/json" });
         }
-        res.write(rewriteStreamChunk(firstChunk));
+        res.write(transformStreamChunk(firstChunk));
         return;
       }
 
@@ -325,7 +383,7 @@ export const pipeZenOpenAIResponse = (
         nonStreamChunks.push(chunk);
         return;
       }
-      if (headersSent) res.write(rewriteStreamChunk(chunk));
+      if (headersSent) res.write(transformStreamChunk(chunk));
     });
 
     zenRes.on("end", () => {
@@ -345,11 +403,11 @@ export const pipeZenOpenAIResponse = (
           protocolError = true;
         }
       }
-      const errorBody = status >= 400 ? responseErrorBody : nonStreamRaw;
-      const rateLimited = status === 429 || errorBody.includes("FreeUsageLimitError") || errorBody.includes("rate_limit_error") || errorBody.toLowerCase().includes("rate limit");
+      const upstreamErrorRaw = status >= 400 ? responseErrorBody : nonStreamRaw;
+      const rateLimited = status === 429 || upstreamErrorRaw.includes("FreeUsageLimitError") || upstreamErrorRaw.includes("rate_limit_error") || upstreamErrorRaw.toLowerCase().includes("rate limit");
       if (status >= 400 || (!stream && protocolError)) {
         const parsed = (() => {
-          try { return JSON.parse(errorBody); } catch { return null; }
+          try { return JSON.parse(upstreamErrorRaw); } catch { return null; }
         })();
         const errMsg = parsed?.error?.message || parsed?.message || (status >= 400 ? `Upstream returned HTTP ${status}` : "Invalid upstream response");
         if (prepared.lease?.node && proxyPool && !markedFailure) {
@@ -360,7 +418,7 @@ export const pipeZenOpenAIResponse = (
         if (!res.headersSent) {
           const responseStatus = rateLimited ? 429 : (status >= 400 ? status : 502);
           res.writeHead(responseStatus, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: rateLimited ? `${errMsg} (free model rate limit)` : errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
+          res.end(errorBody(rateLimited ? `${errMsg} (free model rate limit)` : errMsg, rateLimited));
         }
         metrics?.recordUpstream({ statusCode: rateLimited ? 429 : (status >= 400 ? status : 502), durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
         return;
@@ -379,8 +437,7 @@ export const pipeZenOpenAIResponse = (
           let totalTokens = usageAccumulator.totalTokens();
           if (totalTokens === null) {
             try {
-              const requestMessages = JSON.parse(prepared.body).messages;
-              totalTokens = estimateTokens(requestMessages) + Math.ceil(observedOutputChars / 4);
+              totalTokens = estimateTokens(requestInputForTokenEstimate(prepared.body)) + Math.ceil(observedOutputChars / 4);
             } catch {
               totalTokens = Math.ceil(observedOutputChars / 4);
             }
@@ -394,6 +451,10 @@ export const pipeZenOpenAIResponse = (
         let body = nonStreamRaw;
         if (nonStreamData && responseModel) {
           nonStreamData.model = responseModel;
+          const response = nonStreamData.response;
+          if (response && typeof response === "object" && !Array.isArray(response)) {
+            (response as Record<string, unknown>).model = responseModel;
+          }
           body = JSON.stringify(nonStreamData);
         }
         if (!res.headersSent) res.writeHead(status, { "Content-Type": "application/json" });
@@ -403,12 +464,12 @@ export const pipeZenOpenAIResponse = (
       if (!headersSent && !firstChunk) {
         if (!res.headersSent) {
           res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "Empty response from upstream", type: "upstream_error" } }));
+          res.end(errorBody("Empty response from upstream", false));
         }
         return;
       }
       if (headersSent) {
-        if (responseModel && stream) res.write(rewriteStreamChunk("", true));
+        if (streamTransform || responseModel) res.write(transformStreamChunk("", true));
         if (!res.writableEnded) res.end();
       }
     });
@@ -435,7 +496,7 @@ export const pipeZenOpenAIResponse = (
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message: `Upstream error: ${error.message}`, type: "upstream_error" } }));
+      res.end(errorBody(`Upstream error: ${error.message}`, false));
     }
   });
 
@@ -449,7 +510,7 @@ export const pipeZenOpenAIResponse = (
     metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });
     if (!res.headersSent) {
       res.writeHead(504, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message: "Upstream timeout", type: "timeout_error" } }));
+      res.end(errorBody("Upstream timeout", false));
     }
   });
 

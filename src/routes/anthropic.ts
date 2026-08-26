@@ -4,10 +4,11 @@ import type { AppConfig } from "../config/env.js";
 import type { ModelConfigStore } from "../models/catalog.js";
 import type { ModelAliasStore } from "../models/aliases.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
-import { prepareZenRequest, requestZenFull } from "../providers/zenClient.js";
+import { prepareZenRequest, requestZenFull, pipeZenOpenAIResponse } from "../providers/zenClient.js";
 import { SessionStore, sessionScopeFromHeaders } from "../sessions/sessionStore.js";
 import { anthropicToOpenAI, handleAnthropicFullResponse, pipeZenAsAnthropic } from "../converters/anthropic.js";
-import type { AnthropicMessageRequest } from "../types/api.js";
+import { createResponsesToAnthropicStreamTransformer, openAIChatToResponsesRequest, responsesToOpenAIChatResponse } from "../converters/openAiResponses.js";
+import type { AnthropicMessageRequest, ChatMessage, OpenAIChatRequest } from "../types/api.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { AsyncLimiter } from "../rateLimit/limiter.js";
 import type { RequestTracker } from "../runtime/requestTracker.js";
@@ -70,6 +71,7 @@ export const registerAnthropicRoutes = async (
       return reply.code(400).send({ type: "error", error: { type: "invalid_request_error", message: `Model alias is required: ${model}` } });
     }
     const upstreamModel = modelAliasStore.resolveUpstream(model);
+    const useResponsesUpstream = modelStore.usesResponses(upstreamModel);
     if (!modelAliasStore.find(model) && !modelStore.isEnabled(upstreamModel)) {
       release();
       return reply.code(400).send({
@@ -112,26 +114,40 @@ export const registerAnthropicRoutes = async (
 
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;
-    const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
+    const responseRequest = useResponsesUpstream ? openAIChatToResponsesRequest({
       model: upstreamModel,
-      messages,
+      messages: messages as ChatMessage[],
       stream: isStream,
       tools,
-      toolChoice,
-      parameters,
+      tool_choice: toolChoice,
+      ...parameters,
+    } as OpenAIChatRequest) : undefined;
+    const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
+      model: upstreamModel,
+      stream: isStream,
       sessionId,
+      ...(useResponsesUpstream
+        ? { protocol: "responses" as const, responseBody: responseRequest }
+        : { messages, tools, toolChoice, parameters }),
     }, effectiveProxyPool, excludeProxyIds);
     const prepared = prepareRequest();
 
     if (isStream) {
       reply.hijack();
+      if (useResponsesUpstream) {
+        pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createResponsesToAnthropicStreamTransformer(model, inputTokens));
+        return;
+      }
       pipeZenAsAnthropic(prepared, model, reply.raw, inputTokens, effectiveProxyPool, metrics, prepareRequest);
       return;
     }
 
     try {
       const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest);
-      const result = handleAnthropicFullResponse(zenResp, model, inputTokens);
+      const normalizedResponse = useResponsesUpstream && zenResp.status >= 200 && zenResp.status < 300 && !zenResp.data?.error && zenResp.data?.type !== "error"
+        ? { ...zenResp, data: responsesToOpenAIChatResponse(zenResp.data, model) }
+        : zenResp;
+      const result = handleAnthropicFullResponse(normalizedResponse, model, inputTokens);
       return reply.code(result.status).send(result.body);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown upstream error";

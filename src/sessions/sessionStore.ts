@@ -25,7 +25,7 @@ export class SessionStore {
 
 export const sessionScopeFromHeaders = (
   keyId: string,
-  protocol: "openai" | "anthropic",
+  protocol: "openai" | "anthropic" | "responses",
   model: string,
   headers: Record<string, string | string[] | undefined>,
 ): string => {

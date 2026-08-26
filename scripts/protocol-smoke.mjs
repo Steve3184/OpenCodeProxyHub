@@ -31,6 +31,17 @@ const checks = [
     expectStatus: 401,
     expectJson: (data) => data?.type === "error" && Boolean(data?.error?.message),
   },
+  {
+    name: "Responses invalid auth shape",
+    path: "/v1/responses",
+    body: {
+      model: "deepseek-v4-flash-free",
+      input: "ping",
+      max_output_tokens: 8,
+    },
+    expectStatus: 401,
+    expectJson: (data) => Boolean(data?.error?.message),
+  },
 ];
 
 let failed = 0;

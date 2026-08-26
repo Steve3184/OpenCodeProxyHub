@@ -150,7 +150,7 @@ export const registerAdminRoutes = async (
   app.put<{ Params: { id: string }; Body: ModelUpdateInput }>("/admin/models/:id", async (request, reply) => {
     try {
       const model = modelStore.upsert(request.params.id, request.body || {});
-      audit(request, "model.upsert", "success", { targetId: request.params.id, enabled: model.enabled });
+      audit(request, "model.upsert", "success", { targetId: request.params.id, enabled: model.enabled, useResponses: model.useResponses === true });
       return reply.send({ data: model });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to save model";
@@ -271,12 +271,15 @@ export const registerAdminRoutes = async (
 
   app.post<{ Params: { id: string } }>("/admin/proxies/:id/test", async (request, reply) => {
     try {
+      const healthCheckModel = modelStore.isEnabled(config.proxyHealthCheckModel)
+        ? config.proxyHealthCheckModel
+        : modelStore.enabledIds()[0] || config.proxyHealthCheckModel;
+      const useResponses = modelStore.usesResponses(healthCheckModel);
       const proxy = await proxyPool.test(request.params.id, {
         hostname: config.zenHost,
-        path: config.zenPath,
-        model: modelStore.isEnabled(config.proxyHealthCheckModel)
-          ? config.proxyHealthCheckModel
-          : modelStore.enabledIds()[0] || config.proxyHealthCheckModel,
+        path: useResponses ? config.zenResponsesPath : config.zenPath,
+        protocol: useResponses ? "responses" : "chat_completions",
+        model: healthCheckModel,
         timeoutMs: config.proxyHealthCheckTimeoutMs,
       });
       audit(request, "proxy.test", "success", { targetId: request.params.id, targetName: proxy.name });

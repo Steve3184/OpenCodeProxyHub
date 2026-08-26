@@ -6,6 +6,6 @@ export const registerHealthRoutes = async (app: FastifyInstance, models: ModelCo
     status: "ok",
     version: "0.1.6",
     models: models.listEnabled().length,
-    endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models"],
+    endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/models"],
   }));
 };

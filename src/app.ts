@@ -7,6 +7,7 @@ import { SessionStore } from "./sessions/sessionStore.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerModelRoutes } from "./routes/models.js";
 import { registerOpenAIRoutes } from "./routes/openai.js";
+import { registerResponsesRoutes } from "./routes/responses.js";
 import { registerAnthropicRoutes } from "./routes/anthropic.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 import { registerWebRoutes } from "./routes/web.js";
@@ -52,16 +53,22 @@ export const buildApp = async (config: AppConfig) => {
   const proxyHealthCheckModel = () => modelStore.isEnabled(config.proxyHealthCheckModel)
     ? config.proxyHealthCheckModel
     : modelStore.enabledIds()[0] || config.proxyHealthCheckModel;
+  const proxyHealthCheckOptions = () => {
+    const model = proxyHealthCheckModel();
+    const useResponses = modelStore.usesResponses(model);
+    return {
+      hostname: config.zenHost,
+      path: useResponses ? config.zenResponsesPath : config.zenPath,
+      protocol: useResponses ? "responses" as const : "chat_completions" as const,
+      model,
+      timeoutMs: config.proxyHealthCheckTimeoutMs,
+      recoveryIntervalMs: config.proxyRecoveryIntervalMs,
+    };
+  };
   const proxyPool = new ProxyPoolStore(config.proxiesFile, settingsStore);
   proxyPool.load();
   const proxyRecoveryTimer = setInterval(() => {
-    void proxyPool.recoverRateLimitedProxies({
-      hostname: config.zenHost,
-      path: config.zenPath,
-      model: proxyHealthCheckModel(),
-      timeoutMs: config.proxyHealthCheckTimeoutMs,
-      recoveryIntervalMs: config.proxyRecoveryIntervalMs,
-    }).then((summary) => {
+    void proxyPool.recoverRateLimitedProxies(proxyHealthCheckOptions()).then((summary) => {
       if (summary.tested > 0) app.log.info(summary, "proxy_recovery_check_completed");
     }).catch((error) => {
       app.log.warn({ error }, "proxy_recovery_check_failed");
@@ -89,6 +96,7 @@ export const buildApp = async (config: AppConfig) => {
   await registerModelRoutes(app, modelStore, modelAliasStore);
   await registerAdminRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, proxyPool, limiter, requestTracker, metrics, eventLogger, adminSessions);
   await registerOpenAIRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
+  await registerResponsesRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
   await registerAnthropicRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
   await registerWebRoutes(app);
 

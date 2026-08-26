@@ -30,6 +30,7 @@ export interface ModelItem {
   ownedBy: string;
   created: number;
   displayName?: string;
+  useResponses?: boolean;
 }
 
 export interface ModelAlias {

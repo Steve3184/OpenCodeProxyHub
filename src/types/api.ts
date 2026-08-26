@@ -25,6 +25,21 @@ export interface OpenAIChatRequest {
   user?: string;
 }
 
+export interface OpenAIResponsesRequest {
+  model: string;
+  input?: unknown;
+  stream?: boolean;
+  instructions?: string;
+  tools?: unknown[];
+  tool_choice?: unknown;
+  max_output_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  user?: string;
+  text?: unknown;
+  [key: string]: unknown;
+}
+
 export interface AnthropicMessageRequest {
   model: string;
   system?: string | Array<{ text?: string }>;

@@ -1,6 +1,6 @@
 # OpenCodeProxyHub
 
-OpenCodeProxyHub 是一个独立的 AI API 网关，把 OpenCode 免费模型通过 **OpenAI 兼容** 与 **Anthropic 兼容** 的接口暴露出来，让任意支持这两种协议的客户端（opencode、各类 OpenAI/Claude SDK、第三方工具）都能直接接入。
+OpenCodeProxyHub 是一个独立的 AI API 网关，把 OpenCode 免费模型通过 **OpenAI Chat Completions / Responses** 与 **Anthropic** 兼容接口暴露出来，让任意支持这些协议的客户端（opencode、各类 OpenAI/Claude SDK、第三方工具）都能直接接入。
 
 后端为 TypeScript + Fastify，前端为 React + Vite 控制台。除了协议转换，网关还内置了 API Key 管理、出口代理池、限流、可观测性与 Docker 部署，目标是一个“可长期运行、可视化运维”的网关，而不只是一个轻量转发脚本。
 
@@ -25,7 +25,7 @@ OpenCodeProxyHub 基于 MIT 许可证开源，派生并大量借鉴自 [`opencod
 
 ## 可用免费模型
 
-OpenCodeProxyHub 默认内置以下免费模型，均可通过 OpenAI 兼容接口 `/v1/chat/completions` 与 Anthropic 兼容接口 `/v1/messages` 调用：
+OpenCodeProxyHub 默认内置以下免费模型，均可通过 OpenAI 兼容接口 `/v1/chat/completions`、`/v1/responses` 与 Anthropic 兼容接口 `/v1/messages` 调用：
 
 | 模型 ID | 说明 |
 |--------|------|
@@ -124,10 +124,14 @@ npm start            # 运行已构建的 dist/main.js
 
 ## 功能总览
 
-- **双协议兼容**
+- **三种协议入口**
   - OpenAI 兼容：`POST /v1/chat/completions`、`GET /v1/models`
+  - OpenAI Responses：`POST /v1/responses`
   - Anthropic 兼容：`POST /v1/messages`
   - 同时支持流式（SSE）与非流式
+- **按模型选择上游协议**
+  - 控制台可为单个模型开启“使用 Responses 上游”；开启后 Chat Completions 与 Anthropic 请求会自动转换为上游 `/responses` 请求，并把结果还原为调用方协议
+  - `/v1/responses` 对未开启的模型自动转换为上游 Chat Completions；对已开启模型原生透传到 Responses 上游
 - **默认免费模型**：内置 7 个可用免费模型，详见上方“可用免费模型”
 - **流式归一化转换（可按模型开启）**
   - `anthropic-sse-to-openai`：把上游的 Anthropic 风格 SSE 转成 OpenAI 风格 SSE
@@ -180,13 +184,13 @@ npm start            # 运行已构建的 dist/main.js
 
 ```
 客户端 (opencode / OpenAI SDK / Claude SDK / curl)
-        │  OpenAI 或 Anthropic 协议
+        │  Chat Completions / Responses / Anthropic 协议
         ▼
 ┌──────────────────────────────────────────────┐
 │ OpenCodeProxyHub (Fastify)                     │
 │                                                │
 │  鉴权 (API Key 哈希)  →  限流 (内存/Redis)      │
-│  路由 /v1/chat/completions  /v1/messages       │
+│  路由 /v1/chat/completions /v1/responses /v1/messages │
 │  流式转换 (passthrough / sse 转换 / think 抽取) │
 │  代理池 (优先填充 + 可选链式前置代理)            │
 │  可观测性 (指标 + JSONL 日志)                   │
@@ -206,7 +210,7 @@ src/
   config/env.ts          # 环境变量 → AppConfig
   auth/                  # API Key 哈希鉴权、管理员鉴权
   rateLimit/limiter.ts   # 内存 / Redis 两种限流实现（同一接口）
-  routes/                # openai / anthropic / admin / models / health / web 路由
+  routes/                # openai / responses / anthropic / admin / models / health / web 路由
   providers/zenClient.ts # 构造上游请求、透传上游响应
   converters/            # anthropicSseToOpenAi、openAiThinkTagToReasoning 等流式转换
   proxy/                 # 代理池（优先填充）、链式前置代理 Agent
@@ -271,13 +275,25 @@ curl http://127.0.0.1:6446/v1/messages \
   }'
 ```
 
+OpenAI Responses：
+
+```bash
+curl http://127.0.0.1:6446/v1/responses \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "hy3-free",
+    "input": "用一句话介绍你自己"
+  }'
+```
+
 ## Web 控制台
 
 控制台在 `/app`，登录后可：
 
 - **总览**：网关状态、Key 数量、代理节点、AI 请求数等关键指标
 - **API Keys**：创建（明文显示一次并可复制）、启用/禁用、删除、备注与标签、每 Key 策略（RPM、并发、模型白名单、是否允许代理）、查看请求量与最近客户端
-- **模型**：启用/禁用模型，按模型开启 `anthropic-sse-to-openai` 与 `think-to-reasoning` 两种流式转换
+- **模型**：启用/禁用模型；按模型开启 `anthropic-sse-to-openai`、`think-to-reasoning`，或“使用 Responses 上游”协议转换
 - **模型别名**：配置下游 model ID 到上游 model ID 的映射，可开启“只允许使用已配置的别名”来屏蔽未配置的默认模型
 - **设置**：上游超时、请求体限制、默认流式、代理使用模式、链式前置代理、文件日志与审计开关、日志保留天数
 - **代理池**：新增/编辑/删除/测试节点，查看优先节点、成功率、近 N 次请求结果色条、用量/并发/连续 429 数值与 Token 统计
@@ -300,7 +316,8 @@ PROXIES_FILE=./proxies.json             # 代理池文件
 LOGS_DIR=./logs                         # 日志目录
 ADMIN_PASSWORD=admin                    # 管理接口/控制台密码（务必修改）
 ZEN_HOST=opencode.ai                    # 上游主机
-ZEN_PATH=/zen/v1/chat/completions       # 上游路径
+ZEN_PATH=/zen/v1/chat/completions       # Chat Completions 上游路径
+ZEN_RESPONSES_PATH=/zen/v1/responses    # Responses 上游路径；默认由 ZEN_PATH 推导
 UPSTREAM_TIMEOUT_MS=120000              # 上游超时
 GLOBAL_REQUESTS_PER_MINUTE=120          # 全局每分钟请求上限
 API_KEY_REQUESTS_PER_MINUTE=60          # 单 Key 每分钟请求上限
@@ -387,6 +404,15 @@ curl -X PATCH http://127.0.0.1:6446/admin/settings \
   -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"reasoningTagModels":["deepseek-v4-flash-free"]}'
+```
+
+按模型使用 Responses 上游：
+
+```bash
+curl -X PUT http://127.0.0.1:6446/admin/models/hy3-free \
+  -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"useResponses":true}'
 ```
 
 ## 本地数据文件
