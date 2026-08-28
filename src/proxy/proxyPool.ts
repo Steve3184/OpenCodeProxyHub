@@ -525,7 +525,7 @@ export class ProxyPoolStore {
   private requestModelHealthCheck(node: ProxyNode, options: ProxyModelTestOptions): Promise<number> {
     const usesResponses = options.protocol === "responses";
     const body = JSON.stringify(usesResponses
-      ? { model: options.model, input: "ping", stream: false, max_output_tokens: 1 }
+      ? { model: options.model, input: "ping", stream: false, max_output_tokens: 16 }
       : { model: options.model, messages: [{ role: "user", content: "ping" }], stream: false, max_tokens: 1 });
     return new Promise((resolve, reject) => {
       let settled = false;

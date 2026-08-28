@@ -11,6 +11,7 @@ import {
   createResponsesToOpenAIStreamTransformer,
   openAIChatResponseToResponses,
   openAIChatToResponsesRequest,
+  normalizeResponsesRequest,
   responsesToOpenAIChatRequest,
   responsesToOpenAIChatResponse,
 } from "../src/converters/openAiResponses.js";
@@ -38,6 +39,45 @@ assert.equal(asRecord(responsesRequest.text).format.type, "json_schema");
 assert.equal(asRecord(responsesRequest.input).filter((item: any) => item.type === "function_call").length, 1);
 assert.equal(asRecord(responsesRequest.input).filter((item: any) => item.type === "function_call_output").length, 1);
 
+const duplicateToolRequest = openAIChatToResponsesRequest({
+  model: "responses-model",
+  messages: [
+    { role: "assistant", content: null, tool_calls: [{ id: "chatcmpl-tool-1", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "chatcmpl-tool-1", content: "first" },
+    { role: "tool", tool_call_id: "chatcmpl-tool-1", content: "duplicate" },
+    { role: "assistant", content: null, tool_calls: [{ id: "chatcmpl-tool-1", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+  ],
+  max_tokens: 1,
+  user: "legacy-user",
+} as any);
+assert.equal(duplicateToolRequest.max_output_tokens, 16);
+assert.equal("user" in duplicateToolRequest, false);
+assert.equal(asRecord(duplicateToolRequest.input).filter((item: any) => item.type === "function_call").length, 1);
+assert.equal(asRecord(duplicateToolRequest.input).filter((item: any) => item.type === "function_call_output").length, 1);
+
+const normalizedResponses = normalizeResponsesRequest({
+  model: "responses-model",
+  input: [
+    { type: "function_call", call_id: "call-1", name: "lookup", arguments: "{}" },
+    { type: "function_call", call_id: "call-1", name: "lookup", arguments: "{}" },
+    { type: "function_call_output", call_id: "call-1", output: "found" },
+    { type: "function_call_output", call_id: "call-1", output: "duplicate" },
+  ],
+  max_output_tokens: 15.9,
+  temperature: null,
+  top_p: "0.5",
+  user: "legacy-user",
+  stop: ["DONE"],
+  max_tokens: 8,
+} as any);
+assert.equal(normalizedResponses.max_output_tokens, 16);
+assert.equal("temperature" in normalizedResponses, false);
+assert.equal("top_p" in normalizedResponses, false);
+assert.equal("user" in normalizedResponses, false);
+assert.equal("stop" in normalizedResponses, false);
+assert.equal("max_tokens" in normalizedResponses, false);
+assert.equal((normalizedResponses.input as unknown[]).length, 2);
+
 const chatFromResponses = responsesToOpenAIChatRequest({
   model: "chat-model",
   instructions: "Follow the policy.",
@@ -55,6 +95,16 @@ assert.equal(chatFromResponses.messages[2]?.role, "assistant");
 assert.equal(chatFromResponses.messages[3]?.role, "tool");
 assert.deepEqual(chatFromResponses.tool_choice, { type: "function", function: { name: "lookup" } });
 assert.equal(chatFromResponses.max_tokens, 32);
+
+const chatFromDuplicateResponses = responsesToOpenAIChatRequest({
+  model: "chat-model",
+  input: [
+    { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_1", output: "found" },
+    { type: "function_call_output", call_id: "call_1", output: "duplicate" },
+  ],
+});
+assert.equal(chatFromDuplicateResponses.messages.filter((message: any) => message.role === "tool").length, 1);
 
 const responseFromChat = openAIChatResponseToResponses({
   id: "chatcmpl_1",
@@ -154,11 +204,13 @@ try {
   const preparedResponses = prepareZenRequest(config, {
     model: "big-pickle",
     protocol: "responses",
-    responseBody: { input: "ping" },
+    responseBody: { input: "ping", max_output_tokens: 1, user: "legacy-user" },
     sessionId: "responses-check",
   });
   assert.equal(preparedResponses.options.path, "/v1/responses");
   assert.equal(JSON.parse(preparedResponses.body).model, "big-pickle");
+  assert.equal(JSON.parse(preparedResponses.body).max_output_tokens, 16);
+  assert.equal("user" in JSON.parse(preparedResponses.body), false);
   const { app } = await buildApp(config);
   const login = await app.inject({ method: "POST", url: "/admin/login", payload: { password: "admin" } });
   assert.equal(login.statusCode, 200);

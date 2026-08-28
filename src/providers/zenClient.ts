@@ -6,6 +6,7 @@ import type { ZenFullResponse } from "../types/api.js";
 import type { ProxyLease, ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator, estimateTokens, extractTokenUsage } from "../utils/tokenUsage.js";
+import { normalizeResponsesRequest } from "../converters/openAiResponses.js";
 
 const OC_VERSION = "1.15.0";
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
@@ -56,11 +57,11 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
   const protocol = input.protocol || "chat_completions";
   let requestBody: Record<string, unknown>;
   if (protocol === "responses") {
-    requestBody = {
+    requestBody = normalizeResponsesRequest({
       ...(input.responseBody || {}),
       model: input.model,
       stream: Boolean(input.stream),
-    };
+    });
   } else {
     requestBody = {
       model: input.model,

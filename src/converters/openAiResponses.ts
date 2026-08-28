@@ -23,6 +23,15 @@ const numberValue = (value: unknown): number | undefined => (
 
 const stringValue = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
 
+const finiteNumber = (value: unknown): number | undefined => (
+  typeof value === "number" && Number.isFinite(value) ? value : undefined
+);
+
+const normalizeMaxOutputTokens = (value: unknown): number | undefined => {
+  const number = finiteNumber(value);
+  return number === undefined ? undefined : Math.max(16, Math.trunc(number));
+};
+
 const safeJson = (value: unknown): string => {
   if (typeof value === "string") return value;
   try {
@@ -107,12 +116,17 @@ const mapChatResponseFormatToResponses = (responseFormat: unknown): JsonObject |
 /** Convert an OpenAI Chat Completions request into a Responses request. */
 export const openAIChatToResponsesRequest = (body: OpenAIChatRequest): OpenAIResponsesRequest => {
   const input: JsonObject[] = [];
+  const functionCallIds = new Set<string>();
+  const functionCallOutputIds = new Set<string>();
   for (const message of body.messages || []) {
     const role = typeof message.role === "string" ? message.role : "user";
     if (role === "tool") {
+      const callId = stringValue(message.tool_call_id) || ocId("call");
+      if (functionCallOutputIds.has(callId)) continue;
+      functionCallOutputIds.add(callId);
       input.push({
         type: "function_call_output",
-        call_id: message.tool_call_id || ocId("call"),
+        call_id: callId,
         output: typeof message.content === "string" ? message.content : chatContentToResponses(message.content, "user"),
       });
       continue;
@@ -127,10 +141,13 @@ export const openAIChatToResponsesRequest = (body: OpenAIChatRequest): OpenAIRes
       const record = asObject(call);
       const fn = asObject(record?.function);
       if (!record || !fn) continue;
+      const callId = stringValue(record.id) || ocId("call");
+      if (functionCallIds.has(callId)) continue;
+      functionCallIds.add(callId);
       input.push({
         type: "function_call",
         id: stringValue(record.id) || ocId("fc"),
-        call_id: stringValue(record.id) || ocId("call"),
+        call_id: callId,
         name: stringValue(fn.name) || "",
         arguments: typeof fn.arguments === "string" ? fn.arguments : safeJson(fn.arguments ?? {}),
       });
@@ -146,13 +163,56 @@ export const openAIChatToResponsesRequest = (body: OpenAIChatRequest): OpenAIRes
   if (tools) request.tools = tools;
   const toolChoice = mapChatToolChoiceToResponses(body.tool_choice);
   if (toolChoice !== undefined) request.tool_choice = toolChoice;
-  if (body.temperature !== undefined) request.temperature = body.temperature;
-  if (body.top_p !== undefined) request.top_p = body.top_p;
-  if (body.max_tokens !== undefined) request.max_output_tokens = body.max_tokens;
-  if (body.user !== undefined) request.user = body.user;
+  const temperature = finiteNumber(body.temperature);
+  const topP = finiteNumber(body.top_p);
+  const maxOutputTokens = normalizeMaxOutputTokens(body.max_tokens);
+  if (temperature !== undefined) request.temperature = temperature;
+  if (topP !== undefined) request.top_p = topP;
+  if (maxOutputTokens !== undefined) request.max_output_tokens = maxOutputTokens;
   const responseFormat = mapChatResponseFormatToResponses(body.response_format);
   if (responseFormat) request.text = { format: responseFormat };
   return request;
+};
+
+/** Normalize fields whose constraints differ from Chat Completions. */
+export const normalizeResponsesRequest = (body: OpenAIResponsesRequest): OpenAIResponsesRequest => {
+  const normalized: OpenAIResponsesRequest = { ...body };
+  // These controls belong to Chat Completions and are rejected by the
+  // Responses endpoint. Ignore them instead of forwarding an invalid body.
+  for (const key of ["max_tokens", "stop", "presence_penalty", "frequency_penalty", "seed", "response_format", "user"] as const) {
+    delete normalized[key];
+  }
+  if ("max_output_tokens" in normalized) {
+    const maxOutputTokens = normalizeMaxOutputTokens(normalized.max_output_tokens);
+    if (maxOutputTokens === undefined) delete normalized.max_output_tokens;
+    else normalized.max_output_tokens = maxOutputTokens;
+  }
+  for (const key of ["temperature", "top_p"] as const) {
+    if (key in normalized) {
+      const value = finiteNumber(normalized[key]);
+      if (value === undefined) delete normalized[key];
+      else normalized[key] = value;
+    }
+  }
+  if (Array.isArray(normalized.input)) {
+    const functionCallIds = new Set<string>();
+    const functionCallOutputIds = new Set<string>();
+    normalized.input = normalized.input.filter((item) => {
+      const record = asObject(item);
+      if (!record) return true;
+      if (record.type === "function_call") {
+        const callId = stringValue(record.call_id) || stringValue(record.id);
+        if (!callId || functionCallIds.has(callId)) return false;
+        functionCallIds.add(callId);
+      } else if (record.type === "function_call_output") {
+        const callId = stringValue(record.call_id) || stringValue(record.id);
+        if (!callId || functionCallOutputIds.has(callId)) return false;
+        functionCallOutputIds.add(callId);
+      }
+      return true;
+    });
+  }
+  return normalized;
 };
 
 const responseContentToChat = (content: unknown): unknown => {
@@ -232,6 +292,8 @@ const mapResponsesTextFormatToChat = (text: unknown): JsonObject | undefined => 
 /** Convert a Responses request into the OpenAI Chat Completions request shape. */
 export const responsesToOpenAIChatRequest = (body: OpenAIResponsesRequest): OpenAIChatRequest => {
   const messages: JsonObject[] = [];
+  const functionCallIds = new Set<string>();
+  const functionCallOutputIds = new Set<string>();
   if (typeof body.instructions === "string" && body.instructions.trim()) {
     messages.push({ role: "system", content: body.instructions });
   }
@@ -248,14 +310,20 @@ export const responsesToOpenAIChatRequest = (body: OpenAIResponsesRequest): Open
     }
     const type = stringValue(record.type);
     if (type === "function_call_output") {
+      const callId = stringValue(record.call_id) || stringValue(record.id) || ocId("call");
+      if (functionCallOutputIds.has(callId)) continue;
+      functionCallOutputIds.add(callId);
       messages.push({
         role: "tool",
-        tool_call_id: stringValue(record.call_id) || stringValue(record.id) || ocId("call"),
+        tool_call_id: callId,
         content: responseContentToChat(record.output ?? record.content),
       });
       continue;
     }
     if (type === "function_call") {
+      const callId = stringValue(record.call_id) || stringValue(record.id) || ocId("call");
+      if (functionCallIds.has(callId)) continue;
+      functionCallIds.add(callId);
       appendToolCall(messages, record);
       continue;
     }
@@ -280,9 +348,11 @@ export const responsesToOpenAIChatRequest = (body: OpenAIResponsesRequest): Open
   if (tools) request.tools = tools;
   const toolChoice = mapResponsesToolChoiceToChat(body.tool_choice);
   if (toolChoice !== undefined) request.tool_choice = toolChoice;
-  if (body.temperature !== undefined) request.temperature = body.temperature as number;
-  if (body.top_p !== undefined) request.top_p = body.top_p as number;
-  if (body.max_output_tokens !== undefined) request.max_tokens = body.max_output_tokens as number;
+  const temperature = finiteNumber(body.temperature);
+  const topP = finiteNumber(body.top_p);
+  if (temperature !== undefined) request.temperature = temperature;
+  if (topP !== undefined) request.top_p = topP;
+  if (finiteNumber(body.max_output_tokens) !== undefined) request.max_tokens = Math.trunc(body.max_output_tokens as number);
   if (body.user !== undefined) request.user = body.user as string;
   const responseFormat = mapResponsesTextFormatToChat(body.text);
   if (responseFormat) request.response_format = responseFormat;
