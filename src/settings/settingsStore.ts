@@ -26,8 +26,11 @@ interface SettingsFile {
 
 export type SystemSettingsUpdate = Partial<SystemSettings>;
 
+export const DEFAULT_REQUEST_BODY_LIMIT_BYTES = 1024 * 1024 * 1024;
+const LEGACY_DEFAULT_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
+
 const DEFAULT_SETTINGS: SystemSettings = {
-  requestBodyLimitBytes: 10 * 1024 * 1024,
+  requestBodyLimitBytes: DEFAULT_REQUEST_BODY_LIMIT_BYTES,
   upstreamTimeoutMs: 120000,
   defaultStream: false,
   openAiStreamTransformModels: [],
@@ -57,7 +60,10 @@ export class SettingsStore {
   load(): void {
     const data = this.store.read({ version: 1, settings: this.settings });
     const { logPrompts: _legacyLogPrompts, logMaxBodyChars: _legacyLogMaxBodyChars, ...storedSettings } = data.settings as SystemSettings & { logPrompts?: unknown; logMaxBodyChars?: unknown };
-    this.settings = { ...DEFAULT_SETTINGS, ...this.settings, ...storedSettings };
+    const migratedSettings = storedSettings.requestBodyLimitBytes === LEGACY_DEFAULT_REQUEST_BODY_LIMIT_BYTES
+      ? { ...storedSettings, requestBodyLimitBytes: DEFAULT_REQUEST_BODY_LIMIT_BYTES }
+      : storedSettings;
+    this.settings = { ...DEFAULT_SETTINGS, ...this.settings, ...migratedSettings };
     this.persist();
   }
 

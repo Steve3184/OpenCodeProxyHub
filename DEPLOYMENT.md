@@ -103,6 +103,7 @@ Place Nginx, Caddy, or another HTTPS reverse proxy in front of `http://127.0.0.1
 Minimum proxy requirements:
 
 - preserve `Authorization` and `x-api-key` headers
+- allow request bodies up to `1 GiB` (for example, Nginx `client_max_body_size 1g`)
 - support long-lived streaming responses
 - disable response buffering for SSE paths if possible
 - forward client disconnects promptly
