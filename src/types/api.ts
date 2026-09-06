@@ -23,6 +23,13 @@ export interface OpenAIChatRequest {
   response_format?: unknown;
   seed?: number;
   user?: string;
+  reasoning_effort?: string;
+}
+
+export interface OpenAIReasoningConfig {
+  effort?: string;
+  summary?: string;
+  [key: string]: unknown;
 }
 
 export interface OpenAIResponsesRequest {
@@ -37,6 +44,7 @@ export interface OpenAIResponsesRequest {
   top_p?: number;
   user?: string;
   text?: unknown;
+  reasoning?: OpenAIReasoningConfig | null;
   [key: string]: unknown;
 }
 

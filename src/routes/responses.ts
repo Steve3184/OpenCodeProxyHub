@@ -145,6 +145,7 @@ export const registerResponsesRoutes = async (
           response_format: chatRequest?.response_format,
           seed: chatRequest?.seed,
           user: chatRequest?.user,
+          reasoning_effort: chatRequest?.reasoning_effort,
         } }),
     }, effectiveProxyPool, excludeProxyIds);
     const prepared = prepareRequest();

@@ -29,11 +29,13 @@ const chatRequest = {
   tools: [{ type: "function", function: { name: "weather", description: "Get weather", parameters: { type: "object" } } }],
   tool_choice: { type: "function", function: { name: "weather" } },
   max_tokens: 64,
+  reasoning_effort: "high",
   response_format: { type: "json_schema", json_schema: { name: "answer", schema: { type: "object" }, strict: true } },
 } as const;
 
 const responsesRequest = openAIChatToResponsesRequest(chatRequest);
 assert.equal(responsesRequest.max_output_tokens, 64);
+assert.deepEqual(responsesRequest.reasoning, { effort: "high" });
 assert.deepEqual(responsesRequest.tool_choice, { type: "function", name: "weather" });
 assert.equal(asRecord(responsesRequest.text).format.type, "json_schema");
 assert.equal(asRecord(responsesRequest.input).filter((item: any) => item.type === "function_call").length, 1);
@@ -89,12 +91,14 @@ const chatFromResponses = responsesToOpenAIChatRequest({
   tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
   tool_choice: { type: "function", name: "lookup" },
   max_output_tokens: 32,
+  reasoning: { effort: "low" },
 });
 assert.equal(chatFromResponses.messages[0]?.role, "system");
 assert.equal(chatFromResponses.messages[2]?.role, "assistant");
 assert.equal(chatFromResponses.messages[3]?.role, "tool");
 assert.deepEqual(chatFromResponses.tool_choice, { type: "function", function: { name: "lookup" } });
 assert.equal(chatFromResponses.max_tokens, 32);
+assert.equal(chatFromResponses.reasoning_effort, "low");
 
 const chatFromDuplicateResponses = responsesToOpenAIChatRequest({
   model: "chat-model",

@@ -59,6 +59,7 @@ export const registerOpenAIRoutes = async (
       response_format,
       seed,
       user,
+      reasoning_effort,
     } = request.body || {} as OpenAIChatRequest;
     const model = downstreamModel;
     const isStream = Boolean(stream);
@@ -152,6 +153,7 @@ export const registerOpenAIRoutes = async (
       response_format,
       seed,
       user,
+      reasoning_effort,
     }) : undefined;
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
@@ -159,7 +161,7 @@ export const registerOpenAIRoutes = async (
       sessionId,
       ...(useResponsesUpstream
         ? { protocol: "responses" as const, responseBody: responseRequest }
-        : { messages, tools, toolChoice: tool_choice, parameters: { temperature, top_p, max_tokens, stop, presence_penalty, frequency_penalty, response_format, seed, user } }),
+        : { messages, tools, toolChoice: tool_choice, parameters: { temperature, top_p, max_tokens, stop, presence_penalty, frequency_penalty, response_format, seed, user, reasoning_effort } }),
     }, effectiveProxyPool, excludeProxyIds);
     const prepared = prepareRequest();
 

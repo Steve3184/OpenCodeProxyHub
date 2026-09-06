@@ -171,6 +171,8 @@ export const openAIChatToResponsesRequest = (body: OpenAIChatRequest): OpenAIRes
   if (maxOutputTokens !== undefined) request.max_output_tokens = maxOutputTokens;
   const responseFormat = mapChatResponseFormatToResponses(body.response_format);
   if (responseFormat) request.text = { format: responseFormat };
+  const reasoningEffort = stringValue(body.reasoning_effort);
+  if (reasoningEffort !== undefined) request.reasoning = { effort: reasoningEffort };
   return request;
 };
 
@@ -356,6 +358,9 @@ export const responsesToOpenAIChatRequest = (body: OpenAIResponsesRequest): Open
   if (body.user !== undefined) request.user = body.user as string;
   const responseFormat = mapResponsesTextFormatToChat(body.text);
   if (responseFormat) request.response_format = responseFormat;
+  const reasoning = asObject(body.reasoning);
+  const reasoningEffort = stringValue(reasoning?.effort);
+  if (reasoningEffort !== undefined) request.reasoning_effort = reasoningEffort;
   return request;
 };
 
