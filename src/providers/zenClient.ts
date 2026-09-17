@@ -8,7 +8,7 @@ import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator, estimateTokens, extractTokenUsage } from "../utils/tokenUsage.js";
 import { normalizeResponsesRequest } from "../converters/openAiResponses.js";
 
-const OC_VERSION = "1.15.0";
+const OC_VERSION = "1.18.31";
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
 export interface ZenRequestInput {
