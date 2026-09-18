@@ -8,6 +8,7 @@ import { prepareZenRequest, pipeZenOpenAIResponse, requestZenFull } from "../pro
 import { pipeAnthropicSseAsOpenAI } from "../converters/anthropicSseToOpenAi.js";
 import { pipeOpenAiStreamStrippingThink } from "../converters/openAiThinkTagToReasoning.js";
 import { createResponsesToOpenAIStreamTransformer, openAIChatToResponsesRequest, responsesToOpenAIChatResponse } from "../converters/openAiResponses.js";
+import { createToolNameMapper } from "../converters/toolMapping.js";
 import { SessionStore, sessionScopeFromHeaders } from "../sessions/sessionStore.js";
 import type { OpenAIChatRequest } from "../types/api.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
@@ -103,6 +104,9 @@ export const registerOpenAIRoutes = async (
     }
 
     const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "openai", model, request.headers));
+    // Downstream tools are spelled `Read`/`Bash`; the upstream gate wants
+    // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
+    const toolMapper = createToolNameMapper(tools);
     app.log.info({ user: auth.name, model, upstreamModel, stream: isStream, messageCount: messages.length }, "openai_request");
     const resolveTransform = (settings: ReturnType<typeof settingsStore.get>): string => {
       if (useResponsesUpstream) return "responses-to-openai";
@@ -154,11 +158,12 @@ export const registerOpenAIRoutes = async (
       seed,
       user,
       reasoning_effort,
-    }) : undefined;
+    }, toolMapper) : undefined;
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
       stream: isStream,
       sessionId,
+      toolMapper,
       ...(useResponsesUpstream
         ? { protocol: "responses" as const, responseBody: responseRequest }
         : { messages, tools, toolChoice: tool_choice, parameters: { temperature, top_p, max_tokens, stop, presence_penalty, frequency_penalty, response_format, seed, user, reasoning_effort } }),
@@ -167,7 +172,7 @@ export const registerOpenAIRoutes = async (
 
     if (useResponsesUpstream && !isStream) {
       try {
-        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest);
+        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, false, "responses");
         const raw = zenResp.raw || "";
         const rateLimited = zenResp.status === 429 || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error") || raw.toLowerCase().includes("rate limit");
         if (rateLimited || zenResp.status < 200 || zenResp.status >= 300 || zenResp.data?.error || zenResp.data?.type === "error") {
@@ -176,7 +181,7 @@ export const registerOpenAIRoutes = async (
             error: { message: rateLimited ? `${message} (free model rate limit)` : message, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) },
           });
         }
-        return reply.code(200).send(responsesToOpenAIChatResponse(zenResp.data, model));
+        return reply.code(200).send(responsesToOpenAIChatResponse(zenResp.data, model, toolMapper));
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown upstream error";
         return reply.code(502).send({ error: { message, type: "upstream_error" } });
@@ -185,17 +190,17 @@ export const registerOpenAIRoutes = async (
 
     reply.hijack();
     if (useResponsesUpstream) {
-      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createResponsesToOpenAIStreamTransformer(model));
+      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createResponsesToOpenAIStreamTransformer(model, toolMapper), toolMapper);
       return;
     }
     if (isStream && activeSettings.openAiStreamTransformModels.includes(model)) {
-      pipeAnthropicSseAsOpenAI(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest);
+      pipeAnthropicSseAsOpenAI(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, toolMapper);
       return;
     }
     if (isStream && activeSettings.reasoningTagModels.includes(model)) {
-      pipeOpenAiStreamStrippingThink(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest);
+      pipeOpenAiStreamStrippingThink(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, toolMapper);
       return;
     }
-    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, model);
+    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, model, undefined, toolMapper);
   });
 };

@@ -6,6 +6,7 @@ import type { ModelAliasStore } from "../models/aliases.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { pipeZenOpenAIResponse, prepareZenRequest, requestZenFull } from "../providers/zenClient.js";
 import { createOpenAIToResponsesStreamTransformer, openAIChatResponseToResponses, responsesToOpenAIChatRequest } from "../converters/openAiResponses.js";
+import { createToolNameMapper } from "../converters/toolMapping.js";
 import { SessionStore, sessionScopeFromHeaders } from "../sessions/sessionStore.js";
 import type { OpenAIResponsesRequest } from "../types/api.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
@@ -100,6 +101,9 @@ export const registerResponsesRoutes = async (
 
     const inputItems = responseInputCount(body.input);
     const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "responses", model, request.headers));
+    // Downstream tools are spelled `Read`/`Bash`; the upstream gate wants
+    // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
+    const toolMapper = createToolNameMapper(body.tools);
     app.log.info({ user: auth.name, model, upstreamModel, stream: isStream, inputItems, useResponsesUpstream }, "responses_request");
     const useProxy = (settings: ReturnType<typeof settingsStore.get>): boolean => settings.proxyMode !== "direct" && auth.policy.allowProxy !== false;
     const logRequest = (statusCode: number, extra: Record<string, unknown> = {}) => {
@@ -128,13 +132,14 @@ export const registerResponsesRoutes = async (
 
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;
-    const chatRequest = useResponsesUpstream ? undefined : responsesToOpenAIChatRequest({ ...body, model: upstreamModel, stream: isStream });
+    const chatRequest = useResponsesUpstream ? undefined : responsesToOpenAIChatRequest({ ...body, model: upstreamModel, stream: isStream }, toolMapper);
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
       stream: isStream,
       sessionId,
+      toolMapper,
       ...(useResponsesUpstream
-        ? { protocol: "responses" as const, responseBody: { ...body, model: upstreamModel, stream: isStream } }
+        ? { protocol: "responses" as const, responseBody: { ...body, model: upstreamModel } }
         : { messages: chatRequest?.messages, tools: chatRequest?.tools, toolChoice: chatRequest?.tool_choice, parameters: {
           temperature: chatRequest?.temperature,
           top_p: chatRequest?.top_p,
@@ -152,7 +157,7 @@ export const registerResponsesRoutes = async (
 
     if (!isStream) {
       try {
-        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest);
+        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, false, useResponsesUpstream ? "responses" : "chat_completions");
         const raw = zenResp.raw || "";
         const rateLimited = zenResp.status === 429 || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error") || raw.toLowerCase().includes("rate limit");
         if (rateLimited || zenResp.status < 200 || zenResp.status >= 300 || zenResp.data?.error || zenResp.data?.type === "error") {
@@ -163,7 +168,7 @@ export const registerResponsesRoutes = async (
         }
         const result = useResponsesUpstream
           ? rewriteResponseModel(zenResp.data, model)
-          : openAIChatResponseToResponses(zenResp.data, model);
+          : openAIChatResponseToResponses(zenResp.data, model, toolMapper);
         return reply.code(200).send(result);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown upstream error";
@@ -173,9 +178,9 @@ export const registerResponsesRoutes = async (
 
     reply.hijack();
     if (useResponsesUpstream) {
-      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, model);
+      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, model, undefined, toolMapper, true);
       return;
     }
-    pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createOpenAIToResponsesStreamTransformer(model));
+    pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createOpenAIToResponsesStreamTransformer(model, toolMapper), toolMapper);
   });
 };

@@ -1,6 +1,7 @@
 import { ocId } from "../utils/ids.js";
 import type { ChatMessage, OpenAIChatRequest, OpenAIResponsesRequest } from "../types/api.js";
 import type { ZenStreamTransform } from "../providers/zenClient.js";
+import { applyToolFilterToChatCompletion, applyToolFilterToResponsesResponse, toUpstreamMessages, toUpstreamResponsesInput, toUpstreamToolChoice, type ToolNameMapper } from "./toolMapping.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -114,11 +115,12 @@ const mapChatResponseFormatToResponses = (responseFormat: unknown): JsonObject |
 };
 
 /** Convert an OpenAI Chat Completions request into a Responses request. */
-export const openAIChatToResponsesRequest = (body: OpenAIChatRequest): OpenAIResponsesRequest => {
+export const openAIChatToResponsesRequest = (body: OpenAIChatRequest, mapper?: ToolNameMapper): OpenAIResponsesRequest => {
   const input: JsonObject[] = [];
   const functionCallIds = new Set<string>();
   const functionCallOutputIds = new Set<string>();
-  for (const message of body.messages || []) {
+  const messages = (mapper ? toUpstreamMessages(body.messages, mapper) : body.messages) as ChatMessage[];
+  for (const message of messages || []) {
     const role = typeof message.role === "string" ? message.role : "user";
     if (role === "tool") {
       const callId = stringValue(message.tool_call_id) || ocId("call");
@@ -162,7 +164,7 @@ export const openAIChatToResponsesRequest = (body: OpenAIChatRequest): OpenAIRes
   const tools = mapChatToolsToResponses(body.tools);
   if (tools) request.tools = tools;
   const toolChoice = mapChatToolChoiceToResponses(body.tool_choice);
-  if (toolChoice !== undefined) request.tool_choice = toolChoice;
+  if (toolChoice !== undefined) request.tool_choice = mapper ? toUpstreamToolChoice(toolChoice, mapper) : toolChoice;
   const temperature = finiteNumber(body.temperature);
   const topP = finiteNumber(body.top_p);
   const maxOutputTokens = normalizeMaxOutputTokens(body.max_tokens);
@@ -177,13 +179,16 @@ export const openAIChatToResponsesRequest = (body: OpenAIChatRequest): OpenAIRes
 };
 
 /** Normalize fields whose constraints differ from Chat Completions. */
-export const normalizeResponsesRequest = (body: OpenAIResponsesRequest): OpenAIResponsesRequest => {
+export const normalizeResponsesRequest = (body: OpenAIResponsesRequest, mapper?: ToolNameMapper): OpenAIResponsesRequest => {
   const normalized: OpenAIResponsesRequest = { ...body };
   // These controls belong to Chat Completions and are rejected by the
   // Responses endpoint. Ignore them instead of forwarding an invalid body.
   for (const key of ["max_tokens", "stop", "presence_penalty", "frequency_penalty", "seed", "response_format", "user"] as const) {
     delete normalized[key];
   }
+  // `stream` is not ours to choose here: the upstream gate requires streaming.
+  delete normalized.stream;
+  if (mapper) normalized.input = toUpstreamResponsesInput(normalized.input, mapper);
   if ("max_output_tokens" in normalized) {
     const maxOutputTokens = normalizeMaxOutputTokens(normalized.max_output_tokens);
     if (maxOutputTokens === undefined) delete normalized.max_output_tokens;
@@ -292,14 +297,15 @@ const mapResponsesTextFormatToChat = (text: unknown): JsonObject | undefined => 
 };
 
 /** Convert a Responses request into the OpenAI Chat Completions request shape. */
-export const responsesToOpenAIChatRequest = (body: OpenAIResponsesRequest): OpenAIChatRequest => {
+export const responsesToOpenAIChatRequest = (body: OpenAIResponsesRequest, mapper?: ToolNameMapper): OpenAIChatRequest => {
   const messages: JsonObject[] = [];
   const functionCallIds = new Set<string>();
   const functionCallOutputIds = new Set<string>();
   if (typeof body.instructions === "string" && body.instructions.trim()) {
     messages.push({ role: "system", content: body.instructions });
   }
-  const input = Array.isArray(body.input) ? body.input : body.input === undefined ? [] : [body.input];
+  const rawInput = Array.isArray(body.input) ? body.input : body.input === undefined ? [] : [body.input];
+  const input = mapper ? toUpstreamResponsesInput(rawInput, mapper) as unknown[] : rawInput;
   for (const item of input) {
     if (typeof item === "string") {
       messages.push({ role: "user", content: item });
@@ -349,7 +355,7 @@ export const responsesToOpenAIChatRequest = (body: OpenAIResponsesRequest): Open
   const tools = mapResponsesToolsToChat(body.tools);
   if (tools) request.tools = tools;
   const toolChoice = mapResponsesToolChoiceToChat(body.tool_choice);
-  if (toolChoice !== undefined) request.tool_choice = toolChoice;
+  if (toolChoice !== undefined) request.tool_choice = mapper ? toUpstreamToolChoice(toolChoice, mapper) : toolChoice;
   const temperature = finiteNumber(body.temperature);
   const topP = finiteNumber(body.top_p);
   if (temperature !== undefined) request.temperature = temperature;
@@ -383,8 +389,9 @@ const chatUsage = (usage: unknown): JsonObject | undefined => {
 };
 
 /** Convert a complete Chat Completions response to a Responses response. */
-export const openAIChatResponseToResponses = (chatResponse: unknown, model: string): JsonObject => {
+export const openAIChatResponseToResponses = (chatResponse: unknown, model: string, mapper?: ToolNameMapper): JsonObject => {
   const response = asObject(chatResponse) || {};
+  if (mapper) applyToolFilterToChatCompletion(response, mapper);
   const choice = asObject(asArray(response.choices)[0]) || {};
   const message = asObject(choice.message) || {};
   const output: JsonObject[] = [];
@@ -433,8 +440,9 @@ const responseOutputText = (item: JsonObject): string => {
 };
 
 /** Convert a complete Responses response to a Chat Completions response. */
-export const responsesToOpenAIChatResponse = (responsesResponse: unknown, model: string): JsonObject => {
+export const responsesToOpenAIChatResponse = (responsesResponse: unknown, model: string, mapper?: ToolNameMapper): JsonObject => {
   const response = asObject(responsesResponse) || {};
+  if (mapper) applyToolFilterToResponsesResponse(response, mapper);
   const output = asArray(response.output);
   const content: string[] = [];
   const toolCalls: JsonObject[] = [];
@@ -501,7 +509,7 @@ const outputUsage = (payload: JsonObject): JsonObject | undefined => (
 );
 
 /** Transform a Responses SSE stream into OpenAI Chat Completions SSE. */
-export const createResponsesToOpenAIStreamTransformer = (model: string): StreamChunkTransformer => {
+export const createResponsesToOpenAIStreamTransformer = (model: string, mapper?: ToolNameMapper): StreamChunkTransformer => {
   let buffer = "";
   const id = ocId("chatcmpl");
   let created = Math.floor(Date.now() / 1000);
@@ -512,6 +520,7 @@ export const createResponsesToOpenAIStreamTransformer = (model: string): StreamC
   let finishReason: "stop" | "tool_calls" | "length" = "stop";
   let usage: JsonObject | undefined;
   const tools = new Map<number, { index: number; id: string; name: string; argumentDeltaSent: boolean }>();
+  const droppedOutputs = new Set<number>();
   const textOutputIndices = new Set<number>();
 
   const chunk = (delta: JsonObject, final: "stop" | "tool_calls" | "length" | null = null): JsonObject => ({
@@ -532,10 +541,19 @@ export const createResponsesToOpenAIStreamTransformer = (model: string): StreamC
   const ensureTool = (outputIndex: number, item?: JsonObject, out?: string[]): { index: number; id: string; name: string; argumentDeltaSent: boolean } => {
     const existing = tools.get(outputIndex);
     if (existing) return existing;
+    const upstreamName = stringValue(item?.name) || "";
+    const downstreamName = mapper ? mapper.toDownstream(upstreamName) : upstreamName;
+    // The model called a placeholder tool the client never declared: drop it.
+    if (downstreamName === undefined) {
+      droppedOutputs.add(outputIndex);
+      const dropped = { index: nextToolIndex, id: "", name: "", argumentDeltaSent: true };
+      tools.set(outputIndex, dropped);
+      return dropped;
+    }
     const state = {
       index: nextToolIndex,
       id: stringValue(item?.call_id) || stringValue(item?.id) || ocId("call"),
-      name: stringValue(item?.name) || "",
+      name: downstreamName,
       argumentDeltaSent: false,
     };
     nextToolIndex += 1;
@@ -599,13 +617,16 @@ export const createResponsesToOpenAIStreamTransformer = (model: string): StreamC
     if (event === "response.function_call_arguments.delta") {
       const delta = stringValue(payload.delta);
       if (delta === undefined) return;
+      if (droppedOutputs.has(outputIndex)) return;
       const tool = ensureTool(outputIndex, item, out);
+      if (droppedOutputs.has(outputIndex)) return;
       tool.argumentDeltaSent = true;
       out.push(chatSse(chunk({ tool_calls: [{ index: tool.index, function: { arguments: delta } }] })));
       return;
     }
     if (event === "response.output_item.done" && item) {
       if (item.type === "function_call") {
+        if (droppedOutputs.has(outputIndex)) return;
         const tool = ensureTool(outputIndex, item, out);
         if (!tool.argumentDeltaSent && typeof item.arguments === "string") {
           out.push(chatSse(chunk({ tool_calls: [{ index: tool.index, function: { arguments: item.arguments } }] })));
@@ -646,7 +667,7 @@ export const createResponsesToOpenAIStreamTransformer = (model: string): StreamC
 };
 
 /** Transform a Chat Completions SSE stream into Responses SSE. */
-export const createOpenAIToResponsesStreamTransformer = (model: string): StreamChunkTransformer => {
+export const createOpenAIToResponsesStreamTransformer = (model: string, mapper?: ToolNameMapper): StreamChunkTransformer => {
   let buffer = "";
   const id = ocId("resp");
   let created = Math.floor(Date.now() / 1000);
@@ -655,7 +676,7 @@ export const createOpenAIToResponsesStreamTransformer = (model: string): StreamC
   let nextOutputIndex = 0;
   let message: { id: string; outputIndex: number; text: string; textStarted: boolean } | undefined;
   let usage: JsonObject | undefined;
-  const tools = new Map<number, { id: string; callId: string; name: string; outputIndex: number; arguments: string }>();
+  const tools = new Map<number, { id: string; callId: string; name: string; outputIndex: number; arguments: string; dropped: boolean }>();
 
   const outputItems = (): JsonObject[] => {
     const items: JsonObject[] = [];
@@ -669,6 +690,7 @@ export const createOpenAIToResponsesStreamTransformer = (model: string): StreamC
       });
     }
     for (const tool of tools.values()) {
+      if (tool.dropped) continue;
       items.push({ id: tool.id, type: "function_call", status: "completed", call_id: tool.callId, name: tool.name, arguments: tool.arguments });
     }
     return items;
@@ -724,12 +746,21 @@ export const createOpenAIToResponsesStreamTransformer = (model: string): StreamC
     if (existing) return existing;
     ensureResponse(out);
     const fn = asObject(delta.function);
+    const upstreamName = stringValue(fn?.name) || "";
+    const downstreamName = mapper ? mapper.toDownstream(upstreamName) : upstreamName;
+    // The model called a placeholder tool the client never declared: drop it.
+    if (downstreamName === undefined) {
+      const dropped = { id: "", callId: "", name: "", outputIndex: -1, arguments: "", dropped: true };
+      tools.set(index, dropped);
+      return dropped;
+    }
     const state = {
       id: ocId("fc"),
       callId: stringValue(delta.id) || ocId("call"),
-      name: stringValue(fn?.name) || "",
+      name: downstreamName,
       outputIndex: nextOutputIndex,
       arguments: "",
+      dropped: false,
     };
     nextOutputIndex += 1;
     tools.set(index, state);
@@ -769,6 +800,7 @@ export const createOpenAIToResponsesStreamTransformer = (model: string): StreamC
       }));
     }
     for (const tool of tools.values()) {
+      if (tool.dropped) continue;
       out.push(sse("response.output_item.done", {
         type: "response.output_item.done",
         output_index: tool.outputIndex,
@@ -813,8 +845,9 @@ export const createOpenAIToResponsesStreamTransformer = (model: string): StreamC
       if (!toolDelta) continue;
       const index = numberValue(toolDelta.index) ?? 0;
       const tool = ensureTool(index, toolDelta, out);
+      if (tool.dropped) continue;
       const fn = asObject(toolDelta.function);
-      if (typeof fn?.name === "string" && !tool.name) tool.name = fn.name;
+      if (typeof fn?.name === "string" && !tool.name) tool.name = mapper ? mapper.toDownstream(fn.name) ?? tool.name : fn.name;
       if (typeof fn?.arguments === "string") {
         tool.arguments += fn.arguments;
       }
@@ -841,7 +874,7 @@ export const createOpenAIToResponsesStreamTransformer = (model: string): StreamC
 };
 
 /** Transform a Responses SSE stream directly into Anthropic Messages SSE. */
-export const createResponsesToAnthropicStreamTransformer = (model: string, inputTokens: number): StreamChunkTransformer => {
+export const createResponsesToAnthropicStreamTransformer = (model: string, inputTokens: number, mapper?: ToolNameMapper): StreamChunkTransformer => {
   let buffer = "";
   const id = ocId("msg");
   let started = false;
@@ -850,7 +883,7 @@ export const createResponsesToAnthropicStreamTransformer = (model: string, input
   let outputTokens = 0;
   let usage: JsonObject | undefined;
   let textBlock: { index: number; started: boolean; text: string } | undefined;
-  const toolBlocks = new Map<number, { index: number; id: string; name: string; input: string }>();
+  const toolBlocks = new Map<number, { index: number; id: string; name: string; input: string; dropped: boolean }>();
 
   const ensureMessage = (out: string[]): void => {
     if (started) return;
@@ -882,11 +915,20 @@ export const createResponsesToAnthropicStreamTransformer = (model: string, input
     const existing = toolBlocks.get(outputIndex);
     if (existing) return existing;
     ensureMessage(out);
+    const upstreamName = stringValue(item?.name) || "";
+    const downstreamName = mapper ? mapper.toDownstream(upstreamName) : upstreamName;
+    // The model called a placeholder tool the client never declared: drop it.
+    if (downstreamName === undefined) {
+      const dropped = { index: -1, id: "", name: "", input: "", dropped: true };
+      toolBlocks.set(outputIndex, dropped);
+      return dropped;
+    }
     const state = {
       index: nextBlockIndex,
       id: stringValue(item?.call_id) || stringValue(item?.id) || ocId("toolu"),
-      name: stringValue(item?.name) || "",
+      name: downstreamName,
       input: "",
+      dropped: false,
     };
     nextBlockIndex += 1;
     toolBlocks.set(outputIndex, state);
@@ -904,9 +946,11 @@ export const createResponsesToAnthropicStreamTransformer = (model: string, input
     ensureMessage(out);
     if (textBlock) out.push(sse("content_block_stop", { type: "content_block_stop", index: textBlock.index }));
     for (const tool of toolBlocks.values()) {
+      if (tool.dropped) continue;
       out.push(sse("content_block_stop", { type: "content_block_stop", index: tool.index }));
     }
-    const stopReason = toolBlocks.size ? "tool_use" : incomplete ? "max_tokens" : "end_turn";
+    const hasToolBlock = [...toolBlocks.values()].some((tool) => !tool.dropped);
+    const stopReason = hasToolBlock ? "tool_use" : incomplete ? "max_tokens" : "end_turn";
     const finalUsage = responseUsage(usage) || {};
     out.push(sse("message_delta", {
       type: "message_delta",
@@ -933,6 +977,7 @@ export const createResponsesToAnthropicStreamTransformer = (model: string, input
     const outputIndex = numberValue(payload.output_index) ?? 0;
     const item = asObject(payload.item);
     if (event === "response.output_item.added" && item?.type === "function_call") {
+      // A dropped placeholder never opens a content block.
       ensureTool(outputIndex, item, out);
       return;
     }
@@ -949,6 +994,7 @@ export const createResponsesToAnthropicStreamTransformer = (model: string, input
       const delta = stringValue(payload.delta);
       if (delta === undefined) return;
       const tool = ensureTool(outputIndex, item, out);
+      if (tool.dropped) return;
       tool.input += delta;
       outputTokens += Math.ceil(delta.length / 4);
       out.push(sse("content_block_delta", { type: "content_block_delta", index: tool.index, delta: { type: "input_json_delta", partial_json: delta } }));
@@ -957,6 +1003,7 @@ export const createResponsesToAnthropicStreamTransformer = (model: string, input
     if (event === "response.output_item.done" && item) {
       if (item.type === "function_call") {
         const tool = ensureTool(outputIndex, item, out);
+        if (tool.dropped) return;
         if (!tool.input && typeof item.arguments === "string") {
           tool.input = item.arguments;
           out.push(sse("content_block_delta", { type: "content_block_delta", index: tool.index, delta: { type: "input_json_delta", partial_json: item.arguments } }));

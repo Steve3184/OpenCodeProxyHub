@@ -6,6 +6,7 @@ import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator } from "../utils/tokenUsage.js";
+import type { ToolNameMapper } from "./toolMapping.js";
 
 export const anthropicToOpenAI = (body: AnthropicMessageRequest): { messages: unknown[]; tools?: unknown[]; toolChoice?: unknown; parameters: Record<string, unknown> } => {
   const messages: any[] = [];
@@ -79,7 +80,7 @@ export const anthropicToOpenAI = (body: AnthropicMessageRequest): { messages: un
   return { messages, tools: tools.length ? tools : undefined, toolChoice: body.tool_choice, parameters };
 };
 
-export const openAIToAnthropic = (oaiResp: any, model: string, inputTokens: number) => {
+export const openAIToAnthropic = (oaiResp: any, model: string, inputTokens: number, toolMapper?: ToolNameMapper) => {
   const choice = oaiResp.choices?.[0];
   if (!choice) {
     return {
@@ -97,6 +98,9 @@ export const openAIToAnthropic = (oaiResp: any, model: string, inputTokens: numb
   if (choice.message?.content) content.push({ type: "text", text: choice.message.content });
   if (choice.message?.tool_calls) {
     for (const toolCall of choice.message.tool_calls) {
+      // Placeholder calls the client never declared are dropped entirely.
+      const name = toolMapper ? toolMapper.toDownstream(toolCall.function?.name) : toolCall.function?.name;
+      if (name === undefined) continue;
       let input = {};
       try {
         input = JSON.parse(toolCall.function.arguments);
@@ -106,7 +110,7 @@ export const openAIToAnthropic = (oaiResp: any, model: string, inputTokens: numb
       content.push({
         type: "tool_use",
         id: toolCall.id || ocId("toolu"),
-        name: toolCall.function.name,
+        name,
         input,
       });
     }
@@ -114,7 +118,7 @@ export const openAIToAnthropic = (oaiResp: any, model: string, inputTokens: numb
   if (!content.length) content.push({ type: "text", text: "" });
 
   let stopReason = "end_turn";
-  if (choice.finish_reason === "tool_calls") stopReason = "tool_use";
+  if (choice.finish_reason === "tool_calls" && content.some((block) => block.type === "tool_use")) stopReason = "tool_use";
   else if (choice.finish_reason === "length") stopReason = "max_tokens";
 
   return {
@@ -133,7 +137,7 @@ export const openAIToAnthropic = (oaiResp: any, model: string, inputTokens: numb
   };
 };
 
-export const handleAnthropicFullResponse = (zenResp: ZenFullResponse, model: string, inputTokens: number) => {
+export const handleAnthropicFullResponse = (zenResp: ZenFullResponse, model: string, inputTokens: number, toolMapper?: ToolNameMapper) => {
   const rawError = typeof zenResp.raw === "string" ? zenResp.raw : "";
   const rateLimited = zenResp.status === 429 || rawError.includes("FreeUsageLimitError") || rawError.includes("rate_limit_error") || rawError.toLowerCase().includes("rate limit");
   if (rateLimited) {
@@ -155,7 +159,7 @@ export const handleAnthropicFullResponse = (zenResp: ZenFullResponse, model: str
       body: { type: "error", error: { type: "upstream_error", message: "Invalid upstream response" } },
     };
   }
-  return { status: 200, body: openAIToAnthropic(zenResp.data, model, inputTokens) };
+  return { status: 200, body: openAIToAnthropic(zenResp.data, model, inputTokens, toolMapper) };
 };
 
 export const pipeZenAsAnthropic = (
@@ -167,6 +171,7 @@ export const pipeZenAsAnthropic = (
   metrics?: MetricsStore,
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
   retryAttempt = false,
+  toolMapper?: ToolNameMapper,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -196,13 +201,21 @@ export const pipeZenAsAnthropic = (
       const retryPrepared = retryPrepare(excluded);
       if (retryPrepared.lease?.requiredUnavailable) return false;
       retryStarted = true;
-      pipeZenAsAnthropic(retryPrepared, model, res, inputTokens, proxyPool, metrics, retryPrepare, true);
+      pipeZenAsAnthropic(retryPrepared, model, res, inputTokens, proxyPool, metrics, retryPrepare, true, toolMapper);
       return true;
     };
 
     const sendSSE = (event: string, data: unknown) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
+
+    // A placeholder tool call (upstream `read`/`bash` the client never declared)
+    // has to be dropped, including its later argument fragments.
+    let droppedBlockIndex = -1;
+    const isDropped = (blockIndex: number): boolean => blockIndex !== -1 && blockIndex === droppedBlockIndex;
+    const mapToolName = (name: unknown): string | undefined => (
+      toolMapper ? toolMapper.toDownstream(name) : (typeof name === "string" ? name : undefined)
+    );
 
     const sendHeaders = () => {
       if (headersSent) return;
@@ -302,11 +315,20 @@ export const pipeZenAsAnthropic = (
         if (delta.tool_calls) {
           for (const toolCall of delta.tool_calls) {
             const idx = toolCall.index ?? 0;
+            if (isDropped(idx)) continue;
             if (idx > toolIdx) {
+              const mappedName = mapToolName(toolCall.function?.name);
+              if (mappedName === undefined) {
+                // Placeholder call the client never declared: drop the block.
+                if (toolIdx === -1 && contentIdx > 0) sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
+                droppedBlockIndex = idx;
+                toolIdx = idx;
+                continue;
+              }
               if (toolIdx === -1 && contentIdx > 0) sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
               toolIdx = idx;
               const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: toolCall.id || ocId("toolu"), name: toolCall.function?.name || "" } });
+              sendSSE("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: toolCall.id || ocId("toolu"), name: mappedName } });
             }
             if (toolCall.function?.arguments) {
               const blockIdx = contentIdx > 0 ? idx + 1 : idx;
@@ -318,9 +340,12 @@ export const pipeZenAsAnthropic = (
 
         if (choice.finish_reason) {
           const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-          for (let i = 0; i < totalBlocks; i += 1) sendSSE("content_block_stop", { type: "content_block_stop", index: i });
+          for (let i = 0; i < totalBlocks; i += 1) {
+            if (isDropped(i)) continue;
+            sendSSE("content_block_stop", { type: "content_block_stop", index: i });
+          }
           let stopReason = "end_turn";
-          if (choice.finish_reason === "tool_calls") stopReason = "tool_use";
+          if (choice.finish_reason === "tool_calls" && droppedBlockIndex === -1) stopReason = "tool_use";
           else if (choice.finish_reason === "length") stopReason = "max_tokens";
           sendSSE("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } });
           sendSSE("message_stop", { type: "message_stop" });

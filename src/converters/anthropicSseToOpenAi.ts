@@ -5,6 +5,7 @@ import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator } from "../utils/tokenUsage.js";
+import type { ToolNameMapper } from "./toolMapping.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -20,6 +21,8 @@ interface TransformState {
   sawToolCall: boolean;
   stopReason: FinishReason;
   doneSent: boolean;
+  /** Set once the upstream ended with only dropped placeholder tool calls. */
+  sawDroppedToolCall: boolean;
 }
 
 interface SseBlock {
@@ -37,6 +40,7 @@ const createState = (model: string): TransformState => ({
   sawToolCall: false,
   stopReason: "stop",
   doneSent: false,
+  sawDroppedToolCall: false,
 });
 
 const openAiChunk = (state: TransformState, delta: Record<string, unknown>, finishReason: FinishReason | null = null) => ({
@@ -112,7 +116,7 @@ const writeOpenAiError = (res: ServerResponse, statusCode: number, message: stri
   res.end(JSON.stringify({ error: { message, type: "upstream_error" } }));
 };
 
-const handleParsedPayload = (state: TransformState, res: ServerResponse, parsed: any): void => {
+const handleParsedPayload = (state: TransformState, res: ServerResponse, parsed: any, toolMapper?: ToolNameMapper): void => {
   if (state.doneSent) return;
 
   if (Array.isArray(parsed?.choices)) {
@@ -131,6 +135,13 @@ const handleParsedPayload = (state: TransformState, res: ServerResponse, parsed:
   if (parsed?.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
     sendRole(state, res);
     const blockIndex = Number.isInteger(parsed.index) ? parsed.index : state.nextToolIndex;
+    const name = toolMapper ? toolMapper.toDownstream(parsed.content_block.name) : parsed.content_block.name;
+    if (name === undefined) {
+      // Placeholder tool the client never declared: drop the whole block.
+      state.sawDroppedToolCall = true;
+      state.blockToToolIndex.set(blockIndex, -1);
+      return;
+    }
     const toolIndex = state.nextToolIndex;
     state.nextToolIndex += 1;
     state.blockToToolIndex.set(blockIndex, toolIndex);
@@ -140,7 +151,7 @@ const handleParsedPayload = (state: TransformState, res: ServerResponse, parsed:
         index: toolIndex,
         id: parsed.content_block.id || ocId("toolu"),
         type: "function",
-        function: { name: parsed.content_block.name || "", arguments: "" },
+        function: { name, arguments: "" },
       }],
     }));
     return;
@@ -162,6 +173,7 @@ const handleParsedPayload = (state: TransformState, res: ServerResponse, parsed:
       sendRole(state, res);
       const blockIndex = Number.isInteger(parsed.index) ? parsed.index : -1;
       const toolIndex = state.blockToToolIndex.get(blockIndex) ?? 0;
+      if (toolIndex === -1) return;
       state.sawToolCall = true;
       writeSse(res, openAiChunk(state, {
         tool_calls: [{ index: toolIndex, function: { arguments: delta.partial_json } }],
@@ -177,6 +189,8 @@ const handleParsedPayload = (state: TransformState, res: ServerResponse, parsed:
 
   if (parsed?.type === "message_stop") {
     if (state.sawToolCall && state.stopReason === "stop") state.stopReason = "tool_calls";
+    // Only dropped placeholders were emitted: the turn simply ends.
+    else if (!state.sawToolCall && state.sawDroppedToolCall && state.stopReason === "tool_calls") state.stopReason = "stop";
     sendDone(state, res);
   }
 };
@@ -189,6 +203,7 @@ export const pipeAnthropicSseAsOpenAI = (
   metrics?: MetricsStore,
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
   retryAttempt = false,
+  toolMapper?: ToolNameMapper,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -214,7 +229,7 @@ export const pipeAnthropicSseAsOpenAI = (
     const retryPrepared = retryPrepare(excluded);
     if (retryPrepared.lease?.requiredUnavailable) return false;
     retryStarted = true;
-    pipeAnthropicSseAsOpenAI(retryPrepared, model, res, proxyPool, metrics, retryPrepare, true);
+    pipeAnthropicSseAsOpenAI(retryPrepared, model, res, proxyPool, metrics, retryPrepare, true, toolMapper);
     return true;
   };
 
@@ -266,7 +281,7 @@ export const pipeAnthropicSseAsOpenAI = (
           usageAccumulator.observe(parsed);
           const text = parsed.delta?.text || parsed.delta?.thinking || parsed.content_block?.text;
           if (typeof text === "string") observedOutputChars += text.length;
-          handleParsedPayload(state, res, parsed);
+          handleParsedPayload(state, res, parsed, toolMapper);
         } catch {
           // Ignore malformed SSE payloads rather than corrupting the OpenAI stream.
         }

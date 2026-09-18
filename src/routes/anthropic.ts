@@ -8,6 +8,7 @@ import { prepareZenRequest, requestZenFull, pipeZenOpenAIResponse } from "../pro
 import { SessionStore, sessionScopeFromHeaders } from "../sessions/sessionStore.js";
 import { anthropicToOpenAI, handleAnthropicFullResponse, pipeZenAsAnthropic } from "../converters/anthropic.js";
 import { createResponsesToAnthropicStreamTransformer, openAIChatToResponsesRequest, responsesToOpenAIChatResponse } from "../converters/openAiResponses.js";
+import { createToolNameMapper } from "../converters/toolMapping.js";
 import type { AnthropicMessageRequest, ChatMessage, OpenAIChatRequest } from "../types/api.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { AsyncLimiter } from "../rateLimit/limiter.js";
@@ -86,6 +87,9 @@ export const registerAnthropicRoutes = async (
 
     const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "anthropic", model, request.headers));
     const { messages, tools, toolChoice, parameters } = anthropicToOpenAI(request.body);
+    // Downstream tools are spelled `Read`/`Bash`; the upstream gate wants
+    // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
+    const toolMapper = createToolNameMapper(tools);
     const inputTokens = Math.trunc(JSON.stringify(messages).length / 4);
     app.log.info({ user: auth.name, model, upstreamModel, stream: isStream, messageCount: messages.length }, "anthropic_request");
     const useProxy = (settings: ReturnType<typeof settingsStore.get>): boolean => settings.proxyMode !== "direct" && auth.policy.allowProxy !== false;
@@ -121,11 +125,12 @@ export const registerAnthropicRoutes = async (
       tools,
       tool_choice: toolChoice,
       ...parameters,
-    } as OpenAIChatRequest) : undefined;
+    } as OpenAIChatRequest, toolMapper) : undefined;
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
       stream: isStream,
       sessionId,
+      toolMapper,
       ...(useResponsesUpstream
         ? { protocol: "responses" as const, responseBody: responseRequest }
         : { messages, tools, toolChoice, parameters }),
@@ -135,19 +140,19 @@ export const registerAnthropicRoutes = async (
     if (isStream) {
       reply.hijack();
       if (useResponsesUpstream) {
-        pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createResponsesToAnthropicStreamTransformer(model, inputTokens));
+        pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createResponsesToAnthropicStreamTransformer(model, inputTokens, toolMapper));
         return;
       }
-      pipeZenAsAnthropic(prepared, model, reply.raw, inputTokens, effectiveProxyPool, metrics, prepareRequest);
+      pipeZenAsAnthropic(prepared, model, reply.raw, inputTokens, effectiveProxyPool, metrics, prepareRequest, false, toolMapper);
       return;
     }
 
     try {
-      const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest);
+      const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, false, useResponsesUpstream ? "responses" : "chat_completions");
       const normalizedResponse = useResponsesUpstream && zenResp.status >= 200 && zenResp.status < 300 && !zenResp.data?.error && zenResp.data?.type !== "error"
-        ? { ...zenResp, data: responsesToOpenAIChatResponse(zenResp.data, model) }
+        ? { ...zenResp, data: responsesToOpenAIChatResponse(zenResp.data, model, toolMapper) }
         : zenResp;
-      const result = handleAnthropicFullResponse(normalizedResponse, model, inputTokens);
+      const result = handleAnthropicFullResponse(normalizedResponse, model, inputTokens, toolMapper);
       return reply.code(result.status).send(result.body);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown upstream error";

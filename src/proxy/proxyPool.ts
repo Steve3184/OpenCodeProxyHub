@@ -524,9 +524,21 @@ export class ProxyPoolStore {
 
   private requestModelHealthCheck(node: ProxyNode, options: ProxyModelTestOptions): Promise<number> {
     const usesResponses = options.protocol === "responses";
+    // The upstream gate requires `stream: true` plus the `read`/`bash` tool
+    // declarations, so the health check has to look like a real request.
+    const tools = [
+      { type: "function", name: "read", description: "Placeholder", parameters: { type: "object", properties: {} } },
+      { type: "function", name: "bash", description: "Placeholder", parameters: { type: "object", properties: {} } },
+    ];
     const body = JSON.stringify(usesResponses
-      ? { model: options.model, input: "ping", stream: false, max_output_tokens: 16 }
-      : { model: options.model, messages: [{ role: "user", content: "ping" }], stream: false, max_tokens: 1 });
+      ? { model: options.model, input: "ping", stream: true, max_output_tokens: 16, tools }
+      : {
+        model: options.model,
+        messages: [{ role: "user", content: "ping" }],
+        stream: true,
+        max_tokens: 1,
+        tools: tools.map(({ type, name, description, parameters }) => ({ type, function: { name, description, parameters } })),
+      });
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (callback: () => void) => {
@@ -567,17 +579,40 @@ export class ProxyPoolStore {
           const raw = Buffer.concat(chunks).toString("utf8");
           if (statusCode >= 200 && statusCode < 300) {
             try {
-              const parsed = JSON.parse(raw) as { choices?: unknown[]; output?: unknown[]; object?: string; error?: { message?: string } | string; type?: string };
-              if (parsed.error || parsed.type === "error" || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error")) {
-                const message = typeof parsed.error === "string" ? parsed.error : parsed.error?.message;
+              // The health check streams, so the body is SSE. Only the JSON
+              // payloads matter here; error events carry the upstream error.
+              const payloads: Record<string, unknown>[] = [];
+              const trimmed = raw.trim();
+              if (trimmed.startsWith("{")) {
+                payloads.push(JSON.parse(trimmed) as Record<string, unknown>);
+              } else {
+                for (const line of trimmed.split(/\r?\n/)) {
+                  if (!line.startsWith("data:")) continue;
+                  const payload = line.slice(5).trim();
+                  if (!payload || payload === "[DONE]") continue;
+                  try {
+                    payloads.push(JSON.parse(payload) as Record<string, unknown>);
+                  } catch {
+                    // A malformed chunk does not invalidate the whole stream.
+                  }
+                }
+              }
+              const errorPayload = payloads.find((entry) => entry.error || entry.type === "error");
+              if (errorPayload || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error")) {
+                const errorValue = errorPayload?.error;
+                const message = typeof errorValue === "string" ? errorValue : (errorValue as { message?: string } | undefined)?.message;
                 const error = new Error(`Model health check returned an upstream error${message ? `: ${message}` : ""}`) as Error & { statusCode?: number };
                 error.statusCode = statusCode;
                 reject(error);
                 return;
               }
               const validResponse = usesResponses
-                ? parsed.object === "response" || Array.isArray(parsed.output)
-                : Array.isArray(parsed.choices) && parsed.choices.length > 0;
+                ? payloads.some((entry) => {
+                  const response = entry.response as { object?: string; output?: unknown[] } | undefined;
+                  return entry.object === "response" || Array.isArray(entry.output) || response?.object === "response" || Array.isArray(response?.output);
+                })
+                // The first chunk of any chat stream carries the choices array.
+                : payloads.some((entry) => Array.isArray(entry.choices));
               if (!validResponse) {
                 const error = new Error(usesResponses ? "Model health check returned no response output" : "Model health check returned no choices") as Error & { statusCode?: number };
                 error.statusCode = statusCode;

@@ -7,6 +7,8 @@ import type { ProxyLease, ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator, estimateTokens, extractTokenUsage } from "../utils/tokenUsage.js";
 import { normalizeResponsesRequest } from "../converters/openAiResponses.js";
+import { aggregateUpstreamBody, type UpstreamProtocol } from "../converters/streamAggregator.js";
+import { DownstreamToolCallFilter, ResponsesStreamToolFilter, applyToolFilterToChatCompletion, applyToolFilterToResponsesResponse, toUpstreamMessages, toUpstreamToolChoice, toUpstreamTools, type ToolNameMapper } from "../converters/toolMapping.js";
 
 const OC_VERSION = "1.18.31";
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
@@ -21,6 +23,8 @@ export interface ZenRequestInput {
   sessionId: string;
   protocol?: "chat_completions" | "responses";
   responseBody?: Record<string, unknown>;
+  /** Maps the client's tool names to the upstream spelling and back. */
+  toolMapper: ToolNameMapper;
 }
 
 export interface ZenPreparedRequest {
@@ -55,21 +59,27 @@ const responseTextForTokenEstimate = (data: any): unknown => {
 
 export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, proxyPool?: ProxyPoolStore, excludeProxyIds: ReadonlySet<string> = new Set()): ZenPreparedRequest => {
   const protocol = input.protocol || "chat_completions";
+  const mapper = input.toolMapper;
   let requestBody: Record<string, unknown>;
   if (protocol === "responses") {
     requestBody = normalizeResponsesRequest({
       ...(input.responseBody || {}),
       model: input.model,
-      stream: Boolean(input.stream),
-    });
+    }, mapper);
+    // The upstream gate requires streaming, so the body always asks for it and
+    // the caller's own preference is tracked separately.
+    requestBody.stream = true;
+    requestBody.tools = toUpstreamTools(requestBody.tools, mapper, "responses");
   } else {
     requestBody = {
       model: input.model,
-      messages: input.messages || [],
-      stream: Boolean(input.stream),
+      messages: toUpstreamMessages(input.messages || [], mapper),
+      // The upstream gate requires streaming, so the body always asks for it and
+      // the caller's own preference is tracked separately.
+      stream: true,
     };
-    if (input.tools?.length) requestBody.tools = input.tools;
-    if (input.toolChoice) requestBody.tool_choice = input.toolChoice;
+    if (input.tools?.length) requestBody.tools = toUpstreamTools(input.tools, mapper, "chat");
+    if (input.toolChoice) requestBody.tool_choice = toUpstreamToolChoice(input.toolChoice, mapper);
     for (const [key, value] of Object.entries(input.parameters || {})) {
       if (value !== undefined) requestBody[key] = value;
     }
@@ -109,6 +119,7 @@ export const requestZenFull = (
   metrics?: MetricsStore,
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
   retryAttempt = false,
+  protocol: UpstreamProtocol = "chat_completions",
 ): Promise<ZenFullResponse> => {
   return new Promise((resolve, reject) => {
     if (prepared.lease?.requiredUnavailable) {
@@ -126,13 +137,13 @@ export const requestZenFull = (
       zenRes.on("end", () => {
         if (settled) return;
         settled = true;
-        const raw = Buffer.concat(chunks).toString();
-        let data: any = null;
-        try {
-          data = JSON.parse(raw);
-        } catch {
-          // Preserve the raw upstream body for callers.
-        }
+        const upstreamRaw = Buffer.concat(chunks).toString();
+        // The upstream always streams, so a successful body is SSE. Fold it back
+        // into the complete JSON document the caller expects; error bodies and
+        // non-SSE replies are passed through as-is.
+        const aggregated = aggregateUpstreamBody(upstreamRaw, protocol);
+        const data: any = aggregated;
+        const raw = aggregated ? JSON.stringify(aggregated) : upstreamRaw;
         const status = zenRes.statusCode || 502;
         const protocolError = !data || Boolean(data.error) || data.type === "error";
         const rateLimited = status === 429 || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error") || raw.toLowerCase().includes("rate limit");
@@ -153,7 +164,7 @@ export const requestZenFull = (
           if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
           const retryPrepared = retryPrepare(excluded);
           if (retryPrepared.lease?.node || !retryPrepared.lease?.requiredUnavailable) {
-            requestZenFull(retryPrepared, proxyPool, metrics, retryPrepare, true).then(resolve, reject);
+            requestZenFull(retryPrepared, proxyPool, metrics, retryPrepare, true, protocol).then(resolve, reject);
             return;
           }
         }
@@ -213,6 +224,8 @@ export const pipeZenOpenAIResponse = (
   retryAttempt = false,
   responseModel?: string,
   streamTransform?: ZenStreamTransform,
+  toolMapper?: ToolNameMapper,
+  responsesProtocol = false,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -229,7 +242,12 @@ export const pipeZenOpenAIResponse = (
   let observedOutputChars = 0;
   let responseErrorBody = "";
   let responseRewriteBuffer = "";
+  // Upstream always streams; a non-streaming caller gets the stream folded back
+  // into a single JSON body once the upstream has finished.
+  const aggregateUpstream = !stream;
   const nonStreamChunks: Buffer[] = [];
+  const toolCallFilter = toolMapper ? new DownstreamToolCallFilter(toolMapper) : undefined;
+  const responsesToolFilter = toolMapper && responsesProtocol ? new ResponsesStreamToolFilter(toolMapper) : undefined;
   const errorBody = (message: string, rateLimited: boolean): string => JSON.stringify(
     streamTransform?.errorBody?.(message, rateLimited) ?? {
       error: {
@@ -264,8 +282,43 @@ export const pipeZenOpenAIResponse = (
       }
     }).join("\n") + (complete.length ? "\n" : ""));
   };
+  // Only used on the Responses passthrough path, where the upstream events are
+  // forwarded verbatim and placeholder tool calls have to be filtered out.
+  let responsesFilterBuffer = "";
+  const filterResponsesChunk = (chunk: Buffer | string, flush = false): Buffer => {
+    responsesFilterBuffer += chunk.toString();
+    const lines = responsesFilterBuffer.split(/\n/);
+    const remainder = lines.pop() || "";
+    const complete = flush ? lines.concat(remainder ? [remainder] : []) : lines;
+    responsesFilterBuffer = flush ? "" : remainder;
+    const out: string[] = [];
+    for (const line of complete) {
+      const match = line.match(/^(data:\s*)(.*?)(\r?)$/);
+      if (!match || !match[2] || match[2] === "[DONE]") {
+        out.push(line);
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(match[2]) as Record<string, unknown>;
+        const filtered = responsesToolFilter?.applyPayload(parsed) ?? parsed;
+        if (filtered === null) continue;
+        if (responseModel) {
+          filtered.model = responseModel;
+          const response = filtered.response;
+          if (response && typeof response === "object" && !Array.isArray(response)) {
+            (response as Record<string, unknown>).model = responseModel;
+          }
+        }
+        out.push(`${match[1]}${JSON.stringify(filtered)}${match[3] || ""}`);
+      } catch {
+        out.push(line);
+      }
+    }
+    return Buffer.from(out.join("\n") + (complete.length ? "\n" : ""));
+  };
   const transformStreamChunk = (chunk: Buffer | string, flush = false): Buffer => {
     if (streamTransform) return flush ? streamTransform.flush() : streamTransform.write(Buffer.from(chunk));
+    if (responsesToolFilter) return filterResponsesChunk(chunk, flush);
     return rewriteStreamChunk(chunk, flush);
   };
   const scanUsage = (chunk: Buffer | string) => {
@@ -294,7 +347,7 @@ export const pipeZenOpenAIResponse = (
     const retryPrepared = retryPrepare(excluded);
     if (retryPrepared.lease?.requiredUnavailable) return false;
     retryStarted = true;
-    pipeZenOpenAIResponse(retryPrepared, stream, res, proxyPool, metrics, retryPrepare, true, responseModel, streamTransform);
+    pipeZenOpenAIResponse(retryPrepared, stream, res, proxyPool, metrics, retryPrepare, true, responseModel, streamTransform, toolMapper, responsesProtocol);
     return true;
   };
   const handleRequestSetupError = (error: unknown): void => {
@@ -356,31 +409,27 @@ export const pipeZenOpenAIResponse = (
         }
 
         scanUsage(firstChunk);
-        if (!stream) {
-          // Buffer all non-stream responses so protocol errors and aliases are
-          // handled from the complete JSON body before headers are sent.
+        if (aggregateUpstream) {
+          // Buffer the upstream stream so protocol errors and aliases are
+          // handled from the complete response before headers are sent.
           nonStreamChunks.push(firstChunk);
           return;
         }
 
         headersSent = true;
-        if (stream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform",
-            Connection: "keep-alive",
-            "X-Accel-Buffering": "no",
-            "Transfer-Encoding": "chunked",
-          });
-        } else {
-          res.writeHead(zenRes.statusCode || 502, { "Content-Type": "application/json" });
-        }
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          "Transfer-Encoding": "chunked",
+        });
         res.write(transformStreamChunk(firstChunk));
         return;
       }
 
       scanUsage(chunk);
-      if (!stream) {
+      if (aggregateUpstream) {
         nonStreamChunks.push(chunk);
         return;
       }
@@ -391,22 +440,19 @@ export const pipeZenOpenAIResponse = (
       if (settled || retryStarted) return;
       settled = true;
       const status = zenRes.statusCode || 502;
-      const nonStreamRaw = !stream ? Buffer.concat(nonStreamChunks).toString() : "";
+      const upstreamBody = aggregateUpstream ? Buffer.concat(nonStreamChunks).toString() : "";
+      // The upstream streams even for non-streaming callers, so fold the SSE
+      // body back into the complete JSON document they expect.
       let nonStreamData: Record<string, unknown> | null = null;
       let protocolError = false;
-      if (!stream) {
-        try {
-          const parsed = JSON.parse(nonStreamRaw);
-          nonStreamData = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
-          protocolError = !nonStreamData || Boolean(nonStreamData.error) || nonStreamData.type === "error";
-          if (nonStreamData) usageAccumulator.observe(nonStreamData);
-        } catch {
-          protocolError = true;
-        }
+      if (aggregateUpstream && status < 400) {
+        nonStreamData = aggregateUpstreamBody(upstreamBody, responsesProtocol ? "responses" : "chat_completions");
+        protocolError = !nonStreamData || Boolean(nonStreamData.error) || nonStreamData.type === "error";
+        if (nonStreamData) usageAccumulator.observe(nonStreamData);
       }
-      const upstreamErrorRaw = status >= 400 ? responseErrorBody : nonStreamRaw;
+      const upstreamErrorRaw = status >= 400 ? responseErrorBody : upstreamBody;
       const rateLimited = status === 429 || upstreamErrorRaw.includes("FreeUsageLimitError") || upstreamErrorRaw.includes("rate_limit_error") || upstreamErrorRaw.toLowerCase().includes("rate limit");
-      if (status >= 400 || (!stream && protocolError)) {
+      if (status >= 400 || (aggregateUpstream && protocolError)) {
         const parsed = (() => {
           try { return JSON.parse(upstreamErrorRaw); } catch { return null; }
         })();
@@ -448,16 +494,20 @@ export const pipeZenOpenAIResponse = (
       }
       metrics?.recordUpstream({ statusCode: status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
 
-      if (!stream) {
-        let body = nonStreamRaw;
-        if (nonStreamData && responseModel) {
-          nonStreamData.model = responseModel;
-          const response = nonStreamData.response;
-          if (response && typeof response === "object" && !Array.isArray(response)) {
-            (response as Record<string, unknown>).model = responseModel;
+      if (aggregateUpstream) {
+        if (nonStreamData) {
+          // Tool names come back in the upstream spelling; restore the caller's.
+          if (toolMapper && responsesProtocol) applyToolFilterToResponsesResponse(nonStreamData, toolMapper);
+          else if (toolMapper) applyToolFilterToChatCompletion(nonStreamData, toolMapper);
+          if (responseModel) {
+            nonStreamData.model = responseModel;
+            const response = nonStreamData.response;
+            if (response && typeof response === "object" && !Array.isArray(response)) {
+              (response as Record<string, unknown>).model = responseModel;
+            }
           }
-          body = JSON.stringify(nonStreamData);
         }
+        const body = nonStreamData ? JSON.stringify(nonStreamData) : upstreamBody;
         if (!res.headersSent) res.writeHead(status, { "Content-Type": "application/json" });
         if (!res.writableEnded) res.end(body);
         return;
@@ -470,7 +520,7 @@ export const pipeZenOpenAIResponse = (
         return;
       }
       if (headersSent) {
-        if (streamTransform || responseModel) res.write(transformStreamChunk("", true));
+        if (streamTransform || responseModel || responsesToolFilter) res.write(transformStreamChunk("", true));
         if (!res.writableEnded) res.end();
       }
     });

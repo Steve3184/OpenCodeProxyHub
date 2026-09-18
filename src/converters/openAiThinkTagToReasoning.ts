@@ -4,6 +4,7 @@ import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator } from "../utils/tokenUsage.js";
+import { DownstreamToolCallFilter, type ToolNameMapper } from "./toolMapping.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -148,6 +149,7 @@ export const pipeOpenAiStreamStrippingThink = (
   metrics?: MetricsStore,
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
   retryAttempt = false,
+  toolMapper?: ToolNameMapper,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -176,9 +178,11 @@ export const pipeOpenAiStreamStrippingThink = (
     const retryPrepared = retryPrepare(excluded);
     if (retryPrepared.lease?.requiredUnavailable) return false;
     retryStarted = true;
-    pipeOpenAiStreamStrippingThink(retryPrepared, _model, res, proxyPool, metrics, retryPrepare, true);
+    pipeOpenAiStreamStrippingThink(retryPrepared, _model, res, proxyPool, metrics, retryPrepare, true, toolMapper);
     return true;
   };
+
+  const toolFilter = toolMapper ? new DownstreamToolCallFilter(toolMapper) : undefined;
 
   const req = https.request(prepared.options, (zenRes) => {
     zenRes.on("data", (chunk: Buffer) => {
@@ -243,7 +247,9 @@ export const pipeOpenAiStreamStrippingThink = (
           usageAccumulator.observe(parsed);
           const content = parsed.choices?.[0]?.delta?.content;
           if (typeof content === "string") observedOutputChars += content.length;
-          writeSse(res, rewriteChunk(parsed, splitter, _model));
+          const rewritten = rewriteChunk(parsed, splitter, _model);
+          if (toolFilter && rewritten && typeof rewritten === "object") toolFilter.applyChunk(rewritten as Record<string, unknown>);
+          writeSse(res, rewritten);
         } catch {
           // Forward unparseable payloads untouched rather than dropping them.
           res.write(`data: ${block.data}\n\n`);
