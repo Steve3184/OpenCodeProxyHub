@@ -78,7 +78,9 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
       // the caller's own preference is tracked separately.
       stream: true,
     };
-    if (input.tools?.length) requestBody.tools = toUpstreamTools(input.tools, mapper, "chat");
+    // Unconditional: the gate demands both declarations even when the client
+    // declared no tools at all, so the placeholders must still be injected.
+    requestBody.tools = toUpstreamTools(input.tools, mapper, "chat");
     if (input.toolChoice) requestBody.tool_choice = toUpstreamToolChoice(input.toolChoice, mapper);
     for (const [key, value] of Object.entries(input.parameters || {})) {
       if (value !== undefined) requestBody[key] = value;

@@ -178,4 +178,19 @@ const bodyOf = (prepared) => JSON.parse(prepared.body);
   console.log("[pass] placeholder tools are marked as uncallable");
 }
 
+// --- 11. a client that declared no tools still satisfies the gate ----------
+{
+  for (const [label, declared] of [["undefined", undefined], ["empty", []]] as const) {
+    const mapper = createToolNameMapper(declared);
+    const prepared = prepareZenRequest(config, {
+      model: "m", stream: false, sessionId: "ses_x", toolMapper: mapper,
+      messages: [{ role: "user", content: "1" }], tools: declared,
+    });
+    const body = bodyOf(prepared);
+    assert.equal(body.stream, true, `${label}: stream must be forced true`);
+    assert.deepEqual(body.tools?.map((t) => t.function.name), ["read", "bash"], `${label}: placeholders must still be declared`);
+    console.log(`[pass] chat body with ${label} tools still declares read+bash`);
+  }
+}
+
 console.log("\nall tool-mapping checks passed");
