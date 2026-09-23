@@ -9,6 +9,7 @@ import { registerModelRoutes } from "./routes/models.js";
 import { registerOpenAIRoutes } from "./routes/openai.js";
 import { registerResponsesRoutes } from "./routes/responses.js";
 import { registerAnthropicRoutes } from "./routes/anthropic.js";
+import { registerSystemoneRoutes } from "./routes/systemone.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 import { registerWebRoutes } from "./routes/web.js";
 import { ModelConfigStore } from "./models/catalog.js";
@@ -98,6 +99,7 @@ export const buildApp = async (config: AppConfig) => {
   await registerOpenAIRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
   await registerResponsesRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
   await registerAnthropicRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
+  await registerSystemoneRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
   await registerWebRoutes(app);
 
   app.setNotFoundHandler(async (_request, reply) => {

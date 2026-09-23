@@ -189,6 +189,7 @@ try {
     zenHost: "example.invalid",
     zenPath: "/v1/chat/completions",
     zenResponsesPath: "/v1/responses",
+    zenSystemonePath: "/v1/systemone",
     upstreamTimeoutMs: 1_000,
     globalRequestsPerMinute: 10,
     apiKeyRequestsPerMinute: 10,

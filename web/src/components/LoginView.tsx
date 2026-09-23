@@ -55,9 +55,6 @@ export function LoginView({ draftToken, setDraftToken, busy, error, onLogin, che
             <p className="text-xs text-muted-foreground">管理控制台登录</p>
           </div>
         </div>
-        <p className="mb-5 text-sm text-muted-foreground">
-          输入已配置的控制台密码。密码只用于本次登录，服务端验证后会签发临时会话令牌；生产环境请通过 HTTPS 访问控制台以保护传输安全。
-        </p>
         <div className="space-y-2">
           <Label htmlFor="login-pw">控制台密码</Label>
           <Input

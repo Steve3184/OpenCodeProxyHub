@@ -21,7 +21,7 @@ export interface ZenRequestInput {
   toolChoice?: unknown;
   parameters?: Record<string, unknown>;
   sessionId: string;
-  protocol?: "chat_completions" | "responses";
+  protocol?: "chat_completions" | "responses" | "systemone";
   responseBody?: Record<string, unknown>;
   /** Maps the client's tool names to the upstream spelling and back. */
   toolMapper: ToolNameMapper;
@@ -42,7 +42,7 @@ export interface ZenStreamTransform {
 const requestInputForTokenEstimate = (body: string): unknown => {
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
-    return parsed.messages ?? parsed.input ?? parsed.instructions ?? "";
+    return parsed.messages ?? parsed.input ?? parsed.instructions ?? parsed.state ?? parsed.questions ?? "";
   } catch {
     return "";
   }
@@ -61,7 +61,9 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
   const protocol = input.protocol || "chat_completions";
   const mapper = input.toolMapper;
   let requestBody: Record<string, unknown>;
-  if (protocol === "responses") {
+  if (protocol === "systemone") {
+    requestBody = { ...(input.responseBody || {}), model: input.model };
+  } else if (protocol === "responses") {
     requestBody = normalizeResponsesRequest({
       ...(input.responseBody || {}),
       model: input.model,
@@ -96,7 +98,9 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
     options: {
       hostname: config.zenHost,
       port: 443,
-      path: protocol === "responses" ? config.zenResponsesPath : config.zenPath,
+      path: protocol === "responses"
+        ? config.zenResponsesPath
+        : protocol === "systemone" ? config.zenSystemonePath : config.zenPath,
       method: "POST",
       headers: {
         "Content-Type": "application/json",

@@ -207,7 +207,20 @@ export const createResponsesAggregator = (): SseAggregator => {
   };
 };
 
-export type UpstreamProtocol = "chat_completions" | "responses";
+export type UpstreamProtocol = "chat_completions" | "responses" | "systemone";
+
+const createSystemoneAggregator = (): SseAggregator => {
+  let latest: JsonObject | null = null;
+  return {
+    observe(payload: unknown): void {
+      const record = asObject(payload);
+      if (record) latest = record;
+    },
+    result(): JsonObject | null {
+      return latest;
+    },
+  };
+};
 
 /**
  * Turns a complete upstream body into the non-streamed response shape for the
@@ -227,7 +240,9 @@ export const aggregateUpstreamBody = (raw: string, protocol: UpstreamProtocol): 
       // Not a complete JSON body: fall through and parse it as SSE.
     }
   }
-  const aggregator = protocol === "responses" ? createResponsesAggregator() : createChatCompletionAggregator();
+  const aggregator = protocol === "responses"
+    ? createResponsesAggregator()
+    : protocol === "systemone" ? createSystemoneAggregator() : createChatCompletionAggregator();
   for (const payload of parseSsePayloads(trimmed)) aggregator.observe(payload);
   return aggregator.result();
 };

@@ -8,7 +8,8 @@ interface AdminSession {
 export class AdminSessionStore {
   private readonly sessions = new Map<string, AdminSession>();
 
-  constructor(private readonly ttlMs = 30 * 60 * 1000) {}
+  // Sessions are in-memory and are invalidated whenever the server restarts.
+  constructor(private readonly ttlMs = 7 * 24 * 60 * 60 * 1000) {}
 
   create(): string {
     this.removeExpired();

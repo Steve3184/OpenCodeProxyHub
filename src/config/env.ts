@@ -37,6 +37,7 @@ export interface AppConfig {
   zenHost: string;
   zenPath: string;
   zenResponsesPath: string;
+  zenSystemonePath: string;
   upstreamTimeoutMs: number;
   globalRequestsPerMinute: number;
   apiKeyRequestsPerMinute: number;
@@ -69,6 +70,7 @@ export const loadConfig = (): AppConfig => {
     zenHost: process.env.ZEN_HOST || "opencode.ai",
     zenPath,
     zenResponsesPath: process.env.ZEN_RESPONSES_PATH || responsesPathFromChatPath(zenPath),
+    zenSystemonePath: process.env.ZEN_SYSTEMONE_PATH || "/zen/v1/systemone",
     upstreamTimeoutMs: intFromEnv("UPSTREAM_TIMEOUT_MS", 120000),
     globalRequestsPerMinute: intFromEnv("GLOBAL_REQUESTS_PER_MINUTE", 120),
     apiKeyRequestsPerMinute: intFromEnv("API_KEY_REQUESTS_PER_MINUTE", 60),

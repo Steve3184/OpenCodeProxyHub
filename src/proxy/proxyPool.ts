@@ -94,7 +94,7 @@ interface RecoveryProbeState {
 const DEFAULT_MODEL_TEST_OPTIONS: ProxyModelTestOptions = {
   hostname: "opencode.ai",
   path: "/zen/v1/chat/completions",
-  model: "deepseek-v4-flash-free",
+  model: "big-pickle",
   timeoutMs: 10000,
   protocol: "chat_completions",
 };

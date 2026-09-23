@@ -6,7 +6,7 @@ const checks = [
     name: "OpenAI invalid auth shape",
     path: "/v1/chat/completions",
     body: {
-      model: "deepseek-v4-flash-free",
+      model: "big-pickle",
       messages: [{ role: "user", content: "ping" }],
       temperature: 0.2,
       top_p: 0.9,
@@ -21,7 +21,7 @@ const checks = [
     name: "Anthropic invalid auth shape",
     path: "/v1/messages",
     body: {
-      model: "deepseek-v4-flash-free",
+      model: "big-pickle",
       max_tokens: 8,
       temperature: 0.2,
       top_p: 0.9,
@@ -35,9 +35,20 @@ const checks = [
     name: "Responses invalid auth shape",
     path: "/v1/responses",
     body: {
-      model: "deepseek-v4-flash-free",
+      model: "big-pickle",
       input: "ping",
       max_output_tokens: 8,
+    },
+    expectStatus: 401,
+    expectJson: (data) => Boolean(data?.error?.message),
+  },
+  {
+    name: "System One invalid auth shape",
+    path: "/v1/systemone",
+    body: {
+      model: "jev-1.13-free",
+      state: "ping",
+      questions: { answer: { type: "noul", instructions: "Is this a test?" } },
     },
     expectStatus: 401,
     expectJson: (data) => Boolean(data?.error?.message),

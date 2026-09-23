@@ -6,17 +6,17 @@ const requestBodies = [
   {
     name: "openai-invalid-auth",
     path: "/v1/chat/completions",
-    body: { model: "deepseek-v4-flash-free", messages: [{ role: "user", content: "ping" }], max_tokens: 4 },
+    body: { model: "big-pickle", messages: [{ role: "user", content: "ping" }], max_tokens: 4 },
   },
   {
     name: "anthropic-invalid-auth",
     path: "/v1/messages",
-    body: { model: "deepseek-v4-flash-free", max_tokens: 4, messages: [{ role: "user", content: "ping" }] },
+    body: { model: "big-pickle", max_tokens: 4, messages: [{ role: "user", content: "ping" }] },
   },
   {
     name: "responses-invalid-auth",
     path: "/v1/responses",
-    body: { model: "deepseek-v4-flash-free", input: "ping", max_output_tokens: 4 },
+    body: { model: "big-pickle", input: "ping", max_output_tokens: 4 },
   },
 ];
 

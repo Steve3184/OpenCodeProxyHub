@@ -25,21 +25,21 @@ OpenCodeProxyHub 基于 MIT 许可证开源，派生并大量借鉴自 [`opencod
 
 ## 可用免费模型
 
-OpenCodeProxyHub 默认内置以下免费模型，均可通过 OpenAI 兼容接口 `/v1/chat/completions`、`/v1/responses` 与 Anthropic 兼容接口 `/v1/messages` 调用：
+OpenCodeProxyHub 默认内置以下免费模型；其中 Jev 可通过 TypeSafe System One 兼容接口 `/v1/systemone` 调用，其余模型可通过 OpenAI/Anthropic 兼容接口调用：
 
 | 模型 ID | 说明 |
 |--------|------|
-| `deepseek-v4-flash-free` | DeepSeek 免费模型 |
 | `big-pickle` | OpenCode 免费模型 |
 | `nemotron-3-ultra-free` | Nvidia Nemotron 3 Ultra 免费模型 |
 | `nemotron-3.5-lightning-free` | Nvidia Nemotron 3.5 Lightning 免费模型 |
 | `mimo-v2.5-free` | Mimo v2.5 免费模型 |
-| `hy3-free` | Hy3 免费模型 |
-| `laguna-s-2.1-free` | Laguna S 2.1 免费模型 |
+| `ling-3.0-flash-fin-free` | Ling 3.0 Flash Fin 免费模型 |
+| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 Contributor 免费模型 |
+| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 Contributor 免费模型 |
+| `mimo-v2.6-flash-free` | Mimo v2.6 Flash 免费模型 |
+| `jev-1.13-free` | Jev 1.13 免费模型（System One） |
 
-> **上下文说明**：`deepseek-v4-flash-free` 实测支持约 **1M token** 上下文（models.dev 标注的 200K 仅为推荐值，Zen 服务端未按其硬截断），适合长上下文/长文档任务。
-
-新部署会自动生成以上默认模型；已有部署升级后，缺失的默认免费模型会自动追加到已有 `models.json`，不会覆盖用户已修改的模型配置。已下线的模型（如 `north-mini-code-free`、`ling-3.0-flash-free`、`longcat-2.0-free`）会在升级时自动禁用并标记下线原因，用户无需手动清理。重新上线的模型（如 `hy3-free`）升级后会自动重新启用；仅恢复此前被自动禁用的条目，用户手动关闭的不受影响。
+新部署会自动生成以上默认模型；已有部署升级后，缺失的默认免费模型会自动追加到已有 `models.json`，不会覆盖用户已修改的模型配置。已下线的模型（如 `deepseek-v4-flash-free`、`hy3-free`、`laguna-s-2.1-free`）会在升级时自动禁用并标记下线原因，用户无需手动清理。
 
 ## 部署方式
 
@@ -124,11 +124,12 @@ npm start            # 运行已构建的 dist/main.js
 
 ## 功能总览
 
-- **三种协议入口**
+- **四种协议入口**
   - OpenAI 兼容：`POST /v1/chat/completions`、`GET /v1/models`
   - OpenAI Responses：`POST /v1/responses`
+  - TypeSafe System One：`POST /v1/systemone`
   - Anthropic 兼容：`POST /v1/messages`
-  - 同时支持流式（SSE）与非流式
+  - OpenAI/Anthropic 聊天协议同时支持流式（SSE）与非流式
 - **按模型选择上游协议**
   - 控制台可为单个模型开启“使用 Responses 上游”；开启后 Chat Completions 与 Anthropic 请求会自动转换为上游 `/responses` 请求，并把结果还原为调用方协议
   - `/v1/responses` 对未开启的模型自动转换为上游 Chat Completions；对已开启模型原生透传到 Responses 上游
@@ -256,7 +257,7 @@ curl -N http://127.0.0.1:6446/v1/chat/completions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "hy3-free",
+    "model": "big-pickle",
     "stream": true,
     "messages": [{"role": "user", "content": "用一句话介绍你自己"}]
   }'
@@ -269,7 +270,7 @@ curl http://127.0.0.1:6446/v1/messages \
   -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-flash-free",
+    "model": "big-pickle",
     "max_tokens": 256,
     "messages": [{"role": "user", "content": "Hello"}]
   }'
@@ -282,8 +283,23 @@ curl http://127.0.0.1:6446/v1/responses \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "hy3-free",
+    "model": "big-pickle",
     "input": "用一句话介绍你自己"
+  }'
+```
+
+TypeSafe System One（支持模型别名）：
+
+```bash
+curl http://127.0.0.1:6446/v1/systemone \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jev-1.13-free",
+    "state": "Help! My payouts have been failing for 3 days.",
+    "questions": {
+      "is_urgent": {"type": "noul", "instructions": "Does this convey urgency?"}
+    }
   }'
 ```
 
@@ -318,6 +334,7 @@ ADMIN_PASSWORD=admin                    # 管理接口/控制台密码（务必�
 ZEN_HOST=opencode.ai                    # 上游主机
 ZEN_PATH=/zen/v1/chat/completions       # Chat Completions 上游路径
 ZEN_RESPONSES_PATH=/zen/v1/responses    # Responses 上游路径；默认由 ZEN_PATH 推导
+ZEN_SYSTEMONE_PATH=/zen/v1/systemone    # TypeSafe System One 上游路径
 UPSTREAM_TIMEOUT_MS=120000              # 上游超时
 GLOBAL_REQUESTS_PER_MINUTE=120          # 全局每分钟请求上限
 API_KEY_REQUESTS_PER_MINUTE=60          # 单 Key 每分钟请求上限
@@ -331,7 +348,7 @@ PROXY_MODE=optional                     # 代理使用模式：direct / optional
 OUTBOUND_PRE_PROXY_ENABLED=false        # 是否启用链式前置代理
 OUTBOUND_PRE_PROXY_URL=                 # 前置代理地址（http/https）
 REQUIRE_PROXY=false                     # 兼容旧配置；未设置 PROXY_MODE 时 true 等价于 required
-PROXY_HEALTH_CHECK_MODEL=deepseek-v4-flash-free # 429/异常自动恢复探测使用的模型
+PROXY_HEALTH_CHECK_MODEL=big-pickle        # 429/异常自动恢复探测使用的模型
 PROXY_HEALTH_CHECK_TIMEOUT_MS=10000     # 单次恢复探测超时（毫秒）
 PROXY_RECOVERY_INTERVAL_MS=600000       # 429/异常自动恢复探测间隔（默认 10 分钟）
 ```
@@ -403,13 +420,13 @@ curl -X POST http://127.0.0.1:6446/admin/api-keys \
 curl -X PATCH http://127.0.0.1:6446/admin/settings \
   -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"reasoningTagModels":["deepseek-v4-flash-free"]}'
+  -d '{"reasoningTagModels":["big-pickle"]}'
 ```
 
 按模型使用 Responses 上游：
 
 ```bash
-curl -X PUT http://127.0.0.1:6446/admin/models/hy3-free \
+curl -X PUT http://127.0.0.1:6446/admin/models/big-pickle \
   -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"useResponses":true}'
