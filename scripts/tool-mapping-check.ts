@@ -1,9 +1,45 @@
 import assert from "node:assert/strict";
-import { prepareZenRequest } from "../src/providers/zenClient.ts";
+import { EventEmitter } from "node:events";
+import https from "node:https";
+import { prepareZenRequest, pipeZenOpenAIResponse } from "../src/providers/zenClient.ts";
 import { createToolNameMapper, toUpstreamTools } from "../src/converters/toolMapping.ts";
 import { aggregateUpstreamBody } from "../src/converters/streamAggregator.ts";
 import { createResponsesToOpenAIStreamTransformer, createOpenAIToResponsesStreamTransformer, openAIChatResponseToResponses, responsesToOpenAIChatResponse, openAIChatToResponsesRequest, responsesToOpenAIChatRequest } from "../src/converters/openAiResponses.ts";
-import { openAIToAnthropic } from "../src/converters/anthropic.ts";
+import { openAIToAnthropic, pipeZenAsAnthropic } from "../src/converters/anthropic.ts";
+
+/** Runs `fn` against a fake upstream that emits `sse`, capturing the downstream writes. */
+const withFakeUpstream = async (sse: string, fn: (res: any) => void): Promise<string> => {
+  const originalRequest = https.request;
+  (https as any).request = function (_options: any, cb: any) {
+    const req = new EventEmitter() as any;
+    req.write = () => true;
+    req.end = () => {
+      const upstream: any = new EventEmitter();
+      upstream.statusCode = 200;
+      upstream.resume = () => {};
+      setTimeout(() => {
+        cb(upstream);
+        upstream.emit("data", Buffer.from(sse));
+        upstream.emit("end");
+      }, 0);
+    };
+    req.destroy = () => {};
+    return req;
+  };
+  const written: string[] = [];
+  const res: any = new EventEmitter();
+  res.writeHead = () => {};
+  res.headersSent = false;
+  res.write = (value: string) => { written.push(value.toString()); return true; };
+  res.end = () => {};
+  try {
+    fn(res);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    (https as any).request = originalRequest;
+  }
+  return written.join("");
+};
 
 const config = { zenHost: "example.invalid", zenPath: "/zen/v1/chat/completions", zenResponsesPath: "/zen/v1/responses", upstreamTimeoutMs: 1000 };
 
@@ -191,6 +227,70 @@ const bodyOf = (prepared) => JSON.parse(prepared.body);
     assert.deepEqual(body.tools?.map((t) => t.function.name), ["read", "bash"], `${label}: placeholders must still be declared`);
     console.log(`[pass] chat body with ${label} tools still declares read+bash`);
   }
+}
+
+// --- 12. openai streaming passthrough reverse maps and drops placeholders ---
+{
+  const declared = createToolNameMapper([
+    { type: "function", function: { name: "Bash", parameters: {} } },
+    { type: "function", function: { name: "Read", parameters: {} } },
+  ]);
+  const sse = [
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"bash","arguments":"{\\"command\\":\\"ls\\"}"}}]}}]}',
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","type":"function","function":{"name":"read","arguments":"{}"}}]}}]}',
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const out = await withFakeUpstream(sse, (res) => {
+    pipeZenOpenAIResponse({ body: "{}", options: {} } as any, true, res, undefined, undefined, undefined, false, "alias", undefined, declared);
+  });
+  assert.ok(out.includes('"name":"Bash"'), `openai stream should map bash->Bash, got ${out}`);
+  assert.ok(out.includes('"name":"Read"'), `openai stream should map read->Read, got ${out}`);
+  console.log("[pass] openai streaming passthrough reverse maps tool names");
+}
+
+// --- 13. anthropic streaming maps names that arrive after the id ----------
+{
+  const declared = createToolNameMapper([
+    { type: "function", function: { name: "Bash", parameters: {} } },
+    { type: "function", function: { name: "Read", parameters: {} } },
+  ]);
+  // First chunk carries id + empty arguments, the name arrives in the next.
+  const sse = [
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":""}}]}}]}',
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"bash"}}]}}]}',
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"command\\":\\"ls\\"}"}}]}}]}',
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const out = await withFakeUpstream(sse, (res) => {
+    pipeZenAsAnthropic({ body: "{}", options: {} } as any, "alias", res, 10, undefined, undefined, undefined, false, declared);
+  });
+  assert.ok(out.includes('"name":"Bash"'), `anthropic stream should map bash->Bash, got ${out}`);
+  assert.ok(out.includes('"id":"call_1"'), `anthropic stream should keep the tool id, got ${out}`);
+  assert.ok(out.includes('{\\"command\\":\\"ls\\"}'), `anthropic stream should emit arguments, got ${out}`);
+  assert.ok(out.includes('"stop_reason":"tool_use"'), "anthropic stream should report tool_use");
+  console.log("[pass] anthropic streaming maps names arriving after the id");
+}
+
+// --- 14. anthropic streaming drops undeclared placeholder calls ------------
+{
+  const declared = createToolNameMapper([{ type: "function", function: { name: "Bash", parameters: {} } }]);
+  const sse = [
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]}}]}',
+    'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const out = await withFakeUpstream(sse, (res) => {
+    pipeZenAsAnthropic({ body: "{}", options: {} } as any, "alias", res, 10, undefined, undefined, undefined, false, declared);
+  });
+  assert.ok(!out.includes('"name":"read"'), `placeholder read must be dropped, got ${out}`);
+  assert.ok(!out.includes('"name":"Read"'), `placeholder read must be dropped, got ${out}`);
+  assert.ok(out.includes('"stop_reason":"end_turn"'), `dropped-only turn should end normally, got ${out}`);
+  console.log("[pass] anthropic streaming drops undeclared placeholder calls");
 }
 
 console.log("\nall tool-mapping checks passed");

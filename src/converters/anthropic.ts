@@ -188,8 +188,6 @@ export const pipeZenAsAnthropic = (
     let headersSent = false;
     let buffer = "";
     let outputTokens = 0;
-    let contentIdx = 0;
-    let toolIdx = -1;
     let firstChunkHandled = false;
     const usageAccumulator = createTokenUsageAccumulator();
     let rateLimitBody = "";
@@ -209,13 +207,36 @@ export const pipeZenAsAnthropic = (
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
-    // A placeholder tool call (upstream `read`/`bash` the client never declared)
-    // has to be dropped, including its later argument fragments.
-    let droppedBlockIndex = -1;
-    const isDropped = (blockIndex: number): boolean => blockIndex !== -1 && blockIndex === droppedBlockIndex;
+    // Upstream tool names (`bash`) must come back in the client's spelling
+    // (`Bash`), and placeholder calls the client never declared must be dropped.
+    // A call's name may arrive in a later chunk than its id, so state is tracked
+    // per tool index and the block only opens once the name is known; arguments
+    // seen before then are buffered and flushed when the block opens.
+    let nextBlockIndex = 0;
+    let textBlockIndex = -1;
+    let sawToolBlock = false;
+    interface ToolState { blockIndex: number; opened: boolean; dropped: boolean; id?: string; pendingArgs: string; }
+    const toolStates = new Map<number, ToolState>();
     const mapToolName = (name: unknown): string | undefined => (
       toolMapper ? toolMapper.toDownstream(name) : (typeof name === "string" ? name : undefined)
     );
+    const emitToolArgs = (state: ToolState, args: string): void => {
+      if (!args) return;
+      sendSSE("content_block_delta", { type: "content_block_delta", index: state.blockIndex, delta: { type: "input_json_delta", partial_json: args } });
+      outputTokens += Math.ceil(args.length / 4);
+    };
+    const openToolBlock = (state: ToolState, id: unknown, name: string): void => {
+      state.blockIndex = nextBlockIndex;
+      nextBlockIndex += 1;
+      state.opened = true;
+      sawToolBlock = true;
+      sendSSE("content_block_start", { type: "content_block_start", index: state.blockIndex, content_block: { type: "tool_use", id: typeof id === "string" && id ? id : ocId("toolu"), name } });
+      if (state.pendingArgs) {
+        const pending = state.pendingArgs;
+        state.pendingArgs = "";
+        emitToolArgs(state, pending);
+      }
+    };
 
     const sendHeaders = () => {
       if (headersSent) return;
@@ -304,48 +325,60 @@ export const pipeZenAsAnthropic = (
         sendHeaders();
 
         if (delta.content) {
-          if (contentIdx === 0 && toolIdx === -1) {
-            sendSSE("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-            contentIdx = 1;
+          if (textBlockIndex === -1) {
+            textBlockIndex = nextBlockIndex;
+            nextBlockIndex += 1;
+            sendSSE("content_block_start", { type: "content_block_start", index: textBlockIndex, content_block: { type: "text", text: "" } });
           }
-          sendSSE("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta.content } });
+          sendSSE("content_block_delta", { type: "content_block_delta", index: textBlockIndex, delta: { type: "text_delta", text: delta.content } });
           outputTokens += Math.ceil(delta.content.length / 4);
         }
 
         if (delta.tool_calls) {
           for (const toolCall of delta.tool_calls) {
             const idx = toolCall.index ?? 0;
-            if (isDropped(idx)) continue;
-            if (idx > toolIdx) {
-              const mappedName = mapToolName(toolCall.function?.name);
-              if (mappedName === undefined) {
-                // Placeholder call the client never declared: drop the block.
-                if (toolIdx === -1 && contentIdx > 0) sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
-                droppedBlockIndex = idx;
-                toolIdx = idx;
+            let state = toolStates.get(idx);
+            if (!state) {
+              state = { blockIndex: -1, opened: false, dropped: false, pendingArgs: "" };
+              toolStates.set(idx, state);
+            }
+            if (state.dropped) continue;
+            if (!state.opened) {
+              if (typeof toolCall.id === "string" && toolCall.id) state.id = toolCall.id;
+              const rawName = toolCall.function?.name;
+              // The name may not have arrived yet; wait for it before deciding.
+              if (typeof rawName !== "string") {
+                if (toolCall.function?.arguments) state.pendingArgs += toolCall.function.arguments;
                 continue;
               }
-              if (toolIdx === -1 && contentIdx > 0) sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
-              toolIdx = idx;
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: toolCall.id || ocId("toolu"), name: mappedName } });
+              const mappedName = mapToolName(rawName);
+              if (mappedName === undefined) {
+                // Placeholder call the client never declared: drop the block.
+                state.dropped = true;
+                state.pendingArgs = "";
+                continue;
+              }
+              if (textBlockIndex !== -1) {
+                sendSSE("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+                textBlockIndex = -1;
+              }
+              openToolBlock(state, state.id, mappedName);
             }
-            if (toolCall.function?.arguments) {
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: toolCall.function.arguments } });
-              outputTokens += Math.ceil(toolCall.function.arguments.length / 4);
-            }
+            if (toolCall.function?.arguments) emitToolArgs(state, toolCall.function.arguments);
           }
         }
 
         if (choice.finish_reason) {
-          const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-          for (let i = 0; i < totalBlocks; i += 1) {
-            if (isDropped(i)) continue;
-            sendSSE("content_block_stop", { type: "content_block_stop", index: i });
+          const openBlocks = [...toolStates.values()]
+            .filter((state) => state.opened && !state.dropped)
+            .map((state) => state.blockIndex)
+            .sort((a, b) => a - b);
+          if (textBlockIndex !== -1) openBlocks.push(textBlockIndex);
+          for (const blockIndex of openBlocks.sort((a, b) => a - b)) {
+            sendSSE("content_block_stop", { type: "content_block_stop", index: blockIndex });
           }
           let stopReason = "end_turn";
-          if (choice.finish_reason === "tool_calls" && droppedBlockIndex === -1) stopReason = "tool_use";
+          if (choice.finish_reason === "tool_calls" && sawToolBlock) stopReason = "tool_use";
           else if (choice.finish_reason === "length") stopReason = "max_tokens";
           sendSSE("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } });
           sendSSE("message_stop", { type: "message_stop" });

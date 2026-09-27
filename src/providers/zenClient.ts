@@ -264,7 +264,7 @@ export const pipeZenOpenAIResponse = (
     },
   );
   const rewriteStreamChunk = (chunk: Buffer | string, flush = false): Buffer => {
-    if (!responseModel || !stream) return Buffer.from(chunk);
+    if (!stream || (!responseModel && !toolCallFilter)) return Buffer.from(chunk);
     responseRewriteBuffer += chunk.toString();
     const lines = responseRewriteBuffer.split(/\n/);
     const remainder = lines.pop() || "";
@@ -276,11 +276,16 @@ export const pipeZenOpenAIResponse = (
       try {
         const parsed = JSON.parse(match[2]) as Record<string, unknown>;
         if (typeof parsed === "object" && parsed !== null) {
-          parsed.model = responseModel;
-          const response = parsed.response;
-          if (response && typeof response === "object" && !Array.isArray(response)) {
-            (response as Record<string, unknown>).model = responseModel;
+          if (responseModel) {
+            parsed.model = responseModel;
+            const response = parsed.response;
+            if (response && typeof response === "object" && !Array.isArray(response)) {
+              (response as Record<string, unknown>).model = responseModel;
+            }
           }
+          // The upstream reply carries the upstream spelling (`bash`); restore
+          // the caller's own spelling (`Bash`) and drop placeholder calls.
+          if (toolCallFilter) toolCallFilter.applyChunk(parsed);
         }
         return `${match[1]}${JSON.stringify(parsed)}${match[3] || ""}`;
       } catch {
