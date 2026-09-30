@@ -13,6 +13,18 @@ export const DEFAULT_MODELS = [
 ] as const;
 
 /**
+ * Models that upstream only serves through the TypeSafe System One endpoint.
+ * Their `/zen/v1/chat/completions` and `/zen/v1/responses` requests are
+ * rejected with an opaque upstream error, so calls on the Chat/Responses/
+ * Anthropic downstreams are refused locally with a clear message pointing
+ * at `/v1/systemone`. Matching is exact per model id so other models are
+ * never affected.
+ */
+export const SYSTEMONE_ONLY_MODELS: ReadonlySet<string> = new Set([
+  "jev-1.13-free",
+]);
+
+/**
  * Models that have been retired by upstream and should be auto-disabled on
  * startup so existing deployments don't encounter 401 errors after upgrade.
  */
@@ -43,6 +55,8 @@ export interface ModelConfig {
   displayName?: string;
   /** Route this model to the upstream OpenAI Responses endpoint. */
   useResponses?: boolean;
+  /** Derived (never persisted): this id only exists on the upstream System One endpoint. */
+  systemOneOnly?: boolean;
 }
 
 interface ModelConfigFile {
@@ -73,7 +87,7 @@ export class ModelConfigStore {
   }
 
   list(): ModelConfig[] {
-    return this.models.map((model) => ({ ...model }));
+    return this.models.map((model) => ({ ...model, systemOneOnly: SYSTEMONE_ONLY_MODELS.has(model.id) }));
   }
 
   listEnabled(): ModelConfig[] {
@@ -86,6 +100,22 @@ export class ModelConfigStore {
 
   usesResponses(modelId: string): boolean {
     return this.models.some((model) => model.id === modelId && model.useResponses === true);
+  }
+
+  /**
+   * True when the upstream id must only be called through the System One
+   * endpoint. Takes the resolved (upstream) id because aliases may remap.
+   */
+  isSystemOneOnly(modelId: string): boolean {
+    return SYSTEMONE_ONLY_MODELS.has(modelId);
+  }
+
+  /**
+   * Message used when a systemone-only model is requested on a chat-shaped
+   * downstream. Mentions the local route so callers know where to go.
+   */
+  static systemOneOnlyMessage(downstreamModelId: string): string {
+    return `Model ${downstreamModelId} is only available through the TypeSafe System One interface (POST /v1/systemone with state/questions); it does not accept Chat Completions, Responses or Anthropic requests.`;
   }
 
   enabledIds(): string[] {

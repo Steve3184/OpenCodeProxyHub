@@ -31,6 +31,7 @@ export interface ModelItem {
   created: number;
   displayName?: string;
   useResponses?: boolean;
+  systemOneOnly?: boolean;
 }
 
 export interface ModelAlias {

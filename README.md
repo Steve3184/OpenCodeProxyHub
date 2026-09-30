@@ -37,7 +37,7 @@ OpenCodeProxyHub 默认内置以下免费模型；其中 Jev 可通过 TypeSafe 
 | `muse-spark-1.2-contributor-free` | Muse Spark 1.2 Contributor 免费模型 |
 | `muse-spark-1.3-contributor-free` | Muse Spark 1.3 Contributor 免费模型 |
 | `mimo-v2.6-flash-free` | Mimo v2.6 Flash 免费模型 |
-| `jev-1.13-free` | Jev 1.13 免费模型（System One） |
+| `jev-1.13-free` | Jev 1.13 免费模型（**仅 System One，不支持聊天/Responses/Anthropic 协议**） |
 
 新部署会自动生成以上默认模型；已有部署升级后，缺失的默认免费模型会自动追加到已有 `models.json`，不会覆盖用户已修改的模型配置。已下线的模型（如 `deepseek-v4-flash-free`、`hy3-free`、`laguna-s-2.1-free`）会在升级时自动禁用并标记下线原因，用户无需手动清理。
 

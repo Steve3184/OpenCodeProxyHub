@@ -1,7 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import type { ApiKeyStore } from "../auth/apiKeys.js";
 import type { AppConfig } from "../config/env.js";
-import type { ModelConfigStore } from "../models/catalog.js";
+import type { ModelConfigStore as ModelConfigStoreType } from "../models/catalog.js";
+import { ModelConfigStore } from "../models/catalog.js";
 import type { ModelAliasStore } from "../models/aliases.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { pipeZenOpenAIResponse, prepareZenRequest, requestZenFull } from "../providers/zenClient.js";
@@ -33,7 +34,7 @@ export const registerResponsesRoutes = async (
   app: FastifyInstance,
   config: AppConfig,
   keyStore: ApiKeyStore,
-  modelStore: ModelConfigStore,
+  modelStore: ModelConfigStoreType,
   modelAliasStore: ModelAliasStore,
   settingsStore: SettingsStore,
   sessions: SessionStore,
@@ -89,6 +90,13 @@ export const registerResponsesRoutes = async (
     if (!modelAliasStore.find(model) && !modelStore.isEnabled(upstreamModel)) {
       release();
       return reply.code(400).send({ error: { message: `Unknown or disabled model: ${model}. Available: ${modelStore.enabledIds().join(", ")}` } });
+    }
+    // TypeSafe System One models (jev) reject OpenAI-shaped upstream requests
+    // with an opaque convert_request_failed error, so refuse locally with a
+    // message that points at POST /v1/systemone instead.
+    if (modelStore.isSystemOneOnly(upstreamModel)) {
+      release();
+      return reply.code(400).send({ error: { message: ModelConfigStore.systemOneOnlyMessage(model), type: "invalid_request_error" } });
     }
     if (!keyStore.isModelAllowed(auth.id, model)) {
       release();

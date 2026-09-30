@@ -274,11 +274,12 @@ export const registerAdminRoutes = async (
       const healthCheckModel = modelStore.isEnabled(config.proxyHealthCheckModel)
         ? config.proxyHealthCheckModel
         : modelStore.enabledIds()[0] || config.proxyHealthCheckModel;
-      const useResponses = modelStore.usesResponses(healthCheckModel);
+      const systemOneOnly = modelStore.isSystemOneOnly(healthCheckModel);
+      const useResponses = !systemOneOnly && modelStore.usesResponses(healthCheckModel);
       const proxy = await proxyPool.test(request.params.id, {
         hostname: config.zenHost,
-        path: useResponses ? config.zenResponsesPath : config.zenPath,
-        protocol: useResponses ? "responses" : "chat_completions",
+        path: systemOneOnly ? config.zenSystemonePath : useResponses ? config.zenResponsesPath : config.zenPath,
+        protocol: systemOneOnly ? "systemone" : useResponses ? "responses" : "chat_completions",
         model: healthCheckModel,
         timeoutMs: config.proxyHealthCheckTimeoutMs,
       });

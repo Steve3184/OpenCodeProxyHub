@@ -47,14 +47,19 @@ export function ModelsView({ data }: { data: ConsoleData }) {
           const transformEnabled = Boolean(settings?.openAiStreamTransformModels?.includes(model.id));
           const reasoningEnabled = Boolean(settings?.reasoningTagModels?.includes(model.id));
           const responsesEnabled = Boolean(model.useResponses);
+          // System One 模型（如 jev）只走 /v1/systemone，聊天协议用不了。
+          const systemOneOnly = Boolean(model.systemOneOnly);
           return (
             <motion.div key={model.id} variants={fadeUp}>
               <Card className={cn("h-full p-4", !model.enabled && "opacity-60")}>
                 <div className="flex items-start justify-between gap-2">
                   <code className="break-all text-sm font-semibold">{model.id}</code>
-                  <Badge variant={model.enabled ? "success" : "muted"} className="shrink-0">
-                    {model.enabled ? "启用" : "禁用"}
-                  </Badge>
+                  <div className="flex shrink-0 gap-1.5">
+                    {systemOneOnly && <Badge variant="muted">System One</Badge>}
+                    <Badge variant={model.enabled ? "success" : "muted"}>
+                      {model.enabled ? "启用" : "禁用"}
+                    </Badge>
+                  </div>
                 </div>
                 <div className="mt-2 flex gap-3 text-xs text-muted-foreground">
                   <span>{model.ownedBy}</span>
@@ -64,9 +69,9 @@ export function ModelsView({ data }: { data: ConsoleData }) {
                 <div className="mt-4 space-y-2">
                   <SettingRow
                     title="使用 Responses 上游"
-                    desc={responsesEnabled ? "全部协议自动转换并连接 /responses" : "连接上游 Chat Completions"}
+                    desc={systemOneOnly ? "仅支持 System One 上游（/v1/systemone）" : responsesEnabled ? "全部协议自动转换并连接 /responses" : "连接上游 Chat Completions"}
                     checked={responsesEnabled}
-                    disabled={busy}
+                    disabled={busy || systemOneOnly}
                     onToggle={() => toggleUseResponses(model)}
                   />
                   <SettingRow

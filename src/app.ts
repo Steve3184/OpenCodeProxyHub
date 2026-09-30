@@ -56,11 +56,12 @@ export const buildApp = async (config: AppConfig) => {
     : modelStore.enabledIds()[0] || config.proxyHealthCheckModel;
   const proxyHealthCheckOptions = () => {
     const model = proxyHealthCheckModel();
-    const useResponses = modelStore.usesResponses(model);
+    const systemOneOnly = modelStore.isSystemOneOnly(model);
+    const useResponses = !systemOneOnly && modelStore.usesResponses(model);
     return {
       hostname: config.zenHost,
-      path: useResponses ? config.zenResponsesPath : config.zenPath,
-      protocol: useResponses ? "responses" as const : "chat_completions" as const,
+      path: systemOneOnly ? config.zenSystemonePath : useResponses ? config.zenResponsesPath : config.zenPath,
+      protocol: systemOneOnly ? "systemone" as const : useResponses ? "responses" as const : "chat_completions" as const,
       model,
       timeoutMs: config.proxyHealthCheckTimeoutMs,
       recoveryIntervalMs: config.proxyRecoveryIntervalMs,

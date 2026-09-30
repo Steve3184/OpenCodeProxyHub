@@ -16,7 +16,8 @@
     "smoke:load": "node scripts/load-smoke.mjs",
     "check:stability": "node scripts/stability-check.mjs",
     "check:responses": "tsx scripts/responses-conversion-check.ts",
-    "check:tools": "tsx scripts/tool-mapping-check.ts"
+    "check:tools": "tsx scripts/tool-mapping-check.ts",
+    "check:systemone": "tsx scripts/systemone-routing-check.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

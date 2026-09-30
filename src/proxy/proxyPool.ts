@@ -73,7 +73,8 @@ export interface ProxyModelTestOptions {
   model: string;
   timeoutMs: number;
   recoveryIntervalMs?: number;
-  protocol?: "chat_completions" | "responses";
+  /** System One models (jev) reject OpenAI-shaped bodies, so they probe here with a state/questions request. */
+  protocol?: "chat_completions" | "responses" | "systemone";
 }
 
 export interface ProxyRecoverySummary {
@@ -523,22 +524,30 @@ export class ProxyPoolStore {
   }
 
   private requestModelHealthCheck(node: ProxyNode, options: ProxyModelTestOptions): Promise<number> {
-    const usesResponses = options.protocol === "responses";
+    const protocol = options.protocol === "responses" ? "responses" : options.protocol === "systemone" ? "systemone" : "chat_completions";
     // The upstream gate requires `stream: true` plus the `read`/`bash` tool
     // declarations, so the health check has to look like a real request.
     const tools = [
       { type: "function", name: "read", description: "Placeholder", parameters: { type: "object", properties: {} } },
       { type: "function", name: "bash", description: "Placeholder", parameters: { type: "object", properties: {} } },
     ];
-    const body = JSON.stringify(usesResponses
-      ? { model: options.model, input: "ping", stream: true, max_output_tokens: 16, tools }
-      : {
+    const body = JSON.stringify(protocol === "systemone"
+      // System One never streams: a plain non-streamed state/questions body that
+      // expects a JSON document with an `answers` map back.
+      ? {
         model: options.model,
-        messages: [{ role: "user", content: "ping" }],
-        stream: true,
-        max_tokens: 1,
-        tools: tools.map(({ type, name, description, parameters }) => ({ type, function: { name, description, parameters } })),
-      });
+        state: "ping",
+        questions: { ok: { type: "choice", instructions: "Reply with exactly: OK", criteria: { ok: "The answer is OK" } } },
+      }
+      : protocol === "responses"
+        ? { model: options.model, input: "ping", stream: true, max_output_tokens: 16, tools }
+        : {
+          model: options.model,
+          messages: [{ role: "user", content: "ping" }],
+          stream: true,
+          max_tokens: 1,
+          tools: tools.map(({ type, name, description, parameters }) => ({ type, function: { name, description, parameters } })),
+        });
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (callback: () => void) => {
@@ -606,15 +615,18 @@ export class ProxyPoolStore {
                 reject(error);
                 return;
               }
-              const validResponse = usesResponses
-                ? payloads.some((entry) => {
-                  const response = entry.response as { object?: string; output?: unknown[] } | undefined;
-                  return entry.object === "response" || Array.isArray(entry.output) || response?.object === "response" || Array.isArray(response?.output);
-                })
-                // The first chunk of any chat stream carries the choices array.
-                : payloads.some((entry) => Array.isArray(entry.choices));
+              const validResponse = protocol === "systemone"
+                // System One never streams: one JSON document with an `answers` map.
+                ? payloads.some((entry) => entry.answers !== undefined && typeof entry.answers === "object")
+                : protocol === "responses"
+                  ? payloads.some((entry) => {
+                    const response = entry.response as { object?: string; output?: unknown[] } | undefined;
+                    return entry.object === "response" || Array.isArray(entry.output) || response?.object === "response" || Array.isArray(response?.output);
+                  })
+                  // The first chunk of any chat stream carries the choices array.
+                  : payloads.some((entry) => Array.isArray(entry.choices));
               if (!validResponse) {
-                const error = new Error(usesResponses ? "Model health check returned no response output" : "Model health check returned no choices") as Error & { statusCode?: number };
+                const error = new Error(protocol === "systemone" ? "Model health check returned no System One answers" : protocol === "responses" ? "Model health check returned no response output" : "Model health check returned no choices") as Error & { statusCode?: number };
                 error.statusCode = statusCode;
                 reject(error);
                 return;
