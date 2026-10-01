@@ -3,6 +3,7 @@ import type { ServerResponse } from "node:http";
 import { ocId } from "../utils/ids.js";
 import type { AnthropicMessageRequest, ZenFullResponse } from "../types/api.js";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
+import { isOpenCodeProxyAccessError, isUpstreamRateLimitError } from "../providers/opencodeAccessErrors.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator } from "../utils/tokenUsage.js";
@@ -192,7 +193,7 @@ export const pipeZenAsAnthropic = (
     const usageAccumulator = createTokenUsageAccumulator();
     let rateLimitBody = "";
 
-    const retryRateLimited = (): boolean => {
+    const retryWithAnotherProxy = (): boolean => {
       if (retryAttempt || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
       const excluded = new Set<string>();
       if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
@@ -264,7 +265,7 @@ export const pipeZenAsAnthropic = (
     zenRes.on("data", (chunk: Buffer) => {
       if (settled || retryStarted) return;
       const str = chunk.toString();
-      if (zenRes.statusCode === 429) {
+      if ((zenRes.statusCode || 502) >= 400) {
         rateLimitBody += str;
         return;
       }
@@ -274,25 +275,28 @@ export const pipeZenAsAnthropic = (
         if (trimmed.startsWith("{")) {
           try {
             const parsed = JSON.parse(trimmed);
-            const rateLimited = zenRes.statusCode === 429 || trimmed.includes("FreeUsageLimitError") || trimmed.includes("rate_limit_error") || trimmed.toLowerCase().includes("rate limit");
+            const upstreamStatus = zenRes.statusCode || 200;
+            const rateLimited = isUpstreamRateLimitError(upstreamStatus, trimmed);
+            const proxyAccessError = isOpenCodeProxyAccessError(upstreamStatus, trimmed);
             if (parsed.error || parsed.type === "error") {
               const errMsg = parsed.error?.message || parsed.message || "Rate limit";
+              const errorStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
               if (prepared.lease?.node && proxyPool && !markedFailure) {
-                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : 502, leaseId: prepared.lease.leaseId });
+                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: errorStatus, leaseId: prepared.lease.leaseId });
                 markedFailure = true;
               }
-              if (rateLimited && retryRateLimited()) {
+              if ((rateLimited || proxyAccessError) && retryWithAnotherProxy()) {
                 settled = true;
                 zenRes.resume();
                 return;
               }
               settled = true;
               if (!res.headersSent) {
-                const responseStatus = rateLimited ? 429 : 502;
+                const responseStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
                 res.writeHead(responseStatus, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ type: "error", error: { type: rateLimited ? "rate_limit_error" : "upstream_error", message: rateLimited ? `${errMsg} (free model rate limit)` : errMsg } }));
               }
-              metrics?.recordUpstream({ statusCode: rateLimited ? 429 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+              metrics?.recordUpstream({ statusCode: rateLimited ? 429 : proxyAccessError ? 403 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
               zenRes.resume();
               return;
             }
@@ -391,7 +395,8 @@ export const pipeZenAsAnthropic = (
       settled = true;
       const status = zenRes.statusCode || 502;
       if (status >= 400) {
-        const rateLimited = status === 429 || rateLimitBody.includes("FreeUsageLimitError") || rateLimitBody.includes("rate_limit_error") || rateLimitBody.toLowerCase().includes("rate limit");
+        const rateLimited = isUpstreamRateLimitError(status, rateLimitBody);
+        const proxyAccessError = isOpenCodeProxyAccessError(status, rateLimitBody);
         let errMsg = rateLimited ? "Rate limit" : `Upstream returned HTTP ${status}`;
         try {
           const parsed = JSON.parse(rateLimitBody);
@@ -403,7 +408,7 @@ export const pipeZenAsAnthropic = (
           proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : status, leaseId: prepared.lease.leaseId });
           markedFailure = true;
         }
-        if (rateLimited && retryRateLimited()) return;
+        if ((rateLimited || proxyAccessError) && retryWithAnotherProxy()) return;
         if (!res.headersSent) {
           const responseStatus = rateLimited ? 429 : status;
           res.writeHead(responseStatus, { "Content-Type": "application/json" });

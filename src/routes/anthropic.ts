@@ -96,7 +96,7 @@ export const registerAnthropicRoutes = async (
       return reply.code(403).send({ type: "error", error: { type: "permission_error", message: `Model is not allowed for this API key: ${model}` } });
     }
 
-    const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "anthropic", model, request.headers));
+    const sessionScope = sessionScopeFromHeaders(auth.id, "anthropic", model, request.headers);
     const { messages, tools, toolChoice, parameters } = anthropicToOpenAI(request.body);
     // Downstream tools are spelled `Read`/`Bash`; the upstream gate wants
     // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
@@ -140,7 +140,7 @@ export const registerAnthropicRoutes = async (
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
       stream: isStream,
-      sessionId,
+      sessionId: sessions.getSession(sessionScope),
       toolMapper,
       ...(useResponsesUpstream
         ? { protocol: "responses" as const, responseBody: responseRequest }

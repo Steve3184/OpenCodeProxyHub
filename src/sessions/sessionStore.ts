@@ -2,24 +2,14 @@ import { ocId } from "../utils/ids.js";
 
 const firstHeader = (value: string | string[] | undefined): string | undefined => Array.isArray(value) ? value[0] : value;
 
-interface SessionEntry {
-  id: string;
-  ts: number;
-}
-
 export class SessionStore {
-  private readonly sessions = new Map<string, SessionEntry>();
-
-  constructor(private readonly ttlMs = 30 * 60 * 1000) {}
-
-  getSession(user: string): string {
-    const now = Date.now();
-    const existing = this.sessions.get(user);
-    if (existing && now - existing.ts <= this.ttlMs) return existing.id;
-
-    const entry = { id: ocId("ses"), ts: now };
-    this.sessions.set(user, entry);
-    return entry.id;
+  /**
+   * OpenCode binds free-tier request identities to the egress path. Reusing an
+   * x-opencode-session after proxy rotation can trigger a false "outside
+   * OpenCode" 403, so each upstream attempt gets a fresh session id.
+   */
+  getSession(_scope: string): string {
+    return ocId("ses");
   }
 }
 

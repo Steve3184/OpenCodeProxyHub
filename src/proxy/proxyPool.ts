@@ -102,6 +102,14 @@ const DEFAULT_MODEL_TEST_OPTIONS: ProxyModelTestOptions = {
 
 const DEFAULT_PROXY_COOLDOWN_MS = 5 * 60 * 1000;
 
+const isMuseModel = (model: string | undefined): boolean => Boolean(model && model.toLowerCase().replace(/^oc\//, "").startsWith("muse-"));
+
+/** Muse traffic through Cyber nodes is known to trigger upstream account restrictions. */
+export const isProxyCompatibleWithModel = (node: Pick<ProxyNode, "name" | "url">, model?: string): boolean => {
+  if (!isMuseModel(model)) return true;
+  return !/cyber/i.test(`${node.name} ${node.url}`);
+};
+
 const today = () => new Date().toISOString().slice(0, 10);
 
 export class ProxyPoolStore {
@@ -174,12 +182,13 @@ export class ProxyPoolStore {
     return true;
   }
 
-  acquire(excludeProxyIds: ReadonlySet<string> = new Set()): ProxyLease {
+  acquire(excludeProxyIds: ReadonlySet<string> = new Set(), model?: string): ProxyLease {
     this.resetDailyIfNeeded();
     const now = Date.now();
     const candidates = this.proxies
       .filter((node) => node.enabled)
       .filter((node) => !excludeProxyIds.has(node.id))
+      .filter((node) => isProxyCompatibleWithModel(node, model))
       .filter((node) => !node.cooldownUntil || Date.parse(node.cooldownUntil) <= now)
       .filter((node) => node.dailyRequestLimit === 0 || node.dailyRequestCount < node.dailyRequestLimit)
       .filter((node) => node.currentConcurrency < node.maxConcurrency)
@@ -203,7 +212,7 @@ export class ProxyPoolStore {
       this.recordResult(node, false, 502);
       this.persist();
       // Try another node immediately; optional mode can still fall back to direct.
-      return this.acquire(new Set([...excludeProxyIds, node.id]));
+      return this.acquire(new Set([...excludeProxyIds, node.id]), model);
     }
     node.currentConcurrency += 1;
     node.dailyRequestCount += 1;
@@ -294,6 +303,9 @@ export class ProxyPoolStore {
     const node = this.find(id);
     if (!node) throw new Error("Proxy not found");
     this.validateNode(node);
+    if (!isProxyCompatibleWithModel(node, options.model)) {
+      throw new Error(`Proxy ${node.name} is not compatible with model ${options.model}`);
+    }
 
     const checkedAt = new Date().toISOString();
     try {
@@ -327,6 +339,7 @@ export class ProxyPoolStore {
     const recoveryIntervalMs = options.recoveryIntervalMs ?? 10 * 60 * 1000;
     const candidates = this.proxies.filter((node) => {
       if (this.recoveryTestsInFlight.has(node.id)) return false;
+      if (!isProxyCompatibleWithModel(node, options.model)) return false;
       return this.isRecoveryCandidate(node, now, recoveryIntervalMs);
     });
     if (candidates.length === 0) return { tested: 0, recovered: 0 };

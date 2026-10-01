@@ -17,7 +17,8 @@
     "check:stability": "node scripts/stability-check.mjs",
     "check:responses": "tsx scripts/responses-conversion-check.ts",
     "check:tools": "tsx scripts/tool-mapping-check.ts",
-    "check:systemone": "tsx scripts/systemone-routing-check.ts"
+    "check:systemone": "tsx scripts/systemone-routing-check.ts",
+    "check:proxy-routing": "tsx scripts/proxy-routing-check.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

@@ -89,12 +89,12 @@ export const registerSystemoneRoutes = async (
       return reply.code(403).send({ error: { message: `Model is not allowed for this API key: ${downstreamModel}`, type: "permission_error" } });
     }
 
-    const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "systemone", downstreamModel, request.headers));
+    const sessionScope = sessionScopeFromHeaders(auth.id, "systemone", downstreamModel, request.headers);
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
       protocol: "systemone",
       responseBody: { ...body, model: upstreamModel },
-      sessionId,
+      sessionId: sessions.getSession(sessionScope),
       toolMapper: createToolNameMapper(undefined),
     }, settingsStore.get().proxyMode !== "direct" && auth.policy.allowProxy !== false ? proxyPool : undefined, excludeProxyIds);
 

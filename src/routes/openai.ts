@@ -111,7 +111,7 @@ export const registerOpenAIRoutes = async (
       return reply.code(400).send({ error: { message: "messages array is required" } });
     }
 
-    const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "openai", model, request.headers));
+    const sessionScope = sessionScopeFromHeaders(auth.id, "openai", model, request.headers);
     // Downstream tools are spelled `Read`/`Bash`; the upstream gate wants
     // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
     const toolMapper = createToolNameMapper(tools);
@@ -170,7 +170,7 @@ export const registerOpenAIRoutes = async (
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
       stream: isStream,
-      sessionId,
+      sessionId: sessions.getSession(sessionScope),
       toolMapper,
       ...(useResponsesUpstream
         ? { protocol: "responses" as const, responseBody: responseRequest }

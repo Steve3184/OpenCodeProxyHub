@@ -9,6 +9,7 @@ import { createTokenUsageAccumulator, estimateTokens, extractTokenUsage } from "
 import { normalizeResponsesRequest } from "../converters/openAiResponses.js";
 import { aggregateUpstreamBody, type UpstreamProtocol } from "../converters/streamAggregator.js";
 import { DownstreamToolCallFilter, ResponsesStreamToolFilter, applyToolFilterToChatCompletion, applyToolFilterToResponsesResponse, toUpstreamMessages, toUpstreamToolChoice, toUpstreamTools, type ToolNameMapper } from "../converters/toolMapping.js";
+import { isOpenCodeProxyAccessError, isUpstreamRateLimitError, shouldRetryWithAnotherProxy } from "./opencodeAccessErrors.js";
 
 const OC_VERSION = "1.18.31";
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
@@ -92,7 +93,7 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
   const body = JSON.stringify(requestBody);
   const requestId = ocId("msg");
 
-  const lease = proxyPool?.acquire(excludeProxyIds);
+  const lease = proxyPool?.acquire(excludeProxyIds, input.model);
   return {
     body,
     options: {
@@ -152,7 +153,9 @@ export const requestZenFull = (
         const raw = aggregated ? JSON.stringify(aggregated) : upstreamRaw;
         const status = zenRes.statusCode || 502;
         const protocolError = !data || Boolean(data.error) || data.type === "error";
-        const rateLimited = status === 429 || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error") || raw.toLowerCase().includes("rate limit");
+        const rateLimited = isUpstreamRateLimitError(status, raw);
+        const proxyAccessError = isOpenCodeProxyAccessError(status, raw);
+        const retryableProxyError = rateLimited || proxyAccessError;
         const effectiveErrorStatus = rateLimited ? 429 : (status >= 400 ? status : protocolError ? 502 : status);
         if (prepared.lease?.node && proxyPool) {
           if (rateLimited) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429, leaseId: prepared.lease.leaseId });
@@ -165,7 +168,7 @@ export const requestZenFull = (
           }
         }
         metrics?.recordUpstream({ statusCode: effectiveErrorStatus, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-        if (rateLimited && !retryAttempt && retryPrepare && proxyPool && prepared.lease?.node?.id) {
+        if (retryableProxyError && !retryAttempt && retryPrepare && proxyPool && prepared.lease?.node?.id) {
           const excluded = new Set<string>();
           if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
           const retryPrepared = retryPrepare(excluded);
@@ -351,7 +354,7 @@ export const pipeZenOpenAIResponse = (
       }
     }
   };
-  const retryRateLimited = (): boolean => {
+  const retryWithAnotherProxy = (): boolean => {
     if (retryAttempt || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
     const excluded = new Set<string>();
     if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
@@ -392,25 +395,27 @@ export const pipeZenOpenAIResponse = (
         if (str.startsWith("{")) {
           try {
             const parsed = JSON.parse(str);
-            const rateLimited = str.includes("FreeUsageLimitError") || str.includes("rate_limit_error") || str.toLowerCase().includes("rate limit");
+            const rateLimited = isUpstreamRateLimitError(status, str);
+            const proxyAccessError = isOpenCodeProxyAccessError(status, str);
             if (parsed.error || parsed.type === "error") {
               const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
+              const errorStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
               if (prepared.lease?.node && proxyPool && !markedFailure) {
-                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : 502, leaseId: prepared.lease.leaseId });
+                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: errorStatus, leaseId: prepared.lease.leaseId });
                 markedFailure = true;
               }
-              if (rateLimited && retryRateLimited()) {
+              if ((rateLimited || proxyAccessError) && retryWithAnotherProxy()) {
                 settled = true;
                 zenRes.resume();
                 return;
               }
               settled = true;
               if (!res.headersSent) {
-                const responseStatus = rateLimited ? 429 : 502;
+                const responseStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
                 res.writeHead(responseStatus, { "Content-Type": "application/json" });
                 res.end(errorBody(rateLimited ? `${errMsg} (free model rate limit)` : errMsg, rateLimited));
               }
-              metrics?.recordUpstream({ statusCode: rateLimited ? 429 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+              metrics?.recordUpstream({ statusCode: rateLimited ? 429 : proxyAccessError ? 403 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
               zenRes.resume();
               return;
             }
@@ -462,7 +467,8 @@ export const pipeZenOpenAIResponse = (
         if (nonStreamData) usageAccumulator.observe(nonStreamData);
       }
       const upstreamErrorRaw = status >= 400 ? responseErrorBody : upstreamBody;
-      const rateLimited = status === 429 || upstreamErrorRaw.includes("FreeUsageLimitError") || upstreamErrorRaw.includes("rate_limit_error") || upstreamErrorRaw.toLowerCase().includes("rate limit");
+      const rateLimited = isUpstreamRateLimitError(status, upstreamErrorRaw);
+      const proxyAccessError = isOpenCodeProxyAccessError(status, upstreamErrorRaw);
       if (status >= 400 || (aggregateUpstream && protocolError)) {
         const parsed = (() => {
           try { return JSON.parse(upstreamErrorRaw); } catch { return null; }
@@ -472,7 +478,7 @@ export const pipeZenOpenAIResponse = (
           proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : (status >= 400 ? status : 502), leaseId: prepared.lease.leaseId });
           markedFailure = true;
         }
-        if (rateLimited && retryRateLimited()) return;
+        if ((rateLimited || proxyAccessError) && retryWithAnotherProxy()) return;
         if (!res.headersSent) {
           const responseStatus = rateLimited ? 429 : (status >= 400 ? status : 502);
           res.writeHead(responseStatus, { "Content-Type": "application/json" });

@@ -108,7 +108,7 @@ export const registerResponsesRoutes = async (
     }
 
     const inputItems = responseInputCount(body.input);
-    const sessionId = sessions.getSession(sessionScopeFromHeaders(auth.id, "responses", model, request.headers));
+    const sessionScope = sessionScopeFromHeaders(auth.id, "responses", model, request.headers);
     // Downstream tools are spelled `Read`/`Bash`; the upstream gate wants
     // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
     const toolMapper = createToolNameMapper(body.tools);
@@ -144,7 +144,7 @@ export const registerResponsesRoutes = async (
     const prepareRequest = (excludeProxyIds: ReadonlySet<string> = new Set()) => prepareZenRequest(config, {
       model: upstreamModel,
       stream: isStream,
-      sessionId,
+      sessionId: sessions.getSession(sessionScope),
       toolMapper,
       ...(useResponsesUpstream
         ? { protocol: "responses" as const, responseBody: { ...body, model: upstreamModel } }
