@@ -127,7 +127,7 @@ npm start            # 运行已构建的 dist/main.js
 - **四种协议入口**
   - OpenAI 兼容：`POST /v1/chat/completions`、`GET /v1/models`
   - OpenAI Responses：`POST /v1/responses`
-  - TypeSafe System One：`POST /v1/systemone`
+  - TypeSafe System One：`POST /v1/systemone`（同时提供 `POST /zen/v1/systemone` 路由别名，兼容 NewAPI 等固定拼接 `/zen/v1/systemone` 的 TypeSafe 渠道；两条路由共用同一处理函数，非重定向，POST 请求体不会丢失）
   - Anthropic 兼容：`POST /v1/messages`
   - OpenAI/Anthropic 聊天协议同时支持流式（SSE）与非流式
 - **按模型选择上游协议**

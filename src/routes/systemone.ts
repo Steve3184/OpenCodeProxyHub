@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ApiKeyStore } from "../auth/apiKeys.js";
 import type { AppConfig } from "../config/env.js";
 import type { ModelConfigStore } from "../models/catalog.js";
@@ -39,7 +39,7 @@ export const registerSystemoneRoutes = async (
   metrics: MetricsStore,
   eventLogger: EventLogger,
 ): Promise<void> => {
-  app.post<{ Body: SystemoneRequest }>("/v1/systemone", async (request, reply) => {
+  const handleSystemone = async (request: FastifyRequest<{ Body: SystemoneRequest }>, reply: FastifyReply): Promise<void> => {
     const started = process.hrtime.bigint();
     const releaseRequest = requestTracker.acquire();
     if (!releaseRequest) {
@@ -103,7 +103,7 @@ export const registerSystemoneRoutes = async (
       const node = prepared?.lease?.node ?? null;
       eventLogger.apiRequest({
         protocol: "systemone",
-        route: "/v1/systemone",
+        route: request.url,
         apiKeyId: auth.id,
         apiKeyName: auth.name,
         clientId: clientIdFromHeaders(request.headers),
@@ -136,5 +136,11 @@ export const registerSystemoneRoutes = async (
       const message = error instanceof Error ? error.message : "Unknown upstream error";
       return reply.code(502).send({ error: { message, type: "upstream_error" } });
     }
-  });
+  };
+
+  app.post<{ Body: SystemoneRequest }>("/v1/systemone", handleSystemone);
+  // NewAPI's TypeSafe channel adaptor forwards to `base_url + /zen/v1/systemone`,
+  // so expose the same handler under that path too. A real route (not a redirect)
+  // keeps the POST body intact.
+  app.post<{ Body: SystemoneRequest }>("/zen/v1/systemone", handleSystemone);
 };

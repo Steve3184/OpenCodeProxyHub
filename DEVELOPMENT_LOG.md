@@ -1,5 +1,26 @@
 # Development Log
 
+## 2026-10-01: System One Path Alias for NewAPI TypeSafe Channels
+
+Status: complete
+
+Context:
+
+- NewAPI's TypeSafe channel adaptor (`relay/channel/typesafe/adaptor.go`) always forwards to `base_url + /zen/v1/systemone`.
+- OpenCodeProxyHub only registered `POST /v1/systemone`, so `/zen/v1/systemone` returned `404 Route not found` while `/v1/systemone` worked.
+
+Implemented:
+
+- Registered `POST /zen/v1/systemone` as a route alias that shares the exact same handler as `POST /v1/systemone` (a real route, not a 301/302 redirect, so the POST body is preserved).
+- Request logging now records the actual `request.url` so both paths are distinguishable in logs.
+- Added `/zen/v1/systemone` to the `/health` endpoints list.
+- Extended `scripts/systemone-routing-check.ts` to assert the alias is not a 404 and shares the canonical handler's status.
+
+Verified:
+
+- `npm run typecheck`, `npm run check:systemone`, `npm run check:tools`, `npm run check:responses` all pass.
+- Live against real upstream: `POST /v1/systemone` and `POST /zen/v1/systemone` with `jev-1.13-free` return identical 200 bodies.
+
 ## 2026-05-20: Brand Display Normalization
 
 Status: complete

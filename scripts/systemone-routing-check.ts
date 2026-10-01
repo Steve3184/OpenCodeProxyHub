@@ -113,6 +113,19 @@ try {
   assert.ok(!regular.body.includes("/v1/systemone"), `regular model must not hit the gate: ${regular.body.slice(0, 200)}`);
   console.log(`[pass] regular models are not gated (got ${regular.statusCode}, not a local 400)`);
 
+  // NewAPI's TypeSafe channel forwards to /zen/v1/systemone, so that path must
+  // be a real route sharing the same handler (not a 404, not a redirect).
+  const systemonePayload = {
+    model: "jev-1.13-free",
+    state: "hi",
+    questions: { q: { type: "noul", instructions: "Is this a greeting?" } },
+  };
+  const canonical = await app.inject({ method: "POST", url: "/v1/systemone", headers, payload: systemonePayload });
+  const alias = await app.inject({ method: "POST", url: "/zen/v1/systemone", headers, payload: systemonePayload });
+  assert.notEqual(alias.statusCode, 404, `/zen/v1/systemone must not be a 404 (got ${alias.statusCode}: ${alias.body})`);
+  assert.equal(alias.statusCode, canonical.statusCode, `/zen/v1/systemone must share the handler with /v1/systemone (alias ${alias.statusCode} vs canonical ${canonical.statusCode})`);
+  console.log(`[pass] /zen/v1/systemone alias routes to the same handler (got ${alias.statusCode})`);
+
   await app.close();
 } finally {
   await rm(tempDir, { recursive: true, force: true });
