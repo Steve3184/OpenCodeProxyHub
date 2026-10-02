@@ -108,6 +108,58 @@ Minimum proxy requirements:
 - disable response buffering for SSE paths if possible
 - forward client disconnects promptly
 
+### API caching, compression, and Cloudflare
+
+The application does not register a response-compression plugin. Dynamic API
+responses (`/v1/*`, `/zen/v1/*`, `/admin/*`, and `/health`), including errors and
+raw streaming responses, send:
+
+```http
+Cache-Control: no-store, no-cache, must-revalidate, no-transform
+CDN-Cache-Control: no-store
+Cloudflare-CDN-Cache-Control: no-store
+```
+
+`no-cache` alone still permits storage; `no-store` forbids it. Cloudflare documents
+`Cache-Control: no-transform` on the **origin response** as the way to prevent
+edge recompression. Putting it on a client request is not equivalent. Upstream
+model requests, model-list syncs, and health probes also explicitly request
+`Accept-Encoding: identity`. Static console assets retain their normal caching.
+These are HTTP transport controls, not model-provider prompt-cache controls.
+
+SSE responses additionally send `X-Accel-Buffering: no`. This is an Nginx buffering
+control, not a Cloudflare compression control. If Nginx fronts the app, use the
+following directives in the API proxy location(s), retaining your existing
+`proxy_pass` and authorization forwarding configuration:
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_buffering off;
+proxy_cache off;
+gzip off;
+proxy_read_timeout 300s;
+```
+
+In Cloudflare, configure Cache Rules to bypass cache for the API paths above;
+remove conflicting rules that force an Edge Cache TTL or Workers that cache
+these responses. Compression Rules can additionally disable compression for
+these paths. Preserve the origin's `no-transform` header through every proxy.
+Application headers cannot override arbitrary Worker code or eliminate
+Cloudflare's connection/read timeout limits. This change does not modify your
+Cloudflare zone or reverse-proxy configuration.
+
+After deployment, use `curl -N -D -` with an authenticated streaming request
+through your public hostname and compare with a direct-origin request. Offer
+`Accept-Encoding: gzip, br` and check that `Content-Encoding` is absent, API
+responses are not cache hits (`CF-Cache-Status` is not `HIT`), and chunks arrive
+before generation finishes. Also check an ordinary JSON response and an error
+response. A passing local test does not verify the deployed Cloudflare path.
+
+References:
+- https://developers.cloudflare.com/speed/optimization/content/compression/
+- https://developers.cloudflare.com/cache/concepts/cdn-cache-control/
+
 ## Outbound Proxy Mode and Pre-Proxy
 
 Proxy mode controls whether requests use the proxy pool:

@@ -574,6 +574,7 @@ export class ProxyPoolStore {
         path: options.path,
         method: "POST",
         headers: {
+          "Accept-Encoding": "identity",
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(body),
           Authorization: "Bearer public",

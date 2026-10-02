@@ -172,7 +172,7 @@ export const registerAdminRoutes = async (
   app.post("/admin/models/sync-free", async (request, reply) => {
     try {
       const upstreamUrl = "https://opencode.ai/zen/v1/models";
-      const response = await fetch(upstreamUrl);
+      const response = await fetch(upstreamUrl, { cache: "no-store", headers: { "Accept-Encoding": "identity" } });
       if (!response.ok) {
         throw new Error(`Failed to fetch models from upstream: ${response.status}`);
       }
@@ -188,7 +188,8 @@ export const registerAdminRoutes = async (
       let syncedCount = 0;
       for (const model of freeModels) {
         modelStore.upsert(model.id, {
-          enabled: true,
+          // Omit enabled: existing models retain the administrator's choice;
+          // upsert still enables newly discovered models by default.
           ownedBy: model.owned_by || "opencode-free",
           created: model.created || Math.floor(Date.now() / 1000),
         });

@@ -20,6 +20,7 @@ import { createLimiter } from "./rateLimit/limiter.js";
 import { RequestTracker } from "./runtime/requestTracker.js";
 import { MetricsStore, registerMetricsHooks } from "./observability/metrics.js";
 import { EventLogger } from "./observability/eventLogger.js";
+import { API_RESPONSE_HEADERS } from "./utils/responseHeaders.js";
 
 export const buildApp = async (config: AppConfig) => {
   const settingsStore = new SettingsStore(config.settingsFile, {
@@ -36,6 +37,15 @@ export const buildApp = async (config: AppConfig) => {
   const settings = settingsStore.get();
 
   const app = Fastify({ logger: true, bodyLimit: settings.requestBodyLimitBytes });
+  app.addHook("onRequest", async (request, reply) => {
+    const pathname = request.url.split("?", 1)[0] ?? "";
+    if (pathname !== "/health" && !/^\/(?:v1|zen\/v1|admin)(?:\/|$)/.test(pathname)) return;
+    // Set raw headers before routing so hijacked streams, authentication
+    // failures and validation errors receive the same policy as JSON replies.
+    for (const [name, value] of Object.entries(API_RESPONSE_HEADERS)) {
+      reply.raw.setHeader(name, value);
+    }
+  });
   const metrics = new MetricsStore();
   const eventLogger = new EventLogger(settingsStore, config.logsDir);
   registerMetricsHooks(app, metrics);

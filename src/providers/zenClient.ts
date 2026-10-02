@@ -1,4 +1,5 @@
 import https from "node:https";
+import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import type { ServerResponse } from "node:http";
 import { ocId } from "../utils/ids.js";
 import type { AppConfig } from "../config/env.js";
@@ -104,6 +105,7 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
         : protocol === "systemone" ? config.zenSystemonePath : config.zenPath,
       method: "POST",
       headers: {
+        "Accept-Encoding": "identity",
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(body),
         Authorization: "Bearer public",
@@ -433,13 +435,7 @@ export const pipeZenOpenAIResponse = (
         }
 
         headersSent = true;
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache, no-transform",
-          Connection: "keep-alive",
-          "X-Accel-Buffering": "no",
-          "Transfer-Encoding": "chunked",
-        });
+        res.writeHead(200, SSE_RESPONSE_HEADERS);
         res.write(transformStreamChunk(firstChunk));
         return;
       }

@@ -1,3 +1,4 @@
+import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import https from "node:https";
 import type { ServerResponse } from "node:http";
 import { ocId } from "../utils/ids.js";
@@ -57,13 +58,7 @@ const writeSse = (res: ServerResponse, payload: unknown): void => {
 
 const sendHeaders = (res: ServerResponse): void => {
   if (res.headersSent) return;
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-    "Transfer-Encoding": "chunked",
-  });
+  res.writeHead(200, SSE_RESPONSE_HEADERS);
 };
 
 const sendRole = (state: TransformState, res: ServerResponse): void => {
