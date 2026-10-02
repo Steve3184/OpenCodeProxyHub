@@ -54,6 +54,13 @@ Back up `./data` before upgrades or host migration:
 tar -czf opencode-proxy-hub-data.tgz data
 ```
 
+JSON stores are written to a temporary file in the same directory, flushed,
+and atomically renamed into place. Only a missing file uses default data;
+an empty, malformed, or unreadable existing file fails startup without being
+overwritten. Recover such a file from a validated backup before restarting.
+Before an upgrade, validate the JSON snapshots and record the API-key, model,
+alias, and proxy counts. Verify those counts after restarting, not just `/health`.
+
 ## Health Checks
 
 App health:
