@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
-import { AlertTriangle, CheckCircle2, Network, Plus, RotateCcw, Route, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Network, Plus, RotateCcw, Route, Trash2 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -32,6 +32,18 @@ export function ProxyView({ data }: { data: ConsoleData }) {
   const [deleteTarget, setDeleteTarget] = useState<ProxyNode | null>(null);
   const [statsTarget, setStatsTarget] = useState<ProxyNode | null>(null);
   const [showProxyDetails, setShowProxyDetails] = useState(false);
+  const [proxyPage, setProxyPage] = useState(1);
+  const pageSize = 200;
+  const pageCount = Math.max(1, Math.ceil(proxies.length / pageSize));
+
+  const visibleProxies = useMemo(() => {
+    const safePage = Math.min(proxyPage, pageCount);
+    return proxies.slice((safePage - 1) * pageSize, safePage * pageSize);
+  }, [proxies, proxyPage, pageCount]);
+
+  useEffect(() => {
+    if (proxyPage > pageCount) setProxyPage(pageCount);
+  }, [proxyPage, pageCount]);
 
   const prioritized = useMemo(() => {
     const now = Date.now();
@@ -138,7 +150,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
         animate="show"
         className="proxy-grid"
       >
-        {proxies.map((proxy) => {
+        {visibleProxies.map((proxy) => {
           const badge = stateBadge(proxy);
           const isPrimary = prioritized?.id === proxy.id;
           return (
@@ -235,6 +247,35 @@ export function ProxyView({ data }: { data: ConsoleData }) {
           );
         })}
       </motion.div>
+
+      {proxies.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-4 py-3">
+          <span className="text-xs text-muted-foreground">
+            共 {proxies.length} 个代理，每页 {pageSize} 个
+            {pageCount > 1 && <> · 第 {proxyPage}/{pageCount} 页</>}
+          </span>
+          {pageCount > 1 && (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={proxyPage <= 1}
+                onClick={() => setProxyPage((page) => Math.max(1, page - 1))}
+              >
+                <ChevronLeft size={16} /> 上一页
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={proxyPage >= pageCount}
+                onClick={() => setProxyPage((page) => Math.min(pageCount, page + 1))}
+              >
+                下一页 <ChevronRight size={16} />
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
 
       <ConfirmDialog
         open={Boolean(deleteTarget)}
