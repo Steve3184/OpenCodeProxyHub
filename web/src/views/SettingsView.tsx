@@ -27,12 +27,15 @@ export function SettingsView({ data }: { data: ConsoleData }) {
 
   if (!settings) return <p className="text-sm text-muted-foreground">设置加载中…</p>;
 
-  const numberField = (label: string, key: keyof SystemSettings, disabled = false) => (
+  const numberField = (label: string, key: keyof SystemSettings, disabled = false, min?: number, max?: number) => (
     <div className="space-y-1.5">
       <Label className="text-xs text-muted-foreground">{label}</Label>
       <Input
         type="number"
         disabled={busy || disabled}
+        min={min}
+        max={max}
+        step={min !== undefined || max !== undefined ? 1 : undefined}
         value={settings[key] as number}
         onChange={(e) => updateSettings({ [key]: Number(e.target.value) } as Partial<SystemSettings>)}
       />
@@ -58,6 +61,10 @@ export function SettingsView({ data }: { data: ConsoleData }) {
           <div className="mt-4 space-y-4">
             {numberField("上游超时（毫秒）", "upstreamTimeoutMs")}
             {numberField("请求体限制（字节）", "requestBodyLimitBytes")}
+            <div>
+              {numberField("自动重试次数", "autoRetryCount", false, 0, 10)}
+              <p className="mt-1 text-xs text-muted-foreground">失败后自动切换代理重试的次数，0 表示关闭，最多 10 次。</p>
+            </div>
             {toggleField("默认流式输出", "defaultStream")}
           </div>
         </Card>

@@ -3,6 +3,7 @@ import { JsonFileStore } from "../storage/jsonFile.js";
 export interface SystemSettings {
   requestBodyLimitBytes: number;
   upstreamTimeoutMs: number;
+  autoRetryCount: number;
   defaultStream: boolean;
   openAiStreamTransformModels: string[];
   reasoningTagModels: string[];
@@ -32,6 +33,7 @@ const LEGACY_DEFAULT_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_SETTINGS: SystemSettings = {
   requestBodyLimitBytes: DEFAULT_REQUEST_BODY_LIMIT_BYTES,
   upstreamTimeoutMs: 120000,
+  autoRetryCount: 1,
   defaultStream: false,
   openAiStreamTransformModels: [],
   reasoningTagModels: [],
@@ -84,6 +86,13 @@ export class SettingsStore {
         throw new Error("upstreamTimeoutMs must be at least 1000");
       }
       this.settings.upstreamTimeoutMs = Math.trunc(input.upstreamTimeoutMs);
+    }
+
+    if (input.autoRetryCount !== undefined) {
+      if (!Number.isFinite(input.autoRetryCount) || input.autoRetryCount < 0 || input.autoRetryCount > 10) {
+        throw new Error("autoRetryCount must be between 0 and 10");
+      }
+      this.settings.autoRetryCount = Math.trunc(input.autoRetryCount);
     }
 
     if (input.defaultStream !== undefined) this.settings.defaultStream = Boolean(input.defaultStream);

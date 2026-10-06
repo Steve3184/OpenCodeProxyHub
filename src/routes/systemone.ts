@@ -123,7 +123,7 @@ export const registerSystemoneRoutes = async (
 
     const prepared = prepareRequest();
     try {
-      const upstream = await requestZenFull(prepared, settingsStore.get().proxyMode !== "direct" && auth.policy.allowProxy !== false ? proxyPool : undefined, metrics, prepareRequest, false, "systemone");
+      const upstream = await requestZenFull(prepared, settingsStore.get().proxyMode !== "direct" && auth.policy.allowProxy !== false ? proxyPool : undefined, metrics, prepareRequest, 0, "systemone", settingsStore.get().autoRetryCount);
       const raw = upstream.raw || "";
       const rateLimited = upstream.status === 429 || raw.includes("rate_limit_error") || raw.toLowerCase().includes("rate limit");
       if (rateLimited || upstream.status < 200 || upstream.status >= 300 || upstream.data?.error || upstream.data?.type === "error") {

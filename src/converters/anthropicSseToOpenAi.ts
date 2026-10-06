@@ -197,8 +197,9 @@ export const pipeAnthropicSseAsOpenAI = (
   proxyPool?: ProxyPoolStore,
   metrics?: MetricsStore,
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
-  retryAttempt = false,
+  retryCount = 0,
   toolMapper?: ToolNameMapper,
+  maxRetries = 1,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -218,13 +219,17 @@ export const pipeAnthropicSseAsOpenAI = (
   let observedOutputChars = 0;
 
   const retryRateLimited = (): boolean => {
-    if (retryAttempt || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
-    const excluded = new Set<string>();
-    if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
+    if (retryCount >= maxRetries || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
+    const excluded = new Set<string>([prepared.lease.node.id]);
     const retryPrepared = retryPrepare(excluded);
     if (retryPrepared.lease?.requiredUnavailable) return false;
     retryStarted = true;
-    pipeAnthropicSseAsOpenAI(retryPrepared, model, res, proxyPool, metrics, retryPrepare, true, toolMapper);
+    const nextRetryPrepare = (additional: ReadonlySet<string>) => {
+      const allExcluded = new Set(excluded);
+      for (const id of additional) allExcluded.add(id);
+      return retryPrepare(allExcluded);
+    };
+    pipeAnthropicSseAsOpenAI(retryPrepared, model, res, proxyPool, metrics, nextRetryPrepare, retryCount + 1, toolMapper, maxRetries);
     return true;
   };
 

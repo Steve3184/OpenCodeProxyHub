@@ -180,7 +180,7 @@ export const registerOpenAIRoutes = async (
 
     if (useResponsesUpstream && !isStream) {
       try {
-        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, false, "responses");
+        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, 0, "responses", activeSettings.autoRetryCount);
         const raw = zenResp.raw || "";
         const rateLimited = zenResp.status === 429 || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error") || raw.toLowerCase().includes("rate limit");
         if (rateLimited || zenResp.status < 200 || zenResp.status >= 300 || zenResp.data?.error || zenResp.data?.type === "error") {
@@ -198,17 +198,17 @@ export const registerOpenAIRoutes = async (
 
     reply.hijack();
     if (useResponsesUpstream) {
-      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createResponsesToOpenAIStreamTransformer(model, toolMapper), toolMapper);
+      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, 0, undefined, createResponsesToOpenAIStreamTransformer(model, toolMapper), toolMapper, false, activeSettings.autoRetryCount);
       return;
     }
     if (isStream && activeSettings.openAiStreamTransformModels.includes(model)) {
-      pipeAnthropicSseAsOpenAI(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, toolMapper);
+      pipeAnthropicSseAsOpenAI(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest, 0, toolMapper, activeSettings.autoRetryCount);
       return;
     }
     if (isStream && activeSettings.reasoningTagModels.includes(model)) {
-      pipeOpenAiStreamStrippingThink(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, toolMapper);
+      pipeOpenAiStreamStrippingThink(prepared, model, reply.raw, effectiveProxyPool, metrics, prepareRequest, 0, toolMapper, activeSettings.autoRetryCount);
       return;
     }
-    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, model, undefined, toolMapper);
+    pipeZenOpenAIResponse(prepared, isStream, reply.raw, effectiveProxyPool, metrics, prepareRequest, 0, model, undefined, toolMapper, false, activeSettings.autoRetryCount);
   });
 };

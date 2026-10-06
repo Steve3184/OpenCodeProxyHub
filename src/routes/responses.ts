@@ -165,7 +165,7 @@ export const registerResponsesRoutes = async (
 
     if (!isStream) {
       try {
-        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, false, useResponsesUpstream ? "responses" : "chat_completions");
+        const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, 0, useResponsesUpstream ? "responses" : "chat_completions", activeSettings.autoRetryCount);
         const raw = zenResp.raw || "";
         const rateLimited = zenResp.status === 429 || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error") || raw.toLowerCase().includes("rate limit");
         if (rateLimited || zenResp.status < 200 || zenResp.status >= 300 || zenResp.data?.error || zenResp.data?.type === "error") {
@@ -186,9 +186,9 @@ export const registerResponsesRoutes = async (
 
     reply.hijack();
     if (useResponsesUpstream) {
-      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, model, undefined, toolMapper, true);
+      pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, 0, model, undefined, toolMapper, true, activeSettings.autoRetryCount);
       return;
     }
-    pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createOpenAIToResponsesStreamTransformer(model, toolMapper), toolMapper);
+    pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, 0, undefined, createOpenAIToResponsesStreamTransformer(model, toolMapper), toolMapper, false, activeSettings.autoRetryCount);
   });
 };

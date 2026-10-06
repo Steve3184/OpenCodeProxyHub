@@ -47,6 +47,7 @@ export interface ModelAliasConfig {
 export interface SystemSettings {
   requestBodyLimitBytes: number;
   upstreamTimeoutMs: number;
+  autoRetryCount: number;
   defaultStream: boolean;
   openAiStreamTransformModels: string[];
   reasoningTagModels: string[];

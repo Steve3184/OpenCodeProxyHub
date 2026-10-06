@@ -151,15 +151,15 @@ export const registerAnthropicRoutes = async (
     if (isStream) {
       reply.hijack();
       if (useResponsesUpstream) {
-        pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, false, undefined, createResponsesToAnthropicStreamTransformer(model, inputTokens, toolMapper));
+        pipeZenOpenAIResponse(prepared, true, reply.raw, effectiveProxyPool, metrics, prepareRequest, 0, undefined, createResponsesToAnthropicStreamTransformer(model, inputTokens, toolMapper), undefined, false, activeSettings.autoRetryCount);
         return;
       }
-      pipeZenAsAnthropic(prepared, model, reply.raw, inputTokens, effectiveProxyPool, metrics, prepareRequest, false, toolMapper);
+      pipeZenAsAnthropic(prepared, model, reply.raw, inputTokens, effectiveProxyPool, metrics, prepareRequest, 0, toolMapper, activeSettings.autoRetryCount);
       return;
     }
 
     try {
-      const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, false, useResponsesUpstream ? "responses" : "chat_completions");
+      const zenResp = await requestZenFull(prepared, effectiveProxyPool, metrics, prepareRequest, 0, useResponsesUpstream ? "responses" : "chat_completions", activeSettings.autoRetryCount);
       const normalizedResponse = useResponsesUpstream && zenResp.status >= 200 && zenResp.status < 300 && !zenResp.data?.error && zenResp.data?.type !== "error"
         ? { ...zenResp, data: responsesToOpenAIChatResponse(zenResp.data, model, toolMapper) }
         : zenResp;

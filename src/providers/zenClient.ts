@@ -127,8 +127,9 @@ export const requestZenFull = (
   proxyPool?: ProxyPoolStore,
   metrics?: MetricsStore,
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
-  retryAttempt = false,
+  retryCount = 0,
   protocol: UpstreamProtocol = "chat_completions",
+  maxRetries = 1,
 ): Promise<ZenFullResponse> => {
   return new Promise((resolve, reject) => {
     if (prepared.lease?.requiredUnavailable) {
@@ -170,12 +171,16 @@ export const requestZenFull = (
           }
         }
         metrics?.recordUpstream({ statusCode: effectiveErrorStatus, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-        if (retryableProxyError && !retryAttempt && retryPrepare && proxyPool && prepared.lease?.node?.id) {
-          const excluded = new Set<string>();
-          if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
+        if (retryableProxyError && retryCount < maxRetries && retryPrepare && proxyPool && prepared.lease?.node?.id) {
+          const excluded = new Set<string>([prepared.lease.node.id]);
           const retryPrepared = retryPrepare(excluded);
           if (retryPrepared.lease?.node || !retryPrepared.lease?.requiredUnavailable) {
-            requestZenFull(retryPrepared, proxyPool, metrics, retryPrepare, true, protocol).then(resolve, reject);
+            const nextRetryPrepare = (additional: ReadonlySet<string>) => {
+              const allExcluded = new Set(excluded);
+              for (const id of additional) allExcluded.add(id);
+              return retryPrepare(allExcluded);
+            };
+            requestZenFull(retryPrepared, proxyPool, metrics, nextRetryPrepare, retryCount + 1, protocol, maxRetries).then(resolve, reject);
             return;
           }
         }
@@ -232,11 +237,12 @@ export const pipeZenOpenAIResponse = (
   proxyPool?: ProxyPoolStore,
   metrics?: MetricsStore,
   retryPrepare?: (excludeProxyIds: ReadonlySet<string>) => ZenPreparedRequest,
-  retryAttempt = false,
+  retryCount = 0,
   responseModel?: string,
   streamTransform?: ZenStreamTransform,
   toolMapper?: ToolNameMapper,
   responsesProtocol = false,
+  maxRetries = 1,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -357,13 +363,17 @@ export const pipeZenOpenAIResponse = (
     }
   };
   const retryWithAnotherProxy = (): boolean => {
-    if (retryAttempt || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
-    const excluded = new Set<string>();
-    if (prepared.lease?.node?.id) excluded.add(prepared.lease.node.id);
+    if (retryCount >= maxRetries || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
+    const excluded = new Set<string>([prepared.lease.node.id]);
     const retryPrepared = retryPrepare(excluded);
     if (retryPrepared.lease?.requiredUnavailable) return false;
     retryStarted = true;
-    pipeZenOpenAIResponse(retryPrepared, stream, res, proxyPool, metrics, retryPrepare, true, responseModel, streamTransform, toolMapper, responsesProtocol);
+    const nextRetryPrepare = (additional: ReadonlySet<string>) => {
+      const allExcluded = new Set(excluded);
+      for (const id of additional) allExcluded.add(id);
+      return retryPrepare(allExcluded);
+    };
+    pipeZenOpenAIResponse(retryPrepared, stream, res, proxyPool, metrics, nextRetryPrepare, retryCount + 1, responseModel, streamTransform, toolMapper, responsesProtocol, maxRetries);
     return true;
   };
   const handleRequestSetupError = (error: unknown): void => {
