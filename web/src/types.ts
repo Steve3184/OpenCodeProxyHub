@@ -64,6 +64,13 @@ export interface SystemSettings {
   apiKeyMaxConcurrentStreams: number;
 }
 
+export interface ProxySummary {
+  total: number;
+  enabled: number;
+  dailyRequestCount: number;
+  dailyTokens: number;
+}
+
 export interface ProxyPage {
   items: ProxyNode[];
   total: number;

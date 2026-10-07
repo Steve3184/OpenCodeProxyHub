@@ -133,6 +133,16 @@ export class ProxyPoolStore {
     return this.proxies.map((proxy) => ({ ...proxy }));
   }
 
+  summary(): { total: number; enabled: number; dailyRequestCount: number; dailyTokens: number } {
+    this.resetDailyIfNeeded();
+    return {
+      total: this.proxies.length,
+      enabled: this.proxies.filter((proxy) => proxy.enabled).length,
+      dailyRequestCount: this.proxies.reduce((sum, proxy) => sum + proxy.dailyRequestCount, 0),
+      dailyTokens: this.proxies.reduce((sum, proxy) => sum + proxy.dailyTokens, 0),
+    };
+  }
+
   listPage(page = 1, pageSize = 200): { items: ProxyNode[]; total: number; page: number; pageSize: number; pageCount: number } {
     this.resetDailyIfNeeded();
 

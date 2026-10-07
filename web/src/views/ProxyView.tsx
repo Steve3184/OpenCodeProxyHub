@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
 import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Network, Plus, RotateCcw, Route, Trash2 } from "lucide-react";
 import { Card } from "@/components/ui/card";
@@ -37,6 +37,10 @@ export function ProxyView({ data }: { data: ConsoleData }) {
   const pageCount = proxyPagination.pageCount;
   const totalProxies = proxyPagination.total;
   const visibleProxies = proxies;
+
+  useEffect(() => {
+    void loadProxyPage(proxyPage);
+  }, [loadProxyPage]);
 
   const changeProxyPage = (page: number) => {
     const nextPage = Math.max(1, Math.min(page, pageCount));

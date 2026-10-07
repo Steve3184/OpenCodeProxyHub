@@ -11,6 +11,7 @@ import type {
   ProxyDraft,
   ProxyNode,
   ProxyPage,
+  ProxySummary,
   RuntimePayload,
   SystemSettings,
 } from "../types";
@@ -61,6 +62,7 @@ export function useConsoleData() {
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [proxies, setProxies] = useState<ProxyNode[]>([]);
   const [proxyPagination, setProxyPagination] = useState<ProxyPage>({ page: 1, pageSize: 200, total: 0, pageCount: 1, items: [] });
+  const [proxySummary, setProxySummary] = useState<ProxySummary>({ total: 0, enabled: 0, dailyRequestCount: 0, dailyTokens: 0 });
   const [runtime, setRuntime] = useState<RuntimePayload | null>(null);
   const [metricsData, setMetricsData] = useState<MetricsPayload | null>(null);
 
@@ -97,6 +99,7 @@ export function useConsoleData() {
     setSettings(null);
     setProxies([]);
     setProxyPagination({ page: 1, pageSize: 200, total: 0, pageCount: 1, items: [] });
+    setProxySummary({ total: 0, enabled: 0, dailyRequestCount: 0, dailyTokens: 0 });
     setRuntime(null);
     setMetricsData(null);
     pushToast(message, "info");
@@ -124,7 +127,7 @@ export function useConsoleData() {
     }
   }, [fetchProxyPage, logout, pushToast, token]);
 
-  const loadPublic = useCallback(async (activeToken: string, options: { silent?: boolean; proxyPage?: number } = {}) => {
+  const loadPublic = useCallback(async (activeToken: string, options: { silent?: boolean } = {}) => {
     if (!options.silent) setBusy(true);
     try {
       const [healthData, publicModels] = await Promise.all([
@@ -134,12 +137,12 @@ export function useConsoleData() {
       setHealth(healthData);
       if (!activeToken) return;
 
-      const [keysData, modelsData, aliasesData, settingsData, proxyPageData, runtimeData, metricsResult] = await Promise.all([
+      const [keysData, modelsData, aliasesData, settingsData, proxySummaryData, runtimeData, metricsResult] = await Promise.all([
         apiFetch<{ data: ApiKeyItem[] }>("/admin/api-keys", activeToken),
         apiFetch<{ data: ModelItem[] }>("/admin/models", activeToken),
         apiFetch<{ data: ModelAliasConfig }>("/admin/model-aliases", activeToken),
         apiFetch<{ data: SystemSettings }>("/admin/settings", activeToken),
-        fetchProxyPage(activeToken, options.proxyPage ?? 1),
+        apiFetch<{ data: ProxySummary }>("/admin/proxies/summary", activeToken),
         apiFetch<{ data: RuntimePayload }>("/admin/runtime", activeToken),
         apiFetch<{ data: MetricsPayload }>("/admin/metrics", activeToken),
       ]);
@@ -147,8 +150,7 @@ export function useConsoleData() {
       setModels(modelsData.data);
       setModelAliases(aliasesData.data);
       setSettings(settingsData.data);
-      setProxies(proxyPageData.data.items);
-      setProxyPagination(proxyPageData.data);
+      setProxySummary(proxySummaryData.data);
       setRuntime(runtimeData.data);
       setMetricsData(metricsResult.data);
       if (!modelsData.data.length && Array.isArray(publicModels.data)) {
@@ -225,8 +227,13 @@ export function useConsoleData() {
       setBusy(true);
       try {
         await fn();
-        if (opts.refreshProxies) await loadProxyPage(proxyPagination.page, { silent: true });
-        else if (opts.refresh !== false) await loadPublic(token, { proxyPage: proxyPagination.page });
+        if (opts.refreshProxies) {
+          await Promise.all([
+            loadProxyPage(proxyPagination.page, { silent: true }),
+            apiFetch<{ data: ProxySummary }>("/admin/proxies/summary", token).then((result) => setProxySummary(result.data)),
+          ]);
+        }
+        else if (opts.refresh !== false) await loadPublic(token);
         if (opts.successText) pushToast(opts.successText, "success");
       } catch (err) {
         if (err instanceof ApiFetchError && err.status === 401) {
@@ -379,7 +386,7 @@ export function useConsoleData() {
 
   const refresh = useCallback(async (options: { silent?: boolean } = {}) => {
     try {
-      await loadPublic(token, { ...options, proxyPage: proxyPagination.page });
+      await loadPublic(token, options);
       if (!options.silent) pushToast("已刷新数据", "success");
     } catch (err) {
       if (err instanceof ApiFetchError && err.status === 401) {
@@ -404,6 +411,7 @@ export function useConsoleData() {
     settings,
     proxies,
     proxyPagination,
+    proxySummary,
     runtime,
     metricsData,
     busy,

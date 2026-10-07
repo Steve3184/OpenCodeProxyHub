@@ -234,6 +234,8 @@ export const registerAdminRoutes = async (
     }
   });
 
+  app.get("/admin/proxies/summary", async () => ({ data: proxyPool.summary() }));
+
   app.get<{ Querystring: ProxyListQuery }>("/admin/proxies", async (request) => {
     const page = positiveInteger(request.query.page, 1);
     const pageSize = Math.min(200, positiveInteger(request.query.pageSize, 200));
