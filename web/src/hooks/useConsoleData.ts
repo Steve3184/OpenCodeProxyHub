@@ -10,6 +10,7 @@ import type {
   ModelAliasConfig,
   ProxyDraft,
   ProxyNode,
+  ProxyPage,
   RuntimePayload,
   SystemSettings,
 } from "../types";
@@ -59,6 +60,7 @@ export function useConsoleData() {
   const [modelAliases, setModelAliases] = useState<ModelAliasConfig>({ onlyConfiguredAliases: false, aliases: [] });
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [proxies, setProxies] = useState<ProxyNode[]>([]);
+  const [proxyPagination, setProxyPagination] = useState<ProxyPage>({ page: 1, pageSize: 200, total: 0, pageCount: 1, items: [] });
   const [runtime, setRuntime] = useState<RuntimePayload | null>(null);
   const [metricsData, setMetricsData] = useState<MetricsPayload | null>(null);
 
@@ -94,12 +96,35 @@ export function useConsoleData() {
     setModelAliases({ onlyConfiguredAliases: false, aliases: [] });
     setSettings(null);
     setProxies([]);
+    setProxyPagination({ page: 1, pageSize: 200, total: 0, pageCount: 1, items: [] });
     setRuntime(null);
     setMetricsData(null);
     pushToast(message, "info");
   }, [pushToast, token]);
 
-  const loadPublic = useCallback(async (activeToken: string, options: { silent?: boolean } = {}) => {
+  const fetchProxyPage = useCallback(async (activeToken: string, page: number) => {
+    return apiFetch<{ data: ProxyPage }>(`/admin/proxies?page=${page}&pageSize=200`, activeToken);
+  }, []);
+
+  const loadProxyPage = useCallback(async (page = 1, options: { silent?: boolean } = {}) => {
+    if (!token) return;
+    if (!options.silent) setBusy(true);
+    try {
+      const result = await fetchProxyPage(token, page);
+      setProxies(result.data.items);
+      setProxyPagination(result.data);
+    } catch (err) {
+      if (err instanceof ApiFetchError && err.status === 401) {
+        await logout("登录状态已失效，请重新登录");
+      } else {
+        pushToast(err instanceof Error ? err.message : "加载代理失败", "error");
+      }
+    } finally {
+      if (!options.silent) setBusy(false);
+    }
+  }, [fetchProxyPage, logout, pushToast, token]);
+
+  const loadPublic = useCallback(async (activeToken: string, options: { silent?: boolean; proxyPage?: number } = {}) => {
     if (!options.silent) setBusy(true);
     try {
       const [healthData, publicModels] = await Promise.all([
@@ -109,12 +134,12 @@ export function useConsoleData() {
       setHealth(healthData);
       if (!activeToken) return;
 
-      const [keysData, modelsData, aliasesData, settingsData, proxiesData, runtimeData, metricsResult] = await Promise.all([
+      const [keysData, modelsData, aliasesData, settingsData, proxyPageData, runtimeData, metricsResult] = await Promise.all([
         apiFetch<{ data: ApiKeyItem[] }>("/admin/api-keys", activeToken),
         apiFetch<{ data: ModelItem[] }>("/admin/models", activeToken),
         apiFetch<{ data: ModelAliasConfig }>("/admin/model-aliases", activeToken),
         apiFetch<{ data: SystemSettings }>("/admin/settings", activeToken),
-        apiFetch<{ data: ProxyNode[] }>("/admin/proxies", activeToken),
+        fetchProxyPage(activeToken, options.proxyPage ?? 1),
         apiFetch<{ data: RuntimePayload }>("/admin/runtime", activeToken),
         apiFetch<{ data: MetricsPayload }>("/admin/metrics", activeToken),
       ]);
@@ -122,7 +147,8 @@ export function useConsoleData() {
       setModels(modelsData.data);
       setModelAliases(aliasesData.data);
       setSettings(settingsData.data);
-      setProxies(proxiesData.data);
+      setProxies(proxyPageData.data.items);
+      setProxyPagination(proxyPageData.data);
       setRuntime(runtimeData.data);
       setMetricsData(metricsResult.data);
       if (!modelsData.data.length && Array.isArray(publicModels.data)) {
@@ -131,7 +157,7 @@ export function useConsoleData() {
     } finally {
       if (!options.silent) setBusy(false);
     }
-  }, []);
+  }, [fetchProxyPage]);
 
   const login = useCallback(async (candidate: string) => {
     const cleanToken = candidate.trim();
@@ -195,11 +221,12 @@ export function useConsoleData() {
 
   // Wraps an action: runs it, refreshes data, and routes errors (401 -> logout) to toast.
   const run = useCallback(
-    async (fn: () => Promise<void>, opts: { refresh?: boolean; successText?: string } = {}) => {
+    async (fn: () => Promise<void>, opts: { refresh?: boolean; refreshProxies?: boolean; successText?: string } = {}) => {
       setBusy(true);
       try {
         await fn();
-        if (opts.refresh !== false) await loadPublic(token);
+        if (opts.refreshProxies) await loadProxyPage(proxyPagination.page, { silent: true });
+        else if (opts.refresh !== false) await loadPublic(token, { proxyPage: proxyPagination.page });
         if (opts.successText) pushToast(opts.successText, "success");
       } catch (err) {
         if (err instanceof ApiFetchError && err.status === 401) {
@@ -211,7 +238,7 @@ export function useConsoleData() {
         setBusy(false);
       }
     },
-    [loadPublic, token, pushToast, logout],
+    [loadPublic, loadProxyPage, proxyPagination.page, token, pushToast, logout],
   );
 
   // ---- API Key actions ----
@@ -336,23 +363,23 @@ export function useConsoleData() {
 
   // ---- Proxy actions ----
   const createProxy = (draft: ProxyDraft) =>
-    run(() => apiFetch("/admin/proxies", token, { method: "POST", body: JSON.stringify({ ...draft, type: draft.type as ProxyNode["type"] }) }).then(() => undefined), { successText: "代理节点已创建" });
+    run(() => apiFetch("/admin/proxies", token, { method: "POST", body: JSON.stringify({ ...draft, type: draft.type as ProxyNode["type"] }) }).then(() => undefined), { refreshProxies: true, successText: "代理节点已创建" });
 
   const toggleProxy = (proxy: ProxyNode) =>
-    run(() => apiFetch(`/admin/proxies/${proxy.id}`, token, { method: "PATCH", body: JSON.stringify({ enabled: !proxy.enabled }) }).then(() => undefined));
+    run(() => apiFetch(`/admin/proxies/${proxy.id}`, token, { method: "PATCH", body: JSON.stringify({ enabled: !proxy.enabled }) }).then(() => undefined), { refreshProxies: true });
 
   const testProxy = (proxy: ProxyNode) =>
-    run(() => apiFetch(`/admin/proxies/${proxy.id}/test`, token, { method: "POST" }).then(() => undefined), { successText: `代理「${proxy.name}」测试成功` });
+    run(() => apiFetch(`/admin/proxies/${proxy.id}/test`, token, { method: "POST" }).then(() => undefined), { refreshProxies: true, successText: `代理「${proxy.name}」测试成功` });
 
   const deleteProxy = (proxy: ProxyNode) =>
-    run(() => apiFetch(`/admin/proxies/${proxy.id}`, token, { method: "DELETE" }).then(() => undefined), { successText: `已删除代理「${proxy.name}」` });
+    run(() => apiFetch(`/admin/proxies/${proxy.id}`, token, { method: "DELETE" }).then(() => undefined), { refreshProxies: true, successText: `已删除代理「${proxy.name}」` });
 
   const clearProxyStats = (proxy: ProxyNode) =>
-    run(() => apiFetch(`/admin/proxies/${proxy.id}/stats/clear`, token, { method: "POST" }).then(() => undefined), { successText: `已清空代理「${proxy.name}」统计` });
+    run(() => apiFetch(`/admin/proxies/${proxy.id}/stats/clear`, token, { method: "POST" }).then(() => undefined), { refreshProxies: true, successText: `已清空代理「${proxy.name}」统计` });
 
   const refresh = useCallback(async (options: { silent?: boolean } = {}) => {
     try {
-      await loadPublic(token, options);
+      await loadPublic(token, { ...options, proxyPage: proxyPagination.page });
       if (!options.silent) pushToast("已刷新数据", "success");
     } catch (err) {
       if (err instanceof ApiFetchError && err.status === 401) {
@@ -361,7 +388,7 @@ export function useConsoleData() {
         pushToast(err instanceof Error ? err.message : "刷新失败", "error");
       }
     }
-  }, [loadPublic, logout, pushToast, token]);
+  }, [loadPublic, logout, proxyPagination.page, pushToast, token]);
 
   return {
     // state
@@ -376,6 +403,7 @@ export function useConsoleData() {
     modelAliases,
     settings,
     proxies,
+    proxyPagination,
     runtime,
     metricsData,
     busy,
@@ -408,6 +436,7 @@ export function useConsoleData() {
     testProxy,
     deleteProxy,
     clearProxyStats,
+    loadProxyPage,
     refresh,
   };
 }

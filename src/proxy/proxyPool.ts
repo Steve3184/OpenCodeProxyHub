@@ -133,6 +133,24 @@ export class ProxyPoolStore {
     return this.proxies.map((proxy) => ({ ...proxy }));
   }
 
+  listPage(page = 1, pageSize = 200): { items: ProxyNode[]; total: number; page: number; pageSize: number; pageCount: number } {
+    this.resetDailyIfNeeded();
+
+    const safePageSize = Number.isInteger(pageSize) && pageSize > 0 ? Math.min(pageSize, 200) : 200;
+    const total = this.proxies.length;
+    const pageCount = Math.max(1, Math.ceil(total / safePageSize));
+    const safePage = Number.isInteger(page) && page > 0 ? Math.min(page, pageCount) : 1;
+    const start = (safePage - 1) * safePageSize;
+
+    return {
+      items: this.proxies.slice(start, start + safePageSize).map((proxy) => ({ ...proxy })),
+      total,
+      page: safePage,
+      pageSize: safePageSize,
+      pageCount,
+    };
+  }
+
   create(input: ProxyInput): ProxyNode {
     const node = this.buildNode(input);
     this.validateNode(node);

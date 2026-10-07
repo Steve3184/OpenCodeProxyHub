@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { motion } from "motion/react";
 import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Network, Plus, RotateCcw, Route, Trash2 } from "lucide-react";
 import { Card } from "@/components/ui/card";
@@ -27,23 +27,22 @@ const stateBadge = (proxy: ProxyNode): { label: string; variant: "muted" | "warn
 };
 
 export function ProxyView({ data }: { data: ConsoleData }) {
-  const { proxies, busy, createProxy, toggleProxy, testProxy, deleteProxy, clearProxyStats } = data;
+  const { proxies, proxyPagination, busy, loadProxyPage, createProxy, toggleProxy, testProxy, deleteProxy, clearProxyStats } = data;
   const [draft, setDraft] = useState<ProxyDraft>({ name: "", type: "http", url: "", dailyRequestLimit: 1000, maxConcurrency: 10 });
   const [deleteTarget, setDeleteTarget] = useState<ProxyNode | null>(null);
   const [statsTarget, setStatsTarget] = useState<ProxyNode | null>(null);
   const [showProxyDetails, setShowProxyDetails] = useState(false);
-  const [proxyPage, setProxyPage] = useState(1);
-  const pageSize = 200;
-  const pageCount = Math.max(1, Math.ceil(proxies.length / pageSize));
+  const proxyPage = proxyPagination.page;
+  const pageSize = proxyPagination.pageSize;
+  const pageCount = proxyPagination.pageCount;
+  const totalProxies = proxyPagination.total;
+  const visibleProxies = proxies;
 
-  const visibleProxies = useMemo(() => {
-    const safePage = Math.min(proxyPage, pageCount);
-    return proxies.slice((safePage - 1) * pageSize, safePage * pageSize);
-  }, [proxies, proxyPage, pageCount]);
-
-  useEffect(() => {
-    if (proxyPage > pageCount) setProxyPage(pageCount);
-  }, [proxyPage, pageCount]);
+  const changeProxyPage = (page: number) => {
+    const nextPage = Math.max(1, Math.min(page, pageCount));
+    if (nextPage === proxyPage || busy) return;
+    void loadProxyPage(nextPage);
+  };
 
   const prioritized = useMemo(() => {
     const now = Date.now();
@@ -130,7 +129,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
         </div>
       </Card>
 
-      {proxies.length === 0 && (
+      {totalProxies === 0 && (
         <Card className="p-8">
           <div className="flex flex-col items-center text-center">
             <span className="grid h-12 w-12 place-items-center rounded-lg bg-muted/40 text-muted-foreground">
@@ -179,7 +178,8 @@ export function ProxyView({ data }: { data: ConsoleData }) {
 
                 {(() => {
                   const total = proxy.successCount + proxy.failCount;
-                  const rate = total === 0 ? "—" : `${Math.round((proxy.successCount / total) * 100)}%`;
+                  const ratePercent = total === 0 ? 0 : Math.round((proxy.successCount / total) * 100);
+                  const rate = total === 0 ? "—" : `${ratePercent}%`;
                   return (
                     <div className="mt-3 space-y-1.5">
                       <div className="flex items-center justify-between text-xs">
@@ -189,6 +189,19 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                         <span className="tabular-nums text-muted-foreground">
                           总 {total} · 成 {proxy.successCount} · 败 {proxy.failCount}
                         </span>
+                      </div>
+                      <div
+                        className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+                        role="progressbar"
+                        aria-label={`成功率 ${rate}`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={ratePercent}
+                      >
+                        <div
+                          className={cn("h-full rounded-full transition-[width]", ratePercent >= 80 ? "bg-success" : ratePercent >= 50 ? "bg-warning" : "bg-destructive")}
+                          style={{ width: `${ratePercent}%` }}
+                        />
                       </div>
                       <ResultStrip results={proxy.recentResults || []} />
                     </div>
@@ -248,11 +261,10 @@ export function ProxyView({ data }: { data: ConsoleData }) {
         })}
       </motion.div>
 
-      {proxies.length > 0 && (
+      {totalProxies > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-4 py-3">
           <span className="text-xs text-muted-foreground">
-            共 {proxies.length} 个代理，每页 {pageSize} 个
-            {pageCount > 1 && <> · 第 {proxyPage}/{pageCount} 页</>}
+            共 {totalProxies} 个代理，每页 {pageSize} 个 · 第 {proxyPagination.page}/{pageCount} 页
           </span>
           {pageCount > 1 && (
             <div className="flex items-center gap-2">
@@ -260,7 +272,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                 variant="outline"
                 size="sm"
                 disabled={proxyPage <= 1}
-                onClick={() => setProxyPage((page) => Math.max(1, page - 1))}
+                onClick={() => changeProxyPage(proxyPage - 1)}
               >
                 <ChevronLeft size={16} /> 上一页
               </Button>
@@ -268,7 +280,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                 variant="outline"
                 size="sm"
                 disabled={proxyPage >= pageCount}
-                onClick={() => setProxyPage((page) => Math.min(pageCount, page + 1))}
+                onClick={() => changeProxyPage(proxyPage + 1)}
               >
                 下一页 <ChevronRight size={16} />
               </Button>

@@ -28,6 +28,16 @@ interface LoginBody {
   password?: string;
 }
 
+interface ProxyListQuery {
+  page?: string | number;
+  pageSize?: string | number;
+}
+
+const positiveInteger = (value: unknown, fallback: number): number => {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 export const registerAdminRoutes = async (
   app: FastifyInstance,
   config: AppConfig,
@@ -224,7 +234,11 @@ export const registerAdminRoutes = async (
     }
   });
 
-  app.get("/admin/proxies", async () => ({ data: proxyPool.list() }));
+  app.get<{ Querystring: ProxyListQuery }>("/admin/proxies", async (request) => {
+    const page = positiveInteger(request.query.page, 1);
+    const pageSize = Math.min(200, positiveInteger(request.query.pageSize, 200));
+    return { data: proxyPool.listPage(page, pageSize) };
+  });
 
   app.get("/admin/runtime", async () => ({
     data: {

@@ -64,6 +64,14 @@ export interface SystemSettings {
   apiKeyMaxConcurrentStreams: number;
 }
 
+export interface ProxyPage {
+  items: ProxyNode[];
+  total: number;
+  page: number;
+  pageSize: number;
+  pageCount: number;
+}
+
 export interface ProxyNode {
   id: string;
   name: string;
