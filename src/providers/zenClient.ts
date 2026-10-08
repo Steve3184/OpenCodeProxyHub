@@ -11,6 +11,7 @@ import { normalizeResponsesRequest } from "../converters/openAiResponses.js";
 import { aggregateUpstreamBody, type UpstreamProtocol } from "../converters/streamAggregator.js";
 import { DownstreamToolCallFilter, ResponsesStreamToolFilter, applyToolFilterToChatCompletion, applyToolFilterToResponsesResponse, toUpstreamMessages, toUpstreamToolChoice, toUpstreamTools, type ToolNameMapper } from "../converters/toolMapping.js";
 import { isOpenCodeProxyAccessError, isUpstreamRateLimitError, shouldRetryWithAnotherProxy } from "./opencodeAccessErrors.js";
+import { EXO_FREE_CLAUDE_MAX_BACKEND_RETRIES, ExoStreamGate, classifyExoBackendFromAggregated, exoBackendMismatchMessage, isExoClaudeGateApplicable } from "./exoClaudeGate.js";
 
 const OC_VERSION = "1.18.31";
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
@@ -130,7 +131,9 @@ export const requestZenFull = (
   retryCount = 0,
   protocol: UpstreamProtocol = "chat_completions",
   maxRetries = 1,
+  exoRetryCount = 0,
 ): Promise<ZenFullResponse> => {
+  const exoGated = isExoClaudeGateApplicable(prepared.body, protocol === "responses");
   return new Promise((resolve, reject) => {
     if (prepared.lease?.requiredUnavailable) {
       reject(new Error(noProxyAvailableError));
@@ -160,6 +163,20 @@ export const requestZenFull = (
         const proxyAccessError = isOpenCodeProxyAccessError(status, raw);
         const retryableProxyError = rateLimited || proxyAccessError;
         const effectiveErrorStatus = rateLimited ? 429 : (status >= 400 ? status : protocolError ? 502 : status);
+        // exo-free only: a GPT backend (resp_ id) is a valid reply, but the
+        // caller asked for Claude, so discard it and retry with a fresh
+        // x-opencode-request until the Claude backend answers.
+        if (exoGated && status >= 200 && status < 300 && !protocolError && classifyExoBackendFromAggregated(data) === "gpt") {
+          if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);
+          if (exoRetryCount < EXO_FREE_CLAUDE_MAX_BACKEND_RETRIES && retryPrepare) {
+            const retryPrepared = retryPrepare(new Set());
+            requestZenFull(retryPrepared, proxyPool, metrics, retryPrepare, retryCount, protocol, maxRetries, exoRetryCount + 1).then(resolve, reject);
+            return;
+          }
+          metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "exo-free non-Claude backend" });
+          resolve({ status: 502, data: { error: { message: exoBackendMismatchMessage(exoRetryCount + 1), type: "upstream_error" } }, raw: "" });
+          return;
+        }
         if (prepared.lease?.node && proxyPool) {
           if (rateLimited) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429, leaseId: prepared.lease.leaseId });
           else if (status >= 200 && status < 300 && !protocolError) {
@@ -243,6 +260,7 @@ export const pipeZenOpenAIResponse = (
   toolMapper?: ToolNameMapper,
   responsesProtocol = false,
   maxRetries = 1,
+  exoRetryCount = 0,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -368,6 +386,7 @@ export const pipeZenOpenAIResponse = (
     const retryPrepared = retryPrepare(excluded);
     if (retryPrepared.lease?.requiredUnavailable) return false;
     retryStarted = true;
+    res.setMaxListeners(0);
     const nextRetryPrepare = (additional: ReadonlySet<string>) => {
       const allExcluded = new Set(excluded);
       for (const id of additional) allExcluded.add(id);
@@ -388,13 +407,28 @@ export const pipeZenOpenAIResponse = (
       res.end(errorBody(`Upstream error: ${message}`, false));
     }
   };
+  // exo-free only: hold the stream until the first id reveals the backend.
+  // `msg_` (Claude) flushes the buffered chunks downstream; `resp_` (GPT)
+  // aborts and retries with a fresh x-opencode-request.
+  const exoGated = isExoClaudeGateApplicable(prepared.body, responsesProtocol);
+  const exoGate = exoGated && stream ? new ExoStreamGate() : undefined;
+  const retryExoBackend = (): boolean => {
+    if (exoRetryCount >= EXO_FREE_CLAUDE_MAX_BACKEND_RETRIES || !retryPrepare || res.headersSent) return false;
+    if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);
+    retryStarted = true;
+    // Each retry re-registers close/finish listeners; lift the default cap.
+    res.setMaxListeners(0);
+    const retryPrepared = retryPrepare(new Set());
+    pipeZenOpenAIResponse(retryPrepared, stream, res, proxyPool, metrics, retryPrepare, retryCount, responseModel, streamTransform, toolMapper, responsesProtocol, maxRetries, exoRetryCount + 1);
+    return true;
+  };
   let req: ReturnType<typeof https.request>;
   try {
     req = https.request(prepared.options, (zenRes) => {
     let firstChunk: Buffer | null = null;
     let headersSent = false;
 
-    zenRes.on("data", (chunk: Buffer) => {
+    const processChunk = (chunk: Buffer): void => {
       if (settled || retryStarted) return;
       const status = zenRes.statusCode || 502;
       if (status >= 400) {
@@ -456,9 +490,40 @@ export const pipeZenOpenAIResponse = (
         return;
       }
       if (headersSent) res.write(transformStreamChunk(chunk));
+    };
+
+    zenRes.on("data", (chunk: Buffer) => {
+      if (!exoGate || exoGate.decided) {
+        processChunk(chunk);
+        return;
+      }
+      // Hold chunks until the backend is known; on Claude, replay them through
+      // the normal pipeline; on GPT, abort the request and retry.
+      if (settled || retryStarted) return;
+      const decision = exoGate.push(chunk);
+      if (decision === "pending") return;
+      if (decision === "gpt") {
+        settled = true;
+        zenRes.resume();
+        if (!retryExoBackend()) {
+          metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "exo-free non-Claude backend" });
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(errorBody(exoBackendMismatchMessage(exoRetryCount + 1), false));
+          }
+        }
+        return;
+      }
+      for (const buffered of exoGate.drain()) processChunk(buffered);
     });
 
     zenRes.on("end", () => {
+      if (settled || retryStarted) return;
+      // A stream that ended before the backend was decided (no classifiable id
+      // at all): fail open and replay whatever was buffered.
+      if (exoGate && !exoGate.decided) {
+        for (const buffered of exoGate.drain()) processChunk(buffered);
+      }
       if (settled || retryStarted) return;
       settled = true;
       const status = zenRes.statusCode || 502;
@@ -471,6 +536,17 @@ export const pipeZenOpenAIResponse = (
         nonStreamData = aggregateUpstreamBody(upstreamBody, responsesProtocol ? "responses" : "chat_completions");
         protocolError = !nonStreamData || Boolean(nonStreamData.error) || nonStreamData.type === "error";
         if (nonStreamData) usageAccumulator.observe(nonStreamData);
+      }
+      // exo-free non-stream caller: the GPT backend must be rejected too.
+      if (exoGated && aggregateUpstream && !protocolError && nonStreamData
+        && classifyExoBackendFromAggregated(nonStreamData) === "gpt") {
+        if (retryExoBackend()) return;
+        metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "exo-free non-Claude backend" });
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(errorBody(exoBackendMismatchMessage(exoRetryCount + 1), false));
+        }
+        return;
       }
       const upstreamErrorRaw = status >= 400 ? responseErrorBody : upstreamBody;
       const rateLimited = isUpstreamRateLimitError(status, upstreamErrorRaw);

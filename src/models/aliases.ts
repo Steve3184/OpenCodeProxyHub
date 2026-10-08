@@ -1,4 +1,14 @@
 import { JsonFileStore } from "../storage/jsonFile.js";
+import { EXO_CLAUDE_DOWNSTREAM_MODEL_ID, EXO_FREE_MODEL_ID } from "../providers/exoClaudeGate.js";
+
+/**
+ * Built-in aliases merged on load so upgrades surface them without touching
+ * user-configured entries. `claude-opus-5.5` points at the Claude-locked
+ * `exo-free` upstream; a user alias for the same downstream id always wins.
+ */
+export const DEFAULT_MODEL_ALIASES: ReadonlyArray<ModelAlias> = [
+  { downstreamModelId: EXO_CLAUDE_DOWNSTREAM_MODEL_ID, upstreamModelId: EXO_FREE_MODEL_ID },
+];
 
 export interface ModelAlias {
   downstreamModelId: string;
@@ -29,7 +39,7 @@ export class ModelAliasStore {
 
   load(): void {
     const data = this.store.read({ version: 1, onlyConfiguredAliases: false, aliases: [] });
-    this.config = this.normalize(data);
+    this.config = this.mergeDefaultAliases(this.normalize(data));
     this.persist();
   }
 
@@ -56,12 +66,23 @@ export class ModelAliasStore {
       upstreamModelId: String(alias.upstreamModelId || "").trim(),
     }));
     this.validateAliases(nextAliases);
-    this.config = {
+    this.config = this.mergeDefaultAliases({
       onlyConfiguredAliases: input.onlyConfiguredAliases === undefined ? this.config.onlyConfiguredAliases : Boolean(input.onlyConfiguredAliases),
       aliases: nextAliases,
-    };
+    });
     this.persist();
     return this.get();
+  }
+
+  private mergeDefaultAliases(config: ModelAliasConfig): ModelAliasConfig {
+    const existing = new Set(config.aliases.map((alias) => alias.downstreamModelId));
+    const merged = [...config.aliases];
+    for (const alias of DEFAULT_MODEL_ALIASES) {
+      if (existing.has(alias.downstreamModelId)) continue;
+      existing.add(alias.downstreamModelId);
+      merged.push({ ...alias });
+    }
+    return { onlyConfiguredAliases: config.onlyConfiguredAliases, aliases: merged };
   }
 
   private normalize(data: Partial<ModelAliasFile>): ModelAliasConfig {

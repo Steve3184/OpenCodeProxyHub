@@ -19,6 +19,7 @@
     "check:tools": "tsx scripts/tool-mapping-check.ts",
     "check:systemone": "tsx scripts/systemone-routing-check.ts",
     "check:proxy-routing": "tsx scripts/proxy-routing-check.ts",
+    "check:exo-gate": "tsx scripts/exo-claude-gate-check.ts",
     "check:models-transport": "tsx scripts/models-transport-check.ts",
     "check:json-store": "tsx scripts/json-store-check.ts",
     "check:retry-settings": "tsx scripts/retry-settings-check.ts"

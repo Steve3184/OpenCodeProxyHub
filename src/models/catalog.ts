@@ -2,6 +2,7 @@
 
 export const DEFAULT_MODELS = [
   "big-pickle",
+  "exo-free",
   "nemotron-3-ultra-free",
   "nemotron-3.5-lightning-free",
   "mimo-v2.5-free",

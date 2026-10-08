@@ -9,6 +9,7 @@ import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
 import { createTokenUsageAccumulator } from "../utils/tokenUsage.js";
 import type { ToolNameMapper } from "./toolMapping.js";
+import { EXO_FREE_CLAUDE_MAX_BACKEND_RETRIES, ExoStreamGate, exoBackendMismatchMessage, isExoClaudeGateApplicable } from "../providers/exoClaudeGate.js";
 
 export const anthropicToOpenAI = (body: AnthropicMessageRequest): { messages: unknown[]; tools?: unknown[]; toolChoice?: unknown; parameters: Record<string, unknown> } => {
   const messages: any[] = [];
@@ -175,6 +176,7 @@ export const pipeZenAsAnthropic = (
   retryCount = 0,
   toolMapper?: ToolNameMapper,
   maxRetries = 1,
+  exoRetryCount = 0,
 ): void => {
   if (prepared.lease?.requiredUnavailable) {
     res.writeHead(503, { "Content-Type": "application/json" });
@@ -187,6 +189,17 @@ export const pipeZenAsAnthropic = (
   let markedFailure = false;
   let retryStarted = false;
   let settled = false;
+  const exoGated = isExoClaudeGateApplicable(prepared.body);
+  const exoGate = exoGated ? new ExoStreamGate() : undefined;
+  const retryExoBackend = (): boolean => {
+    if (exoRetryCount >= EXO_FREE_CLAUDE_MAX_BACKEND_RETRIES || !retryPrepare || res.headersSent) return false;
+    if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);
+    retryStarted = true;
+    // Each retry re-registers close listeners; lift the default cap.
+    res.setMaxListeners(0);
+    pipeZenAsAnthropic(retryPrepare(new Set()), model, res, inputTokens, proxyPool, metrics, retryPrepare, retryCount, toolMapper, maxRetries, exoRetryCount + 1);
+    return true;
+  };
   const req = https.request(prepared.options, (zenRes) => {
     let headersSent = false;
     let buffer = "";
@@ -263,7 +276,7 @@ export const pipeZenAsAnthropic = (
       });
     };
 
-    zenRes.on("data", (chunk: Buffer) => {
+    const processChunk = (chunk: Buffer): void => {
       if (settled || retryStarted) return;
       const str = chunk.toString();
       if ((zenRes.statusCode || 502) >= 400) {
@@ -389,9 +402,36 @@ export const pipeZenAsAnthropic = (
           sendSSE("message_stop", { type: "message_stop" });
         }
       }
+    };
+
+    zenRes.on("data", (chunk: Buffer) => {
+      if (!exoGate || exoGate.decided) {
+        processChunk(chunk);
+        return;
+      }
+      if (settled || retryStarted) return;
+      const decision = exoGate.push(chunk);
+      if (decision === "pending") return;
+      if (decision === "gpt") {
+        settled = true;
+        zenRes.resume();
+        if (!retryExoBackend()) {
+          metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "exo-free non-Claude backend" });
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ type: "error", error: { type: "upstream_error", message: exoBackendMismatchMessage(exoRetryCount + 1) } }));
+          }
+        }
+        return;
+      }
+      for (const buffered of exoGate.drain()) processChunk(buffered);
     });
 
     zenRes.on("end", () => {
+      if (settled || retryStarted) return;
+      if (exoGate && !exoGate.decided) {
+        for (const buffered of exoGate.drain()) processChunk(buffered);
+      }
       if (settled || retryStarted) return;
       settled = true;
       const status = zenRes.statusCode || 502;

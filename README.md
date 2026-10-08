@@ -30,6 +30,7 @@ OpenCodeProxyHub 默认内置以下免费模型；其中 Jev 可通过 TypeSafe 
 | 模型 ID | 说明 |
 |--------|------|
 | `big-pickle` | OpenCode 免费模型 |
+| `exo-free` | 上游随机路由到 GPT/Claude 的免费模型；本代理强制只放行 Claude 后端 |
 | `nemotron-3-ultra-free` | Nvidia Nemotron 3 Ultra 免费模型 |
 | `nemotron-3.5-lightning-free` | Nvidia Nemotron 3.5 Lightning 免费模型 |
 | `mimo-v2.5-free` | Mimo v2.5 免费模型 |
@@ -40,6 +41,10 @@ OpenCodeProxyHub 默认内置以下免费模型；其中 Jev 可通过 TypeSafe 
 | `jev-1.13-free` | Jev 1.13 免费模型（**仅 System One，不支持聊天/Responses/Anthropic 协议**） |
 
 新部署会自动生成以上默认模型；已有部署升级后，缺失的默认免费模型会自动追加到已有 `models.json`，不会覆盖用户已修改的模型配置。已下线的模型（如 `deepseek-v4-flash-free`、`hy3-free`、`laguna-s-2.1-free`）会在升级时自动禁用并标记下线原因，用户无需手动清理。
+
+### exo-free 的 Claude 后端锁定
+
+上游 `exo-free` 会随机路由到 GPT 或 Claude 后端。两者的响应都是 OpenAI Chat Completions SSE，但第一个带 `id` 的数据块可以区分：`msg_` 开头是 Claude，`resp_` 开头是 GPT。本代理对 `exo-free` 的 Chat Completions 请求先看第一个 `id`：是 Claude 就照常把内容传回去，是 GPT 就断开并换一个全新的 `x-opencode-request` 重新请求，最多重试 10 次（共 11 次上游尝试），仍失败则返回错误。默认别名 `claude-opus-5.5` 指向该 Claude 锁定链路，可直接使用。
 
 ## 部署方式
 
