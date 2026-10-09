@@ -351,9 +351,19 @@ REQUIRE_PROXY=false                     # 兼容旧配置；未设置 PROXY_MODE
 PROXY_HEALTH_CHECK_MODEL=big-pickle        # 429/异常自动恢复探测使用的模型
 PROXY_HEALTH_CHECK_TIMEOUT_MS=10000     # 单次恢复探测超时（毫秒）
 PROXY_RECOVERY_INTERVAL_MS=600000       # 429/异常自动恢复探测间隔（默认 10 分钟）
+PROXY_RECOVERY_CONCURRENCY=2            # 每轮恢复探测并发数（小机器建议 1-2）
+PROXY_RECOVERY_BATCH_SIZE=32            # 每轮最多探测节点数，避免大代理池打满 CPU
+PROXY_PERSIST_DEBOUNCE_MS=1000          # 代理状态批量落盘延迟，避免每次请求全量写文件
+PROXY_LARGE_POOL_WARNING_THRESHOLD=10000 # 超过此规模启动时输出性能保护警告
 ```
 
 设置项中的 `upstreamTimeoutMs`、代理使用模式、前置代理开关与地址等也可在运行时通过控制台或 `PATCH /admin/settings` **热更新**，无需重启。
+
+## 大规模代理池性能保护
+
+代理池的静态配置保留在 `PROXIES_FILE`，运行时计数、租约相关状态和错误统计批量写入同目录的 `PROXIES_FILE.state.log` 增量日志，并在日志达到阈值时压缩到 `PROXIES_FILE.state`。请求路径不会再同步重写完整代理配置；状态更新会在短暂 debounce 后合并落盘，进程优雅退出时会主动 flush。
+
+恢复探测默认每轮最多探测 32 个节点、并发 2 个，可通过上面的环境变量调整。
 
 ## 出口代理与前置代理
 

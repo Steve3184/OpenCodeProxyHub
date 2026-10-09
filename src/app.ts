@@ -77,8 +77,15 @@ export const buildApp = async (config: AppConfig) => {
       recoveryIntervalMs: config.proxyRecoveryIntervalMs,
     };
   };
-  const proxyPool = new ProxyPoolStore(config.proxiesFile, settingsStore);
-  proxyPool.load();
+  const proxyPool = new ProxyPoolStore(config.proxiesFile, settingsStore, {
+    persistDebounceMs: config.proxyPersistDebounceMs,
+    recoveryConcurrency: config.proxyRecoveryConcurrency,
+    recoveryBatchSize: config.proxyRecoveryBatchSize,
+  });
+  const proxyCount = proxyPool.load();
+  if (proxyCount >= config.proxyLargePoolWarningThreshold) {
+    app.log.warn({ proxyCount, threshold: config.proxyLargePoolWarningThreshold }, "large_proxy_pool_performance_protection_enabled");
+  }
   const proxyRecoveryTimer = setInterval(() => {
     void proxyPool.recoverRateLimitedProxies(proxyHealthCheckOptions()).then((summary) => {
       if (summary.tested > 0) app.log.info(summary, "proxy_recovery_check_completed");
@@ -101,6 +108,7 @@ export const buildApp = async (config: AppConfig) => {
     clearInterval(proxyRecoveryTimer);
     const drained = await requestTracker.drain(config.shutdownDrainTimeoutMs);
     if (!drained) app.log.warn({ runtime: requestTracker.snapshot() }, "shutdown_drain_timeout");
+    await proxyPool.flush();
     await limiter.close();
   });
 

@@ -11,6 +11,8 @@ models.json
 model-aliases.json
 settings.json
 proxies.json
+*.json.state
+*.json.state.log
 data/
 *.tsbuildinfo
 

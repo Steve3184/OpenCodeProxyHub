@@ -44,8 +44,42 @@ export interface ProxyRequestResult {
 }
 
 interface ProxyFile {
+  version: 1 | 2;
+  proxies: ProxyNode[] | ProxyStaticNode[];
+}
+
+type ProxyStaticNode = Pick<ProxyNode,
+  "id" | "name" | "type" | "url" | "enabled" | "weight" | "maxConcurrency"
+  | "dailyRequestLimit" | "autoDisableWhenDailyLimitReached">;
+
+interface ProxyState {
+  enabled: boolean;
+  dailyRequestCount: number;
+  dailyCountDate: string;
+  consecutiveRateLimitCount: number;
+  autoDisabledBy429: boolean;
+  lastRecoveryTestAt: string | null;
+  cooldownUntil: string | null;
+  successCount: number;
+  failCount: number;
+  totalTokens: number;
+  dailyTokens: number;
+  dailyTokensDate: string;
+  recentResults: ProxyRequestResult[];
+  lastError: string | null;
+  lastUsedAt: string | null;
+  lastCheckedAt: string | null;
+}
+
+interface ProxyStateFile {
   version: 1;
-  proxies: ProxyNode[];
+  states: Record<string, ProxyState>;
+}
+
+interface ProxyStateJournalEntry {
+  id: string;
+  state?: ProxyState;
+  deleted?: boolean;
 }
 
 export interface ProxyInput {
@@ -82,6 +116,12 @@ export interface ProxyRecoverySummary {
   recovered: number;
 }
 
+export interface ProxyPoolOptions {
+  persistDebounceMs?: number;
+  recoveryConcurrency?: number;
+  recoveryBatchSize?: number;
+}
+
 interface RecoveryProbeState {
   enabled: boolean;
   autoDisabledBy429: boolean;
@@ -114,18 +154,49 @@ const today = () => new Date().toISOString().slice(0, 10);
 
 export class ProxyPoolStore {
   private readonly store: JsonFileStore<ProxyFile>;
+  private readonly stateStore: JsonFileStore<ProxyStateFile>;
+  private readonly stateJournal: JsonFileStore<ProxyStateJournalEntry>;
+  private readonly persistDebounceMs: number;
+  private readonly recoveryConcurrency: number;
+  private readonly recoveryBatchSize: number;
   private proxies: ProxyNode[] = [];
+  private readonly proxiesById = new Map<string, ProxyNode>();
   private readonly recoveryTestsInFlight = new Set<string>();
   private readonly activeLeases = new Map<string, string>();
+  private recoveryRunInFlight = false;
+  private configPersistTimer: NodeJS.Timeout | undefined;
+  private statePersistTimer: NodeJS.Timeout | undefined;
+  private configDirty = false;
+  private stateDirty = false;
+  private readonly dirtyStateIds = new Set<string>();
+  private readonly deletedStateIds = new Set<string>();
+  private configFlushPromise: Promise<void> | undefined;
+  private stateFlushPromise: Promise<void> | undefined;
+  private writeQueue = Promise.resolve();
 
-  constructor(proxiesFile: string, private readonly settingsStore: SettingsStore) {
+  constructor(proxiesFile: string, private readonly settingsStore: SettingsStore, options: ProxyPoolOptions = {}) {
     this.store = new JsonFileStore<ProxyFile>(proxiesFile);
+    this.stateStore = new JsonFileStore<ProxyStateFile>(`${proxiesFile}.state`);
+    this.stateJournal = new JsonFileStore<ProxyStateJournalEntry>(`${proxiesFile}.state.log`);
+    this.persistDebounceMs = Math.max(100, options.persistDebounceMs ?? 1000);
+    this.recoveryConcurrency = Math.max(1, Math.min(16, options.recoveryConcurrency ?? 2));
+    this.recoveryBatchSize = Math.max(1, Math.min(1000, options.recoveryBatchSize ?? 32));
   }
 
-  load(): void {
+  load(): number {
     const data = this.store.read({ version: 1, proxies: [] });
-    this.proxies = data.proxies.map((node) => this.normalizeDaily(node));
-    this.persist();
+    const stateData = this.stateStore.read({ version: 1, states: {} });
+    const states: Record<string, ProxyState> = {
+      ...(stateData && typeof stateData.states === "object" && stateData.states !== null ? stateData.states : {}),
+    };
+    for (const entry of this.stateJournal.readLines()) {
+      if (entry.deleted) delete states[entry.id];
+      else if (entry.state) states[entry.id] = entry.state;
+    }
+    this.proxies = (data.proxies as ProxyNode[]).map((node) => this.normalizeDaily({ ...node, ...(states[node.id] || {}) }));
+    this.proxiesById.clear();
+    for (const node of this.proxies) this.proxiesById.set(node.id, node);
+    return this.proxies.length;
   }
 
   list(): ProxyNode[] {
@@ -135,12 +206,15 @@ export class ProxyPoolStore {
 
   summary(): { total: number; enabled: number; dailyRequestCount: number; dailyTokens: number } {
     this.resetDailyIfNeeded();
-    return {
-      total: this.proxies.length,
-      enabled: this.proxies.filter((proxy) => proxy.enabled).length,
-      dailyRequestCount: this.proxies.reduce((sum, proxy) => sum + proxy.dailyRequestCount, 0),
-      dailyTokens: this.proxies.reduce((sum, proxy) => sum + proxy.dailyTokens, 0),
-    };
+    let enabled = 0;
+    let dailyRequestCount = 0;
+    let dailyTokens = 0;
+    for (const proxy of this.proxies) {
+      if (proxy.enabled) enabled += 1;
+      dailyRequestCount += proxy.dailyRequestCount;
+      dailyTokens += proxy.dailyTokens;
+    }
+    return { total: this.proxies.length, enabled, dailyRequestCount, dailyTokens };
   }
 
   listPage(page = 1, pageSize = 200): { items: ProxyNode[]; total: number; page: number; pageSize: number; pageCount: number } {
@@ -165,7 +239,9 @@ export class ProxyPoolStore {
     const node = this.buildNode(input);
     this.validateNode(node);
     this.proxies.push(node);
-    this.persist();
+    this.proxiesById.set(node.id, node);
+    this.persistConfig();
+    this.persistState(node.id);
     return { ...node };
   }
 
@@ -195,7 +271,8 @@ export class ProxyPoolStore {
     if (input.autoDisableWhenDailyLimitReached !== undefined) node.autoDisableWhenDailyLimitReached = input.autoDisableWhenDailyLimitReached;
 
     this.validateNode(node);
-    this.persist();
+    this.persistConfig();
+    this.persistState(node.id);
     return { ...node };
   }
 
@@ -206,23 +283,26 @@ export class ProxyPoolStore {
     for (const [leaseId, nodeId] of this.activeLeases) {
       if (nodeId === id) this.activeLeases.delete(leaseId);
     }
-    this.persist();
+    this.proxiesById.delete(id);
+    this.persistConfig();
+    this.persistState(id, true);
     return true;
   }
 
   acquire(excludeProxyIds: ReadonlySet<string> = new Set(), model?: string): ProxyLease {
     this.resetDailyIfNeeded();
     const now = Date.now();
-    const candidates = this.proxies
-      .filter((node) => node.enabled)
-      .filter((node) => !excludeProxyIds.has(node.id))
-      .filter((node) => isProxyCompatibleWithModel(node, model))
-      .filter((node) => !node.cooldownUntil || Date.parse(node.cooldownUntil) <= now)
-      .filter((node) => node.dailyRequestLimit === 0 || node.dailyRequestCount < node.dailyRequestLimit)
-      .filter((node) => node.currentConcurrency < node.maxConcurrency)
-      .sort((a, b) => b.weight - a.weight);
-
-    const node = candidates[0];
+    // Do not sort the entire pool for every request. With tens of thousands of
+    // nodes this changes acquire from O(n log n) to a single O(n) scan.
+    let node: ProxyNode | undefined;
+    for (const candidate of this.proxies) {
+      if (!candidate.enabled || excludeProxyIds.has(candidate.id)) continue;
+      if (!isProxyCompatibleWithModel(candidate, model)) continue;
+      if (candidate.cooldownUntil && Date.parse(candidate.cooldownUntil) > now) continue;
+      if (candidate.dailyRequestLimit !== 0 && candidate.dailyRequestCount >= candidate.dailyRequestLimit) continue;
+      if (candidate.currentConcurrency >= candidate.maxConcurrency) continue;
+      if (!node || candidate.weight > node.weight) node = candidate;
+    }
     if (!node) return { node: null, requiredUnavailable: this.settingsStore.get().proxyMode === "required" };
 
     // Construct the agent before mutating counters. A malformed persisted proxy
@@ -238,7 +318,7 @@ export class ProxyPoolStore {
       node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
       node.lastRecoveryTestAt = null;
       this.recordResult(node, false, 502);
-      this.persist();
+      this.persistState(node.id);
       // Try another node immediately; optional mode can still fall back to direct.
       return this.acquire(new Set([...excludeProxyIds, node.id]), model);
     }
@@ -246,7 +326,7 @@ export class ProxyPoolStore {
     node.dailyRequestCount += 1;
     node.lastUsedAt = new Date().toISOString();
     this.disableIfDailyLimitReached(node);
-    this.persist();
+    this.persistState(node.id);
 
     const leaseId = crypto.randomUUID();
     this.activeLeases.set(leaseId, node.id);
@@ -257,7 +337,7 @@ export class ProxyPoolStore {
     const node = this.find(id);
     if (!node) return;
     if (!this.takeLease(id, leaseId)) return;
-    this.persist();
+    this.persistState(id);
   }
 
   markSuccess(id: string, leaseId?: string, statusCode = 200): void {
@@ -270,7 +350,7 @@ export class ProxyPoolStore {
     this.recordResult(node, true, statusCode);
     if (!node.autoDisabledBy429) node.lastError = null;
     node.lastCheckedAt = new Date().toISOString();
-    this.persist();
+    this.persistState(id);
   }
 
   markFailure(id: string, error: string, options: { statusCode?: number; cooldownMs?: number; leaseId?: string } = {}): void {
@@ -298,7 +378,7 @@ export class ProxyPoolStore {
         node.lastRecoveryTestAt = null;
       }
     }
-    this.persist();
+    this.persistState(id);
   }
 
   recordTokenUsage(id: string, totalTokens: number): void {
@@ -309,7 +389,7 @@ export class ProxyPoolStore {
     if (tokens === 0) return;
     node.totalTokens += tokens;
     node.dailyTokens += tokens;
-    this.persist();
+    this.persistState(id);
   }
 
   clearStats(id: string): ProxyNode {
@@ -323,7 +403,7 @@ export class ProxyPoolStore {
     node.dailyTokens = 0;
     node.dailyTokensDate = today();
     node.recentResults = [];
-    this.persist();
+    this.persistState(id);
     return { ...node };
   }
 
@@ -349,90 +429,100 @@ export class ProxyPoolStore {
         node.lastRecoveryTestAt = null;
       }
       this.recordResult(node, true, statusCode);
-      this.persist();
+      this.persistState(id);
       return { ...node };
     } catch (error) {
       node.lastCheckedAt = checkedAt;
       if (node.autoDisabledBy429 && !node.enabled) node.lastRecoveryTestAt = checkedAt;
       node.lastError = error instanceof Error ? error.message : "Model health check failed";
       this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
-      this.persist();
+      this.persistState(id);
       throw error;
     }
   }
 
-  /** Probe 429-disabled nodes and cooled-down nodes currently shown as abnormal. */
+  /** Probe a bounded batch of abnormal nodes without overlapping recovery runs. */
   async recoverRateLimitedProxies(options: ProxyModelTestOptions): Promise<ProxyRecoverySummary> {
-    const now = Date.now();
-    const recoveryIntervalMs = options.recoveryIntervalMs ?? 10 * 60 * 1000;
-    const candidates = this.proxies.filter((node) => {
-      if (this.recoveryTestsInFlight.has(node.id)) return false;
-      if (!isProxyCompatibleWithModel(node, options.model)) return false;
-      return this.isRecoveryCandidate(node, now, recoveryIntervalMs);
-    });
-    if (candidates.length === 0) return { tested: 0, recovered: 0 };
+    if (this.recoveryRunInFlight) return { tested: 0, recovered: 0 };
+    this.recoveryRunInFlight = true;
+    try {
+      const now = Date.now();
+      const recoveryIntervalMs = options.recoveryIntervalMs ?? 10 * 60 * 1000;
+      const candidates = this.proxies.filter((node) => {
+        if (this.recoveryTestsInFlight.has(node.id)) return false;
+        if (!isProxyCompatibleWithModel(node, options.model)) return false;
+        return this.isRecoveryCandidate(node, now, recoveryIntervalMs);
+      }).sort((a, b) => {
+        const aTime = a.lastRecoveryTestAt ? Date.parse(a.lastRecoveryTestAt) : 0;
+        const bTime = b.lastRecoveryTestAt ? Date.parse(b.lastRecoveryTestAt) : 0;
+        return aTime - bTime;
+      }).slice(0, this.recoveryBatchSize);
+      if (candidates.length === 0) return { tested: 0, recovered: 0 };
 
-    const queue = [...candidates];
-    let tested = 0;
-    let recovered = 0;
-    const worker = async (): Promise<void> => {
-      while (queue.length > 0) {
-        const node = queue.shift();
-        if (!node) return;
-        const candidateNow = Date.now();
-        if (this.recoveryTestsInFlight.has(node.id) || !this.isRecoveryCandidate(node, candidateNow, recoveryIntervalMs)) continue;
+      const queue = [...candidates];
+      let tested = 0;
+      let recovered = 0;
+      const worker = async (): Promise<void> => {
+        while (queue.length > 0) {
+          const node = queue.shift();
+          if (!node) return;
+          const candidateNow = Date.now();
+          if (this.recoveryTestsInFlight.has(node.id) || !this.isRecoveryCandidate(node, candidateNow, recoveryIntervalMs)) continue;
 
-        this.recoveryTestsInFlight.add(node.id);
-        const recoveryTestAt = new Date().toISOString();
-        node.lastRecoveryTestAt = recoveryTestAt;
-        this.persist();
-        tested += 1;
-        const wasAutoDisabled = node.autoDisabledBy429 && !node.enabled;
-        const expectedState: RecoveryProbeState = {
-          enabled: node.enabled,
-          autoDisabledBy429: node.autoDisabledBy429,
-          currentConcurrency: node.currentConcurrency,
-          lastError: node.lastError,
-          lastCheckedAt: node.lastCheckedAt,
-          lastRecoveryTestAt: recoveryTestAt,
-          endpoint: this.proxyEndpoint(node),
-        };
-        try {
-          const statusCode = await this.requestModelHealthCheck(node, options);
-          if (!this.recoveryStateUnchanged(node, expectedState)) continue;
-          if (statusCode >= 200 && statusCode < 300) {
-            if (wasAutoDisabled) {
-              node.enabled = true;
-              node.autoDisabledBy429 = false;
-              node.consecutiveRateLimitCount = 0;
+          this.recoveryTestsInFlight.add(node.id);
+          const recoveryTestAt = new Date().toISOString();
+          node.lastRecoveryTestAt = recoveryTestAt;
+          this.persistState(node.id);
+          tested += 1;
+          const wasAutoDisabled = node.autoDisabledBy429 && !node.enabled;
+          const expectedState: RecoveryProbeState = {
+            enabled: node.enabled,
+            autoDisabledBy429: node.autoDisabledBy429,
+            currentConcurrency: node.currentConcurrency,
+            lastError: node.lastError,
+            lastCheckedAt: node.lastCheckedAt,
+            lastRecoveryTestAt: recoveryTestAt,
+            endpoint: this.proxyEndpoint(node),
+          };
+          try {
+            const statusCode = await this.requestModelHealthCheck(node, options);
+            if (!this.recoveryStateUnchanged(node, expectedState)) continue;
+            if (statusCode >= 200 && statusCode < 300) {
+              if (wasAutoDisabled) {
+                node.enabled = true;
+                node.autoDisabledBy429 = false;
+                node.consecutiveRateLimitCount = 0;
+              }
+              node.cooldownUntil = null;
+              node.lastRecoveryTestAt = null;
+              node.lastError = null;
+              recovered += 1;
+            } else {
+              node.lastError = `Model health check returned HTTP ${statusCode}`;
+              if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
             }
-            node.cooldownUntil = null;
-            node.lastRecoveryTestAt = null;
-            node.lastError = null;
-            recovered += 1;
-          } else {
-            node.lastError = `Model health check returned HTTP ${statusCode}`;
-            if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
-          }
-          node.lastCheckedAt = new Date().toISOString();
-          this.recordResult(node, statusCode >= 200 && statusCode < 300, statusCode);
-        } catch (error) {
-          if (this.recoveryStateUnchanged(node, expectedState)) {
-            node.lastError = error instanceof Error ? error.message : "Model health check failed";
-            if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
             node.lastCheckedAt = new Date().toISOString();
-            this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
+            this.recordResult(node, statusCode >= 200 && statusCode < 300, statusCode);
+          } catch (error) {
+            if (this.recoveryStateUnchanged(node, expectedState)) {
+              node.lastError = error instanceof Error ? error.message : "Model health check failed";
+              if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
+              node.lastCheckedAt = new Date().toISOString();
+              this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
+            }
+          } finally {
+            this.recoveryTestsInFlight.delete(node.id);
+            this.persistState(node.id);
           }
-        } finally {
-          this.recoveryTestsInFlight.delete(node.id);
-          this.persist();
         }
-      }
-    };
+      };
 
-    const workerCount = Math.min(4, candidates.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
-    return { tested, recovered };
+      const workerCount = Math.min(this.recoveryConcurrency, candidates.length);
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+      return { tested, recovered };
+    } finally {
+      this.recoveryRunInFlight = false;
+    }
   }
 
   private buildNode(input: ProxyInput): ProxyNode {
@@ -485,7 +575,6 @@ export class ProxyPoolStore {
 
   private resetDailyIfNeeded(): void {
     const current = today();
-    let changed = false;
     for (const node of this.proxies) {
       if (node.dailyCountDate !== current) {
         node.dailyCountDate = current;
@@ -494,34 +583,47 @@ export class ProxyPoolStore {
           node.enabled = true;
           node.lastError = null;
         }
-        changed = true;
+        this.persistState(node.id);
       }
       if (node.dailyTokensDate !== current) {
         node.dailyTokensDate = current;
         node.dailyTokens = 0;
-        changed = true;
+        this.persistState(node.id);
       }
     }
-    if (changed) this.persist();
   }
 
   private normalizeDaily(node: ProxyNode): ProxyNode {
     const current = today();
+    const dailyCountDate = node.dailyCountDate || current;
     const dailyTokensDate = node.dailyTokensDate || current;
+    const recentResults = Array.isArray(node.recentResults) ? node.recentResults : [];
     return {
       ...node,
+      name: typeof node.name === "string" && node.name.trim() ? node.name : "未命名代理",
+      type: node.type || "http",
+      url: typeof node.url === "string" ? node.url : "",
+      enabled: node.enabled !== false,
+      weight: Number.isFinite(node.weight) ? Math.max(1, Math.trunc(node.weight)) : 1,
+      maxConcurrency: Number.isFinite(node.maxConcurrency) ? Math.max(1, Math.trunc(node.maxConcurrency)) : 10,
       currentConcurrency: 0,
-      dailyCountDate: node.dailyCountDate || today(),
-      dailyRequestLimit: node.dailyRequestLimit || 0,
-      dailyRequestCount: node.dailyRequestCount || 0,
+      dailyCountDate: current,
+      dailyRequestLimit: Number.isFinite(node.dailyRequestLimit) ? Math.max(0, Math.trunc(node.dailyRequestLimit)) : 0,
+      dailyRequestCount: dailyCountDate === current && Number.isFinite(node.dailyRequestCount) ? Math.max(0, Math.trunc(node.dailyRequestCount)) : 0,
       autoDisableWhenDailyLimitReached: Boolean(node.autoDisableWhenDailyLimitReached),
-      consecutiveRateLimitCount: node.consecutiveRateLimitCount || 0,
+      consecutiveRateLimitCount: Number.isFinite(node.consecutiveRateLimitCount) ? Math.max(0, Math.trunc(node.consecutiveRateLimitCount)) : 0,
       autoDisabledBy429: Boolean(node.autoDisabledBy429 || (!node.enabled && node.lastError === "Disabled after 5 consecutive 429 responses")),
       lastRecoveryTestAt: node.lastRecoveryTestAt || null,
+      cooldownUntil: node.cooldownUntil || null,
+      successCount: Number.isFinite(node.successCount) ? Math.max(0, Math.trunc(node.successCount)) : 0,
+      failCount: Number.isFinite(node.failCount) ? Math.max(0, Math.trunc(node.failCount)) : 0,
       totalTokens: Number.isFinite(node.totalTokens) ? Math.max(0, Math.trunc(node.totalTokens)) : 0,
       dailyTokens: dailyTokensDate === current && Number.isFinite(node.dailyTokens) ? Math.max(0, Math.trunc(node.dailyTokens)) : 0,
       dailyTokensDate: current,
-      recentResults: node.recentResults || [],
+      recentResults,
+      lastError: node.lastError || null,
+      lastUsedAt: node.lastUsedAt || null,
+      lastCheckedAt: node.lastCheckedAt || null,
     };
   }
 
@@ -703,7 +805,7 @@ export class ProxyPoolStore {
   }
 
   private find(id: string): ProxyNode | undefined {
-    return this.proxies.find((node) => node.id === id);
+    return this.proxiesById.get(id);
   }
 
   private takeLease(id: string, leaseId?: string): boolean {
@@ -721,7 +823,159 @@ export class ProxyPoolStore {
     return true;
   }
 
-  private persist(): void {
-    this.store.write({ version: 1, proxies: this.proxies });
+  /** Flush pending config/state writes before shutdown or an administrative export. */
+  async flush(): Promise<void> {
+    if (this.configPersistTimer) {
+      clearTimeout(this.configPersistTimer);
+      this.configPersistTimer = undefined;
+    }
+    if (this.statePersistTimer) {
+      clearTimeout(this.statePersistTimer);
+      this.statePersistTimer = undefined;
+    }
+    do {
+      await Promise.all([this.flushConfig(), this.flushState()]);
+    } while (this.configDirty || this.stateDirty || this.configFlushPromise || this.stateFlushPromise);
+  }
+
+  private persistConfig(): void {
+    this.configDirty = true;
+    this.scheduleConfigPersist();
+  }
+
+  private persistState(id?: string, deleted = false): void {
+    this.stateDirty = true;
+    if (id) {
+      this.dirtyStateIds.add(id);
+      if (deleted) this.deletedStateIds.add(id);
+      else this.deletedStateIds.delete(id);
+    }
+    this.scheduleStatePersist();
+  }
+
+  private scheduleConfigPersist(): void {
+    if (this.configPersistTimer || this.configFlushPromise) return;
+    this.configPersistTimer = setTimeout(() => {
+      this.configPersistTimer = undefined;
+      void this.flushConfig().catch((error) => this.reportPersistenceError("config", error));
+    }, this.persistDebounceMs);
+    this.configPersistTimer.unref();
+  }
+
+  private scheduleStatePersist(): void {
+    if (this.statePersistTimer || this.stateFlushPromise) return;
+    this.statePersistTimer = setTimeout(() => {
+      this.statePersistTimer = undefined;
+      void this.flushState().catch((error) => this.reportPersistenceError("state", error));
+    }, this.persistDebounceMs);
+    this.statePersistTimer.unref();
+  }
+
+  private flushConfig(): Promise<void> {
+    if (this.configFlushPromise) return this.configFlushPromise;
+    if (!this.configDirty) return Promise.resolve();
+    this.configDirty = false;
+    const snapshot: ProxyFile = {
+      version: 2,
+      proxies: this.proxies.map((node): ProxyStaticNode => ({
+        id: node.id,
+        name: node.name,
+        type: node.type,
+        url: node.url,
+        enabled: node.enabled,
+        weight: node.weight,
+        maxConcurrency: node.maxConcurrency,
+        dailyRequestLimit: node.dailyRequestLimit,
+        autoDisableWhenDailyLimitReached: node.autoDisableWhenDailyLimitReached,
+      })),
+    };
+    this.configFlushPromise = this.enqueueWrite(() => this.store.writeAsync(snapshot)).catch((error) => {
+      this.configDirty = true;
+      throw error;
+    }).finally(() => {
+      this.configFlushPromise = undefined;
+      if (this.configDirty) this.scheduleConfigPersist();
+    });
+    return this.configFlushPromise;
+  }
+
+  private flushState(): Promise<void> {
+    if (this.stateFlushPromise) return this.stateFlushPromise;
+    if (!this.stateDirty) return Promise.resolve();
+
+    this.stateDirty = false;
+    const ids = [...this.dirtyStateIds];
+    const entries: ProxyStateJournalEntry[] = [];
+    for (const id of ids) {
+      if (this.deletedStateIds.has(id) || !this.proxiesById.has(id)) {
+        entries.push({ id, deleted: true });
+        continue;
+      }
+      const node = this.proxiesById.get(id);
+      if (node) entries.push({ id, state: this.stateForNode(node) });
+    }
+    this.dirtyStateIds.clear();
+    this.deletedStateIds.clear();
+
+    this.stateFlushPromise = this.enqueueWrite(async () => {
+      await this.stateJournal.appendMany(entries);
+      if (await this.stateJournal.size() >= 8 * 1024 * 1024) {
+        // Compact only after the incremental journal is durable. The snapshot
+        // contains any state changes that arrived while the append was pending;
+        // those changes remain dirty and will be journaled again if necessary.
+        await this.stateStore.writeAsync(this.stateSnapshot());
+        await this.stateJournal.truncate();
+      }
+    }).catch((error) => {
+      this.stateDirty = true;
+      for (const entry of entries) {
+        if (this.dirtyStateIds.has(entry.id)) continue;
+        this.dirtyStateIds.add(entry.id);
+        if (entry.deleted) this.deletedStateIds.add(entry.id);
+      }
+      throw error;
+    }).finally(() => {
+      this.stateFlushPromise = undefined;
+      if (this.stateDirty) this.scheduleStatePersist();
+    });
+    return this.stateFlushPromise;
+  }
+
+  private stateForNode(node: ProxyNode): ProxyState {
+    return {
+      enabled: node.enabled,
+      dailyRequestCount: node.dailyRequestCount,
+      dailyCountDate: node.dailyCountDate,
+      consecutiveRateLimitCount: node.consecutiveRateLimitCount,
+      autoDisabledBy429: node.autoDisabledBy429,
+      lastRecoveryTestAt: node.lastRecoveryTestAt,
+      cooldownUntil: node.cooldownUntil,
+      successCount: node.successCount,
+      failCount: node.failCount,
+      totalTokens: node.totalTokens,
+      dailyTokens: node.dailyTokens,
+      dailyTokensDate: node.dailyTokensDate,
+      recentResults: node.recentResults,
+      lastError: node.lastError,
+      lastUsedAt: node.lastUsedAt,
+      lastCheckedAt: node.lastCheckedAt,
+    };
+  }
+
+  private stateSnapshot(): ProxyStateFile {
+    const states: Record<string, ProxyState> = {};
+    for (const node of this.proxies) states[node.id] = this.stateForNode(node);
+    return { version: 1, states };
+  }
+
+  private enqueueWrite(writer: () => Promise<void>): Promise<void> {
+    const next = this.writeQueue.then(writer, writer);
+    this.writeQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  private reportPersistenceError(kind: "config" | "state", error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[proxy-pool] ${kind} persistence failed: ${message}`);
   }
 }
