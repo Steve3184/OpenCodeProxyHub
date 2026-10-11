@@ -6,6 +6,7 @@ import { JsonFileStore } from "../storage/jsonFile.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { HttpPreProxyToHttpAgent, HttpPreProxyToSocksAgent } from "./chainedAgent.js";
 import { ocId } from "../utils/ids.js";
+import { isConsoleProviderError } from "../providers/opencodeAccessErrors.js";
 
 export type ProxyType = "http" | "https" | "socks5";
 
@@ -387,11 +388,17 @@ export class ProxyPoolStore {
     this.persistState(id);
   }
 
-  markFailure(id: string, error: string, options: { statusCode?: number; cooldownMs?: number; leaseId?: string; model?: string } = {}): void {
+  markFailure(id: string, error: string, options: { statusCode?: number; cooldownMs?: number; leaseId?: string; model?: string; upstreamBody?: string } = {}): void {
     const node = this.find(id);
     if (!node) return;
     const lease = this.takeLease(id, options.leaseId);
     if (!lease) return;
+    // Settle the lease without penalizing a healthy proxy for a provider error.
+    // Do not count this as success or clear previous genuine proxy failures.
+    if (isConsoleProviderError(options.upstreamBody ?? error)) {
+      this.persistState(id);
+      return;
+    }
     node.failCount += 1;
     this.recordResult(node, false, options.statusCode || 502);
     node.lastError = error;

@@ -85,11 +85,9 @@ export function SettingsView({ data }: { data: ConsoleData }) {
 
       <motion.div variants={fadeUp}>
         <Card className="p-5">
-          <h2 className="text-sm font-semibold">日志与审计</h2>
+          <h2 className="text-sm font-semibold">错误日志</h2>
           <div className="mt-4 space-y-3">
-            {toggleField("启用文件日志", "logEnabled")}
-            {toggleField("记录管理审计", "logAudit", !settings.logEnabled)}
-            {toggleField("记录 AI 请求摘要", "logApiRequests", !settings.logEnabled)}
+            {toggleField("启用错误文件日志", "logEnabled")}
             <div className="grid grid-cols-2 gap-3">
               {numberField("日志保留天数", "logRetentionDays", !settings.logEnabled)}
             </div>

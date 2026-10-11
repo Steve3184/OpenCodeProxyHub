@@ -10,7 +10,6 @@ import type { ProxyInput, ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { AsyncLimiter } from "../rateLimit/limiter.js";
 import type { RequestTracker } from "../runtime/requestTracker.js";
 import type { MetricsStore } from "../observability/metrics.js";
-import { clientIdFromHeaders, type EventLogger } from "../observability/eventLogger.js";
 
 interface CreateKeyBody {
   name?: string;
@@ -49,21 +48,8 @@ export const registerAdminRoutes = async (
   limiter: AsyncLimiter,
   requestTracker: RequestTracker,
   metrics: MetricsStore,
-  eventLogger: EventLogger,
   adminSessions: AdminSessionStore,
 ): Promise<void> => {
-  const audit = (request: { headers: Record<string, string | string[] | undefined>; ip?: string }, action: string, result: "success" | "failure", details: Record<string, unknown> = {}) => {
-    eventLogger.audit({
-      action,
-      result,
-      actor: "admin",
-      clientId: clientIdFromHeaders(request.headers),
-      ip: request.ip,
-      userAgent: Array.isArray(request.headers["user-agent"]) ? request.headers["user-agent"][0] : request.headers["user-agent"],
-      ...details,
-    });
-  };
-
   app.addHook("preHandler", async (request, reply) => {
     if (!request.url.startsWith("/admin/")) return;
     if (request.url.split("?", 1)[0] === "/admin/login") return;
@@ -74,11 +60,9 @@ export const registerAdminRoutes = async (
   app.post<{ Body: LoginBody }>("/admin/login", async (request, reply) => {
     const password = typeof request.body?.password === "string" ? request.body.password : "";
     if (!passwordMatches(password, config.adminPassword)) {
-      audit(request, "admin.login", "failure", { reason: "invalid_password" });
       return reply.code(401).send({ error: { message: "控制台密码不正确" } });
     }
     const token = adminSessions.create();
-    audit(request, "admin.login", "success");
     return reply.send({ data: { authenticated: true, mode: "password", token } });
   });
 
@@ -91,7 +75,6 @@ export const registerAdminRoutes = async (
 
   app.post("/admin/logout", async (request, reply) => {
     adminSessions.revoke(tokenFromRequest(request));
-    audit(request, "admin.logout", "success");
     return reply.code(204).send();
   });
 
@@ -100,11 +83,9 @@ export const registerAdminRoutes = async (
   app.post<{ Body: CreateKeyBody }>("/admin/api-keys", async (request, reply) => {
     try {
       const created = keyStore.create(request.body?.name || "");
-      audit(request, "api_key.create", "success", { targetId: created.id, targetName: created.name, keyPrefix: created.keyPrefix });
       return reply.code(201).send({ data: created });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create API key";
-      audit(request, "api_key.create", "failure", { error: message });
       return reply.code(400).send({ error: { message } });
     }
   });
@@ -118,12 +99,10 @@ export const registerAdminRoutes = async (
   app.patch<{ Params: { id: string }; Body: UpdateKeyBody }>("/admin/api-keys/:id", async (request, reply) => {
     try {
       const updated = keyStore.update(request.params.id, request.body || {});
-      audit(request, "api_key.update", "success", { targetId: request.params.id, targetName: updated.name, enabled: updated.enabled });
       return reply.send({ data: updated });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to update API key";
       const status = message === "API key not found" ? 404 : 400;
-      audit(request, "api_key.update", "failure", { targetId: request.params.id, error: message });
       return reply.code(status).send({ error: { message } });
     }
   });
@@ -131,10 +110,8 @@ export const registerAdminRoutes = async (
   app.delete<{ Params: { id: string } }>("/admin/api-keys/:id", async (request, reply) => {
     const deleted = keyStore.delete(request.params.id);
     if (!deleted) {
-      audit(request, "api_key.delete", "failure", { targetId: request.params.id, error: "API key not found" });
       return reply.code(404).send({ error: { message: "API key not found" } });
     }
-    audit(request, "api_key.delete", "success", { targetId: request.params.id });
     return reply.code(204).send();
   });
 
@@ -145,14 +122,9 @@ export const registerAdminRoutes = async (
   app.put<{ Body: ModelAliasUpdateInput }>("/admin/model-aliases", async (request, reply) => {
     try {
       const config = modelAliasStore.update(request.body || {});
-      audit(request, "model_aliases.update", "success", {
-        aliasCount: config.aliases.length,
-        onlyConfiguredAliases: config.onlyConfiguredAliases,
-      });
       return reply.send({ data: config });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to save model aliases";
-      audit(request, "model_aliases.update", "failure", { error: message });
       return reply.code(400).send({ error: { message } });
     }
   });
@@ -160,11 +132,9 @@ export const registerAdminRoutes = async (
   app.put<{ Params: { id: string }; Body: ModelUpdateInput }>("/admin/models/:id", async (request, reply) => {
     try {
       const model = modelStore.upsert(request.params.id, request.body || {});
-      audit(request, "model.upsert", "success", { targetId: request.params.id, enabled: model.enabled, useResponses: model.useResponses === true });
       return reply.send({ data: model });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to save model";
-      audit(request, "model.upsert", "failure", { targetId: request.params.id, error: message });
       return reply.code(400).send({ error: { message } });
     }
   });
@@ -172,10 +142,8 @@ export const registerAdminRoutes = async (
   app.delete<{ Params: { id: string } }>("/admin/models/:id", async (request, reply) => {
     const deleted = modelStore.delete(request.params.id);
     if (!deleted) {
-      audit(request, "model.delete", "failure", { targetId: request.params.id, error: "Model not found" });
       return reply.code(404).send({ error: { message: "Model not found" } });
     }
-    audit(request, "model.delete", "success", { targetId: request.params.id });
     return reply.code(204).send();
   });
 
@@ -206,7 +174,6 @@ export const registerAdminRoutes = async (
         syncedCount++;
       }
 
-      audit(request, "models.sync_free", "success", { syncedCount, totalUpstream: data.data.length });
       return reply.send({
         data: {
           synced: syncedCount,
@@ -215,7 +182,6 @@ export const registerAdminRoutes = async (
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to sync free models";
-      audit(request, "models.sync_free", "failure", { error: message });
       return reply.code(500).send({ error: { message } });
     }
   });
@@ -225,11 +191,9 @@ export const registerAdminRoutes = async (
   app.patch<{ Body: SystemSettingsUpdate }>("/admin/settings", async (request, reply) => {
     try {
       const settings = settingsStore.update(request.body || {});
-      audit(request, "settings.update", "success", { keys: Object.keys(request.body || {}) });
       return reply.send({ data: settings });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to update settings";
-      audit(request, "settings.update", "failure", { keys: Object.keys(request.body || {}), error: message });
       return reply.code(400).send({ error: { message } });
     }
   });
@@ -254,11 +218,9 @@ export const registerAdminRoutes = async (
   app.post<{ Body: ProxyInput }>("/admin/proxies", async (request, reply) => {
     try {
       const proxy = proxyPool.create(request.body || {});
-      audit(request, "proxy.create", "success", { targetId: proxy.id, targetName: proxy.name, enabled: proxy.enabled });
       return reply.code(201).send({ data: proxy });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create proxy";
-      audit(request, "proxy.create", "failure", { error: message });
       return reply.code(400).send({ error: { message } });
     }
   });
@@ -266,12 +228,10 @@ export const registerAdminRoutes = async (
   app.patch<{ Params: { id: string }; Body: ProxyInput }>("/admin/proxies/:id", async (request, reply) => {
     try {
       const proxy = proxyPool.update(request.params.id, request.body || {});
-      audit(request, "proxy.update", "success", { targetId: request.params.id, targetName: proxy.name, enabled: proxy.enabled });
       return reply.send({ data: proxy });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to update proxy";
       const status = message === "Proxy not found" ? 404 : 400;
-      audit(request, "proxy.update", "failure", { targetId: request.params.id, error: message });
       return reply.code(status).send({ error: { message } });
     }
   });
@@ -279,10 +239,8 @@ export const registerAdminRoutes = async (
   app.delete<{ Params: { id: string } }>("/admin/proxies/:id", async (request, reply) => {
     const deleted = proxyPool.delete(request.params.id);
     if (!deleted) {
-      audit(request, "proxy.delete", "failure", { targetId: request.params.id, error: "Proxy not found" });
       return reply.code(404).send({ error: { message: "Proxy not found" } });
     }
-    audit(request, "proxy.delete", "success", { targetId: request.params.id });
     return reply.code(204).send();
   });
 
@@ -300,11 +258,9 @@ export const registerAdminRoutes = async (
         model: healthCheckModel,
         timeoutMs: config.proxyHealthCheckTimeoutMs,
       });
-      audit(request, "proxy.test", "success", { targetId: request.params.id, targetName: proxy.name });
       return reply.send({ data: proxy });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to test proxy";
-      audit(request, "proxy.test", "failure", { targetId: request.params.id, error: message });
       return reply.code(400).send({ error: { message } });
     }
   });
@@ -312,12 +268,10 @@ export const registerAdminRoutes = async (
   app.post<{ Params: { id: string } }>("/admin/proxies/:id/stats/clear", async (request, reply) => {
     try {
       const proxy = proxyPool.clearStats(request.params.id);
-      audit(request, "proxy.stats.clear", "success", { targetId: proxy.id, targetName: proxy.name });
       return reply.send({ data: proxy });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to clear proxy statistics";
       const status = message === "Proxy not found" ? 404 : 400;
-      audit(request, "proxy.stats.clear", "failure", { targetId: request.params.id, error: message });
       return reply.code(status).send({ error: { message } });
     }
   });

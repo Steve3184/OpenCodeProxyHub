@@ -19,7 +19,7 @@ const config = {
   adminPassword: "test-only", redisUrl: "", proxyMode: "direct" as const,
   outboundPreProxyEnabled: false, zenHost: "example.invalid",
   globalRequestsPerMinute: 1000, apiKeyRequestsPerMinute: 1000,
-  proxyRecoveryIntervalMs: 3_600_000, shutdownDrainTimeoutMs: 1000,
+  proxyRecoveryIntervalMs: 3_600_000, proxyCooldownMs: 0, shutdownDrainTimeoutMs: 1000,
 };
 let app: Awaited<ReturnType<typeof buildApp>>["app"] | undefined;
 const assertHeaders = (headers: Record<string, unknown>) => {
@@ -107,6 +107,8 @@ try {
   await setSettings({ openAiStreamTransformModels: [], reasoningTagModels: [] });
   let wire = "chat";
   let upstreamStatus = 200;
+  let upstreamError: string | undefined;
+  let splitError = false;
   const chatBody = 'data: {"id":"test","object":"chat.completion.chunk","model":"big-pickle","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\ndata: {"id":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
   const anthropicBody = 'event: message_start\ndata: {"type":"message_start","message":{"id":"test","usage":{"input_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
   const responsesBody = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}\n\n';
@@ -118,8 +120,12 @@ try {
     request.end = () => queueMicrotask(() => {
       const response = Object.assign(new EventEmitter(), { statusCode: upstreamStatus, resume: () => {} });
       callback(response);
-      const body = upstreamStatus !== 200 ? '{"error":{"message":"test upstream error"}}' : wire === "anthropic" ? anthropicBody : wire === "responses" ? responsesBody : wire === "systemone" ? '{"answer":"Hello"}' : chatBody;
-      response.emit("data", Buffer.from(body));
+      const body = upstreamError ?? (upstreamStatus !== 200 ? '{"error":{"message":"test upstream error"}}' : wire === "anthropic" ? anthropicBody : wire === "responses" ? responsesBody : wire === "systemone" ? '{"answer":"Hello"}' : chatBody);
+      if (splitError) {
+        const middle = Math.floor(body.length / 2);
+        response.emit("data", Buffer.from(body.slice(0, middle)));
+        response.emit("data", Buffer.from(body.slice(middle)));
+      } else response.emit("data", Buffer.from(body));
       response.emit("end");
     });
     return request;
@@ -162,6 +168,68 @@ try {
   assert.equal(error.statusCode, 502);
   assertHeaders(error.headers);
   console.log("[pass] Chat/Responses/Anthropic JSON and SSE, both upstream protocols, both optional stream converters, System One aliases and raw upstream errors keep transport headers");
+
+  // Exercise real pool accounting through every public protocol and converter.
+  await setSettings({ proxyMode: "required" });
+  for (const port of [9001, 9002]) {
+    const created = await app.inject({ method: "POST", url: "/admin/proxies", headers: admin,
+      payload: { name: `test-${port}`, type: "http", url: `http://127.0.0.1:${port}`, maxConcurrency: 10, dailyRequestLimit: 0 } });
+    assert.equal(created.statusCode, 201);
+  }
+  const getProxies = async () => (await app!.inject({ url: "/admin/proxies", headers: admin })).json().data.items;
+  const checkProviderError = async (url: string, stream: boolean, message: string, status: number) => {
+    const result = await app!.inject({ method: "POST", url, headers: client, payload: payloadFor(url, stream) });
+    assert.equal(result.statusCode, status, `${url}: ${result.body}`);
+    assert.equal(result.json().error.message, message, `${url}: preserve the provider message without a suffix`);
+    for (const node of await getProxies()) {
+      assert.equal(node.enabled, true);
+      assert.equal(node.autoDisabledBy429, false);
+      assert.equal(node.consecutiveRateLimitCount, 0);
+      assert.equal(node.failCount, 0);
+      assert.equal(node.successCount, 0);
+      assert.equal(node.cooldownUntil, null);
+      assert.equal(node.currentConcurrency, 0, "Console errors must release leases");
+    }
+  };
+  for (const status of [429, 503, 200]) {
+    upstreamStatus = status;
+    splitError = status !== 200;
+    const message = `Error from provider (Console): ${status === 503 ? "Service unavailable." : "Rate limit exceeded. Please try again later."}`;
+    upstreamError = JSON.stringify({ error: { message } });
+    const expectedStatus = status === 200 ? 429 : status;
+    for (const useResponses of [false, true]) {
+      await setModel("big-pickle", { useResponses });
+      for (const url of ["/v1/chat/completions", "/v1/responses", "/v1/messages"]) {
+        for (const stream of [false, true]) await checkProviderError(url, stream, message, expectedStatus);
+      }
+    }
+    await setModel("big-pickle", { useResponses: false });
+    for (const setting of ["reasoningTagModels", "openAiStreamTransformModels"]) {
+      await setSettings({ openAiStreamTransformModels: [], reasoningTagModels: [], [setting]: ["big-pickle"] });
+      await checkProviderError("/v1/chat/completions", true, message, expectedStatus);
+    }
+    await setSettings({ openAiStreamTransformModels: [], reasoningTagModels: [] });
+    for (const url of ["/v1/systemone", "/zen/v1/systemone"]) await checkProviderError(url, false, message, expectedStatus);
+  }
+  console.log("[pass] Console errors preserve messages and never penalize proxies across protocols, stream converters, retries and split error bodies");
+
+  // Ordinary limits still trip the five-429 rule for this model after cooldowns.
+  upstreamStatus = 429;
+  const message = "Rate limit exceeded. Please try again later.";
+  upstreamError = JSON.stringify({ error: { type: "FreeUsageLimitError", message } });
+  for (let i = 0; i < 5; i++) {
+    const result = await app.inject({ method: "POST", url: "/v1/chat/completions", headers: client,
+      payload: payloadFor("/v1/chat/completions", true) });
+    assert.equal(result.statusCode, 429);
+    assert.equal(result.json().error.message, message);
+  }
+  for (const node of await getProxies()) {
+    assert.equal(node.enabled, true);
+    assert.equal(node.rateLimitStates?.["big-pickle"]?.autoDisabledBy429, true);
+    assert.equal(node.rateLimitStates?.["big-pickle"]?.consecutiveRateLimitCount, 5);
+    assert.equal(node.currentConcurrency, 0);
+  }
+  console.log("[pass] ordinary anonymous 429s still isolate the affected model after five failures without appending a message suffix");
 } finally {
   globalThis.fetch = originalFetch;
   https.request = originalRequest;

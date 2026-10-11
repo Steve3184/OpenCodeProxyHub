@@ -11,7 +11,6 @@ import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { AsyncLimiter } from "../rateLimit/limiter.js";
 import type { RequestTracker } from "../runtime/requestTracker.js";
 import type { MetricsStore } from "../observability/metrics.js";
-import { clientIdFromHeaders, type EventLogger } from "../observability/eventLogger.js";
 
 interface SystemoneRequest {
   model?: string;
@@ -37,10 +36,8 @@ export const registerSystemoneRoutes = async (
   limiter: AsyncLimiter,
   requestTracker: RequestTracker,
   metrics: MetricsStore,
-  eventLogger: EventLogger,
 ): Promise<void> => {
   const handleSystemone = async (request: FastifyRequest<{ Body: SystemoneRequest }>, reply: FastifyReply): Promise<void> => {
-    const started = process.hrtime.bigint();
     const releaseRequest = requestTracker.acquire();
     if (!releaseRequest) {
       return reply.code(503).header("Retry-After", "5").send({ error: { message: "Server is draining", type: "service_unavailable" } });
@@ -98,29 +95,6 @@ export const registerSystemoneRoutes = async (
       toolMapper: createToolNameMapper(undefined),
     }, settingsStore.get().proxyMode !== "direct" && auth.policy.allowProxy !== false ? proxyPool : undefined, excludeProxyIds);
 
-    const logRequest = (statusCode: number) => {
-      const currentSettings = settingsStore.get();
-      const node = prepared?.lease?.node ?? null;
-      eventLogger.apiRequest({
-        protocol: "systemone",
-        route: request.url,
-        apiKeyId: auth.id,
-        apiKeyName: auth.name,
-        clientId: clientIdFromHeaders(request.headers),
-        model: downstreamModel,
-        stream: false,
-        messageCount: 0,
-        statusCode,
-        durationMs: Math.round(Number(process.hrtime.bigint() - started) / 1_000_000),
-        proxyId: node?.id ?? null,
-        proxyName: node?.name ?? (currentSettings.proxyMode !== "direct" && auth.policy.allowProxy !== false ? null : "direct"),
-        proxyType: node?.type ?? null,
-        viaPreProxy: Boolean(node && currentSettings.outboundPreProxyEnabled && currentSettings.outboundPreProxyUrl),
-        transform: "systemone-model-alias",
-      });
-    };
-    reply.raw.once("finish", () => logRequest(reply.raw.statusCode));
-
     const prepared = prepareRequest();
     try {
       const upstream = await requestZenFull(prepared, settingsStore.get().proxyMode !== "direct" && auth.policy.allowProxy !== false ? proxyPool : undefined, metrics, prepareRequest, 0, "systemone", settingsStore.get().autoRetryCount);
@@ -129,7 +103,7 @@ export const registerSystemoneRoutes = async (
       if (rateLimited || upstream.status < 200 || upstream.status >= 300 || upstream.data?.error || upstream.data?.type === "error") {
         const message = upstream.data?.error?.message || upstream.data?.message || (rateLimited ? "Rate limit exceeded" : `Upstream returned HTTP ${upstream.status}`);
         const status = rateLimited ? 429 : (upstream.status >= 400 ? upstream.status : 502);
-        return reply.code(status).send({ error: { message: rateLimited ? `${message} (free model rate limit)` : message, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } });
+        return reply.code(status).send({ error: { message, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } });
       }
       return reply.code(200).send(rewriteModel(upstream.data, downstreamModel));
     } catch (error) {

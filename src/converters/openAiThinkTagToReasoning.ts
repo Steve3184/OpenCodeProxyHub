@@ -188,7 +188,7 @@ export const pipeOpenAiStreamStrippingThink = (
   const req = https.request(prepared.options, (zenRes) => {
     zenRes.on("data", (chunk: Buffer) => {
       if (settled || retryStarted || aborted) return;
-      if (zenRes.statusCode === 429) {
+      if ((zenRes.statusCode || 502) >= 400) {
         rateLimitBody += chunk.toString();
         return;
       }
@@ -219,7 +219,7 @@ export const pipeOpenAiStreamStrippingThink = (
               if (!res.headersSent) {
                 const responseStatus = rateLimited ? 429 : 502;
                 res.writeHead(responseStatus, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: { message: rateLimited ? `${errMsg} (free model rate limit)` : errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
+                res.end(JSON.stringify({ error: { message: errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
               }
               metrics?.recordUpstream({ statusCode: rateLimited ? 429 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
               zenRes.resume();
@@ -279,7 +279,7 @@ export const pipeOpenAiStreamStrippingThink = (
         if (!res.headersSent) {
           const responseStatus = rateLimited ? 429 : status;
           res.writeHead(responseStatus, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: rateLimited ? "Upstream returned 429" : errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
+          res.end(JSON.stringify({ error: { message: errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
         } else if (!res.writableEnded) {
           res.end();
         }

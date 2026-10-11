@@ -2,7 +2,7 @@ import { mkdir, appendFile, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { SettingsStore } from "../settings/settingsStore.js";
 
-type LogType = "audit" | "requests" | "errors";
+type LogType = "errors";
 
 interface EventRecord {
   [key: string]: unknown;
@@ -14,18 +14,6 @@ export class EventLogger {
   private cleanupDate = "";
 
   constructor(private readonly settingsStore: SettingsStore, private readonly logsDir: string) {}
-
-  audit(record: EventRecord): void {
-    const settings = this.settingsStore.get();
-    if (!settings.logEnabled || !settings.logAudit) return;
-    this.write("audit", record, settings.logRetentionDays);
-  }
-
-  apiRequest(record: EventRecord): void {
-    const settings = this.settingsStore.get();
-    if (!settings.logEnabled || !settings.logApiRequests) return;
-    this.write("requests", record, settings.logRetentionDays);
-  }
 
   error(record: EventRecord): void {
     const settings = this.settingsStore.get();
@@ -62,8 +50,3 @@ export class EventLogger {
       }));
   }
 }
-
-export const clientIdFromHeaders = (headers: Record<string, string | string[] | undefined>): string => {
-  const first = (value: string | string[] | undefined) => Array.isArray(value) ? value[0] : value;
-  return first(headers["x-client-id"]) || first(headers["x-device-id"]) || first(headers["x-session-id"]) || "unknown-client";
-};

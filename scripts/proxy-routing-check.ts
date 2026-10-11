@@ -33,7 +33,7 @@ const tempDir = await mkdtemp(path.join(os.tmpdir(), "oph-proxy-routing-"));
 try {
   const settings = new SettingsStore(path.join(tempDir, "settings.json"), { proxyMode: "required" });
   settings.load();
-  const pool = new ProxyPoolStore(path.join(tempDir, "proxies.json"), settings);
+  const pool = new ProxyPoolStore(path.join(tempDir, "proxies.json"), settings, { cooldownMs: 0 });
   pool.load();
   const cyber = pool.create({ name: "Cyber primary", type: "http", url: "http://127.0.0.1:9001", weight: 100, maxConcurrency: 10 });
   const safe = pool.create({ name: "Safe fallback", type: "http", url: "http://127.0.0.1:9002", weight: 50, maxConcurrency: 10 });
@@ -46,6 +46,31 @@ try {
   assert.equal(normalLease.node?.id, cyber.id);
   if (normalLease.node) pool.release(normalLease.node.id, normalLease.leaseId);
   console.log("[pass] the proxy pool applies model compatibility during acquisition");
+
+  // Console errors must not consume the fifth strike or release another request's lease.
+  for (let i = 0; i < 4; i++) {
+    const lease = pool.acquire(new Set(), "mimo-v2.5-free");
+    assert.equal(lease.node?.id, cyber.id);
+    pool.markFailure(cyber.id, "Rate limit exceeded", { statusCode: 429, leaseId: lease.leaseId });
+  }
+  const held = pool.acquire(new Set(), "mimo-v2.5-free");
+  const consoleLease = pool.acquire(new Set(), "mimo-v2.5-free");
+  const consoleError = "Error from provider (Console): Rate limit exceeded. Please try again later.";
+  const options = { statusCode: 429, leaseId: consoleLease.leaseId, upstreamBody: JSON.stringify({ error: { message: consoleError } }) };
+  pool.markFailure(cyber.id, "Upstream returned 429", options);
+  pool.markFailure(cyber.id, "Upstream returned 429", options);
+  const node = pool.list().find((item) => item.id === cyber.id)!;
+  assert.equal(node.enabled, true);
+  assert.equal(node.rateLimitStates?.["mimo-v2.5-free"]?.consecutiveRateLimitCount, 4);
+  assert.equal(node.failCount, 4);
+  assert.equal(node.currentConcurrency, 1);
+  assert.equal(node.cooldownUntil, null);
+  pool.release(cyber.id, held.leaseId);
+  await pool.flush();
+  const reloaded = new ProxyPoolStore(path.join(tempDir, "proxies.json"), settings, { cooldownMs: 0 });
+  reloaded.load();
+  assert.equal(reloaded.list().find((item) => item.id === cyber.id)?.rateLimitStates?.["mimo-v2.5-free"]?.consecutiveRateLimitCount, 4);
+  console.log("[pass] Console errors preserve prior strikes and settle only their own lease, including duplicate settlement and reload");
 } finally {
   await rm(tempDir, { recursive: true, force: true });
 }

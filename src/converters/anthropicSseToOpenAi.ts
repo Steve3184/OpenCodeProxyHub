@@ -296,7 +296,7 @@ export const pipeAnthropicSseAsOpenAI = (
       if (status >= 400) {
         const rateLimited = status === 429 || buffer.includes("FreeUsageLimitError") || buffer.includes("rate_limit_error") || buffer.toLowerCase().includes("rate limit");
         if (prepared.lease?.node && proxyPool && !markedFailure) {
-          proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${status}`, { statusCode: rateLimited ? 429 : status, leaseId: prepared.lease.leaseId });
+          proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${status}`, { statusCode: rateLimited ? 429 : status, leaseId: prepared.lease.leaseId, upstreamBody: buffer });
           markedFailure = true;
         }
         if (rateLimited && retryRateLimited()) return;

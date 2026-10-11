@@ -55,8 +55,6 @@ export interface SystemSettings {
   outboundPreProxyEnabled: boolean;
   outboundPreProxyUrl: string;
   logEnabled: boolean;
-  logAudit: boolean;
-  logApiRequests: boolean;
   logRetentionDays: number;
   globalRequestsPerMinute: number;
   apiKeyRequestsPerMinute: number;

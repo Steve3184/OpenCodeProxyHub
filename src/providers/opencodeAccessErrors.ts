@@ -3,6 +3,18 @@ const OPENCODE_PROXY_ACCESS_MESSAGES = [
   "your access has been restricted due to repeated policy violations",
 ] as const;
 
+/** Zen labels errors returned by the Console provider; these are not proxy failures. */
+export const isConsoleProviderError = (body: string): boolean => {
+  let message = body;
+  try {
+    const parsed = JSON.parse(body);
+    message = parsed?.error?.message ?? parsed?.message ?? body;
+  } catch {
+    // Callers may already have extracted the upstream message.
+  }
+  return typeof message === "string" && /^\s*Error from provider\s*\(Console\):/i.test(message);
+};
+
 export const isOpenCodeProxyAccessError = (statusCode: number, body: string): boolean => {
   if (statusCode !== 403 && !body.includes("status_code=403")) return false;
   const normalized = body.toLowerCase();

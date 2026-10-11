@@ -24,7 +24,10 @@
     "check:retry-settings": "tsx scripts/retry-settings-check.ts",
     "check:proxy-performance": "tsx scripts/proxy-pool-performance-check.ts",
     "check:proxy-rate-limit": "tsx scripts/proxy-rate-limit-check.ts",
-    "check:response-lifecycle": "tsx scripts/response-lifecycle-check.ts"
+    "check:response-lifecycle": "tsx scripts/response-lifecycle-check.ts",
+    "build:binary": "npm run build:all && node scripts/build-binary.mjs",
+    "check:binary": "node scripts/binary-smoke.mjs",
+    "check:logging": "tsx scripts/logging-removal-check.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

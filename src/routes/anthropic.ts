@@ -15,7 +15,6 @@ import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { AsyncLimiter } from "../rateLimit/limiter.js";
 import type { RequestTracker } from "../runtime/requestTracker.js";
 import type { MetricsStore } from "../observability/metrics.js";
-import { clientIdFromHeaders, type EventLogger } from "../observability/eventLogger.js";
 
 export const registerAnthropicRoutes = async (
   app: FastifyInstance,
@@ -29,10 +28,8 @@ export const registerAnthropicRoutes = async (
   limiter: AsyncLimiter,
   requestTracker: RequestTracker,
   metrics: MetricsStore,
-  eventLogger: EventLogger,
 ): Promise<void> => {
   app.post<{ Body: AnthropicMessageRequest }>("/v1/messages", async (request, reply) => {
-    const started = process.hrtime.bigint();
     const releaseRequest = requestTracker.acquire();
     if (!releaseRequest) {
       return reply.code(503).header("Retry-After", "5").send({ type: "error", error: { type: "service_unavailable", message: "Server is draining" } });
@@ -102,30 +99,7 @@ export const registerAnthropicRoutes = async (
     // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
     const toolMapper = createToolNameMapper(tools);
     const inputTokens = Math.trunc(JSON.stringify(messages).length / 4);
-    app.log.info({ user: auth.name, model, upstreamModel, stream: isStream, messageCount: messages.length }, "anthropic_request");
     const useProxy = (settings: ReturnType<typeof settingsStore.get>): boolean => settings.proxyMode !== "direct" && auth.policy.allowProxy !== false;
-    const logRequest = (statusCode: number, extra: Record<string, unknown> = {}) => {
-      const currentSettings = settingsStore.get();
-      const node = prepared?.lease?.node ?? null;
-      eventLogger.apiRequest({
-        protocol: "anthropic",
-        route: "/v1/messages",
-        apiKeyId: auth.id,
-        apiKeyName: auth.name,
-        clientId: clientIdFromHeaders(request.headers),
-        model,
-        stream: isStream,
-        messageCount: messages.length,
-        statusCode,
-        durationMs: Math.round(Number(process.hrtime.bigint() - started) / 1_000_000),
-        proxyId: node?.id ?? null,
-        proxyName: node?.name ?? (useProxy(currentSettings) ? null : "direct"),
-        proxyType: node?.type ?? null,
-        viaPreProxy: Boolean(node && currentSettings.outboundPreProxyEnabled && currentSettings.outboundPreProxyUrl),
-        ...extra,
-      });
-    };
-    reply.raw.once("finish", () => logRequest(reply.raw.statusCode));
 
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;

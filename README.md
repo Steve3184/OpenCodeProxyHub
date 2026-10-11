@@ -122,6 +122,30 @@ npm start            # 运行已构建的 dist/main.js
 
 更多健康检查、冒烟测试、备份、反向代理与升级说明见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)。公网部署建议在前面再放一层 Nginx/Caddy 等 HTTPS 反向代理（请求体上限需至少放行 `1 GiB`，并保留 `Authorization`/`x-api-key` 头、支持长连接 SSE、关闭对流式路径的缓冲）。
 
+## 二进制部署（Linux）
+
+每次推送 `main`、推送 `v*` 标签或手动运行 GitHub Actions，都会同时构建 Docker 镜像及 Linux amd64 / arm64 二进制。打开对应 Actions 运行的 **Artifacts**，下载 `opencode-proxy-hub-linux-amd64` 或 `opencode-proxy-hub-linux-arm64`，解压 artifact 后得到 `.tar.gz` 和 SHA-256 校验文件。
+
+```bash
+sha256sum -c opencode-proxy-hub-linux-amd64.tar.gz.sha256
+tar -xzf opencode-proxy-hub-linux-amd64.tar.gz
+cd opencode-proxy-hub-linux-amd64
+cp .env.example .env
+# 编辑 .env，设置 ADMIN_PASSWORD、监听端口和数据文件路径
+./opencode-proxy-hub
+```
+
+压缩包包含独立可执行文件（内含 Bun 运行时）与 `web/dist` 控制台资源，无需安装 Node.js、Bun 或 Docker。请从解压目录启动；systemd 的 `WorkingDirectory` 也应设置为该目录。默认访问 `/app/`，数据文件路径仍由 `.env` 配置。升级前保留 `.env` 和数据文件。amd64 使用 baseline 构建以兼容较旧 CPU；二进制面向 glibc Linux。
+
+本地构建需要 Node.js、npm 和 Bun 1.3.12：
+
+```bash
+npm ci
+npm --prefix web ci
+npm run build:binary -- linux-amd64  # 或 linux-arm64，可交叉编译
+npm run check:binary -- releases/opencode-proxy-hub-linux-amd64  # 在匹配架构上运行
+```
+
 ## 功能总览
 
 - **四种协议入口**
@@ -157,7 +181,7 @@ npm start            # 运行已构建的 dist/main.js
   - 默认内存实现；配置 `REDIS_URL` 后自动切换为基于 Redis Lua 脚本的分布式限流（支持多实例）
 - **可观测性**
   - HTTP / 上游请求计数、最近小时请求趋势、错误率、P50/P95/P99 延迟、按状态码与路由分布、按代理分布、最近错误
-  - 可配置的文件日志：管理审计日志、AI 请求摘要日志（含出口代理字段）、错误日志，JSONL 按天切分、按保留天数自动清理
+  - 可配置的错误文件日志，JSONL 按天切分、按保留天数自动清理
 - **内置 Web 控制台**（`/app`）
   - 总览、API Keys、模型、模型别名、设置、代理池、监控七大页面
   - 代理池含成功率、近 N 次请求结果色条、用量/并发/连续 429 数值与 Token 统计
@@ -311,7 +335,7 @@ curl http://127.0.0.1:6446/v1/systemone \
 - **API Keys**：创建（明文显示一次并可复制）、启用/禁用、删除、备注与标签、每 Key 策略（RPM、并发、模型白名单、是否允许代理）、查看请求量与最近客户端
 - **模型**：启用/禁用模型；按模型开启 `anthropic-sse-to-openai`、`think-to-reasoning`，或“使用 Responses 上游”协议转换
 - **模型别名**：配置下游 model ID 到上游 model ID 的映射，可开启“只允许使用已配置的别名”来屏蔽未配置的默认模型
-- **设置**：上游超时、请求体限制（默认 `1 GiB`）、默认流式、代理使用模式、链式前置代理、文件日志与审计开关、日志保留天数
+- **设置**：上游超时、请求体限制（默认 `1 GiB`）、默认流式、代理使用模式、链式前置代理、错误文件日志开关、日志保留天数
 - **代理池**：新增/编辑/删除/测试节点，查看优先节点、成功率、近 N 次请求结果色条、用量/并发/连续 429 数值与 Token 统计
 - **监控**：HTTP/上游请求量、按小时请求趋势、错误率、延迟分位、状态码与路由分布、限流器后端、运行时长、最近错误
 

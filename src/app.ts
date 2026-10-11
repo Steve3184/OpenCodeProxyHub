@@ -48,6 +48,9 @@ export const buildApp = async (config: AppConfig) => {
   });
   const metrics = new MetricsStore();
   const eventLogger = new EventLogger(settingsStore, config.logsDir);
+  app.addHook("onError", async (request, _reply, error) => {
+    eventLogger.error({ method: request.method, route: request.routeOptions.url, message: error.message });
+  });
   registerMetricsHooks(app, metrics);
   await app.register(cors, {
     origin: "*",
@@ -115,11 +118,11 @@ export const buildApp = async (config: AppConfig) => {
 
   await registerHealthRoutes(app, modelStore);
   await registerModelRoutes(app, modelStore, modelAliasStore);
-  await registerAdminRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, proxyPool, limiter, requestTracker, metrics, eventLogger, adminSessions);
-  await registerOpenAIRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
-  await registerResponsesRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
-  await registerAnthropicRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
-  await registerSystemoneRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics, eventLogger);
+  await registerAdminRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, proxyPool, limiter, requestTracker, metrics, adminSessions);
+  await registerOpenAIRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics);
+  await registerResponsesRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics);
+  await registerAnthropicRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics);
+  await registerSystemoneRoutes(app, config, keyStore, modelStore, modelAliasStore, settingsStore, sessions, proxyPool, limiter, requestTracker, metrics);
   await registerWebRoutes(app);
 
   app.setNotFoundHandler(async (_request, reply) => {

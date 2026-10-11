@@ -147,7 +147,7 @@ export const handleAnthropicFullResponse = (zenResp: ZenFullResponse, model: str
     const errMsg = zenResp.data?.error?.message || "Rate limit exceeded";
     return {
       status: 429,
-      body: { type: "error", error: { type: "rate_limit_error", message: `${errMsg} (free model rate limit)` } },
+      body: { type: "error", error: { type: "rate_limit_error", message: errMsg } },
     };
   }
   if (zenResp.status < 200 || zenResp.status >= 300 || zenResp.data?.error) {
@@ -296,7 +296,7 @@ export const pipeZenAsAnthropic = (
               if (!res.headersSent) {
                 const responseStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
                 res.writeHead(responseStatus, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ type: "error", error: { type: rateLimited ? "rate_limit_error" : "upstream_error", message: rateLimited ? `${errMsg} (free model rate limit)` : errMsg } }));
+                res.end(JSON.stringify({ type: "error", error: { type: rateLimited ? "rate_limit_error" : "upstream_error", message: errMsg } }));
               }
               metrics?.recordUpstream({ statusCode: rateLimited ? 429 : proxyAccessError ? 403 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
               zenRes.resume();
@@ -414,7 +414,7 @@ export const pipeZenAsAnthropic = (
         if (!res.headersSent) {
           const responseStatus = rateLimited ? 429 : status;
           res.writeHead(responseStatus, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ type: "error", error: { type: rateLimited ? "rate_limit_error" : "upstream_error", message: rateLimited ? `${errMsg} (free model rate limit)` : errMsg } }));
+          res.end(JSON.stringify({ type: "error", error: { type: rateLimited ? "rate_limit_error" : "upstream_error", message: errMsg } }));
         }
         metrics?.recordUpstream({ statusCode: rateLimited ? 429 : status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
         return;

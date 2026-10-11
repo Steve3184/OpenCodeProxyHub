@@ -162,13 +162,13 @@ export const requestZenFull = (
         const retryableProxyError = rateLimited || proxyAccessError;
         const effectiveErrorStatus = rateLimited ? 429 : (status >= 400 ? status : protocolError ? 502 : status);
         if (prepared.lease?.node && proxyPool) {
-          if (rateLimited) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429, leaseId: prepared.lease.leaseId });
+          if (rateLimited) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429, leaseId: prepared.lease.leaseId, upstreamBody: raw });
           else if (status >= 200 && status < 300 && !protocolError) {
             proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
             const usage = extractTokenUsage(data);
             proxyPool.recordTokenUsage(prepared.lease.node.id, usage.totalTokens ?? estimateTokens(requestInputForTokenEstimate(prepared.body)) + estimateTokens(responseTextForTokenEstimate(data)));
           } else {
-            proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${effectiveErrorStatus}`, { statusCode: effectiveErrorStatus, leaseId: prepared.lease.leaseId });
+            proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${effectiveErrorStatus}`, { statusCode: effectiveErrorStatus, leaseId: prepared.lease.leaseId, upstreamBody: raw });
           }
         }
         metrics?.recordUpstream({ statusCode: effectiveErrorStatus, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
@@ -426,7 +426,7 @@ export const pipeZenOpenAIResponse = (
               if (!res.headersSent) {
                 const responseStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
                 res.writeHead(responseStatus, { "Content-Type": "application/json" });
-                res.end(errorBody(rateLimited ? `${errMsg} (free model rate limit)` : errMsg, rateLimited));
+                res.end(errorBody(errMsg, rateLimited));
               }
               metrics?.recordUpstream({ statusCode: rateLimited ? 429 : proxyAccessError ? 403 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
               zenRes.resume();
@@ -489,7 +489,7 @@ export const pipeZenOpenAIResponse = (
         if (!res.headersSent) {
           const responseStatus = rateLimited ? 429 : (status >= 400 ? status : 502);
           res.writeHead(responseStatus, { "Content-Type": "application/json" });
-          res.end(errorBody(rateLimited ? `${errMsg} (free model rate limit)` : errMsg, rateLimited));
+          res.end(errorBody(errMsg, rateLimited));
         }
         metrics?.recordUpstream({ statusCode: rateLimited ? 429 : (status >= 400 ? status : 502), durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
         return;

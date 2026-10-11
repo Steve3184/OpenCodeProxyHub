@@ -16,7 +16,6 @@ import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { AsyncLimiter } from "../rateLimit/limiter.js";
 import type { RequestTracker } from "../runtime/requestTracker.js";
 import type { MetricsStore } from "../observability/metrics.js";
-import { clientIdFromHeaders, type EventLogger } from "../observability/eventLogger.js";
 
 export const registerOpenAIRoutes = async (
   app: FastifyInstance,
@@ -30,10 +29,8 @@ export const registerOpenAIRoutes = async (
   limiter: AsyncLimiter,
   requestTracker: RequestTracker,
   metrics: MetricsStore,
-  eventLogger: EventLogger,
 ): Promise<void> => {
   app.post<{ Body: OpenAIChatRequest }>("/v1/chat/completions", async (request, reply) => {
-    const started = process.hrtime.bigint();
     const releaseRequest = requestTracker.acquire();
     if (!releaseRequest) {
       return reply.code(503).header("Retry-After", "5").send({ error: { message: "Server is draining", type: "service_unavailable" } });
@@ -115,38 +112,7 @@ export const registerOpenAIRoutes = async (
     // Downstream tools are spelled `Read`/`Bash`; the upstream gate wants
     // lowercase `read`/`bash` and the reply has to come back in the client's spelling.
     const toolMapper = createToolNameMapper(tools);
-    app.log.info({ user: auth.name, model, upstreamModel, stream: isStream, messageCount: messages.length }, "openai_request");
-    const resolveTransform = (settings: ReturnType<typeof settingsStore.get>): string => {
-      if (useResponsesUpstream) return "responses-to-openai";
-      if (!isStream) return "passthrough";
-      if (settings.openAiStreamTransformModels.includes(model)) return "anthropic-sse-to-openai";
-      if (settings.reasoningTagModels.includes(model)) return "think-to-reasoning";
-      return "passthrough";
-    };
     const useProxy = (settings: ReturnType<typeof settingsStore.get>): boolean => settings.proxyMode !== "direct" && auth.policy.allowProxy !== false;
-    const logRequest = (statusCode: number, extra: Record<string, unknown> = {}) => {
-      const currentSettings = settingsStore.get();
-      const node = prepared?.lease?.node ?? null;
-      eventLogger.apiRequest({
-        protocol: "openai",
-        route: "/v1/chat/completions",
-        apiKeyId: auth.id,
-        apiKeyName: auth.name,
-        clientId: clientIdFromHeaders(request.headers),
-        model: downstreamModel,
-        stream: isStream,
-        messageCount: messages.length,
-        statusCode,
-        durationMs: Math.round(Number(process.hrtime.bigint() - started) / 1_000_000),
-        proxyId: node?.id ?? null,
-        proxyName: node?.name ?? (useProxy(currentSettings) ? null : "direct"),
-        proxyType: node?.type ?? null,
-        viaPreProxy: Boolean(node && currentSettings.outboundPreProxyEnabled && currentSettings.outboundPreProxyUrl),
-        transform: resolveTransform(currentSettings),
-        ...extra,
-      });
-    };
-    reply.raw.once("finish", () => logRequest(reply.raw.statusCode));
 
     const activeSettings = settingsStore.get();
     const effectiveProxyPool = useProxy(activeSettings) ? proxyPool : undefined;
@@ -186,7 +152,7 @@ export const registerOpenAIRoutes = async (
         if (rateLimited || zenResp.status < 200 || zenResp.status >= 300 || zenResp.data?.error || zenResp.data?.type === "error") {
           const message = zenResp.data?.error?.message || zenResp.data?.message || (rateLimited ? "Rate limit exceeded" : `Upstream returned HTTP ${zenResp.status}`);
           return reply.code(rateLimited ? 429 : (zenResp.status >= 400 ? zenResp.status : 502)).send({
-            error: { message: rateLimited ? `${message} (free model rate limit)` : message, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) },
+            error: { message, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) },
           });
         }
         return reply.code(200).send(responsesToOpenAIChatResponse(zenResp.data, model, toolMapper));

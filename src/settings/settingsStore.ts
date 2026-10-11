@@ -11,8 +11,6 @@ export interface SystemSettings {
   outboundPreProxyEnabled: boolean;
   outboundPreProxyUrl: string;
   logEnabled: boolean;
-  logAudit: boolean;
-  logApiRequests: boolean;
   logRetentionDays: number;
   globalRequestsPerMinute: number;
   apiKeyRequestsPerMinute: number;
@@ -41,8 +39,6 @@ const DEFAULT_SETTINGS: SystemSettings = {
   outboundPreProxyEnabled: false,
   outboundPreProxyUrl: "",
   logEnabled: false,
-  logAudit: true,
-  logApiRequests: true,
   logRetentionDays: 7,
   globalRequestsPerMinute: 120,
   apiKeyRequestsPerMinute: 60,
@@ -61,7 +57,19 @@ export class SettingsStore {
 
   load(): void {
     const data = this.store.read({ version: 1, settings: this.settings });
-    const { logPrompts: _legacyLogPrompts, logMaxBodyChars: _legacyLogMaxBodyChars, ...storedSettings } = data.settings as SystemSettings & { logPrompts?: unknown; logMaxBodyChars?: unknown };
+    // Discard removed logging options so upgrades cannot expose or persist them again.
+    const {
+      logPrompts: _legacyLogPrompts,
+      logMaxBodyChars: _legacyLogMaxBodyChars,
+      logAudit: _legacyLogAudit,
+      logApiRequests: _legacyLogApiRequests,
+      ...storedSettings
+    } = data.settings as SystemSettings & {
+      logPrompts?: unknown;
+      logMaxBodyChars?: unknown;
+      logAudit?: unknown;
+      logApiRequests?: unknown;
+    };
     const migratedSettings = storedSettings.requestBodyLimitBytes === LEGACY_DEFAULT_REQUEST_BODY_LIMIT_BYTES
       ? { ...storedSettings, requestBodyLimitBytes: DEFAULT_REQUEST_BODY_LIMIT_BYTES }
       : storedSettings;
@@ -97,8 +105,6 @@ export class SettingsStore {
 
     if (input.defaultStream !== undefined) this.settings.defaultStream = Boolean(input.defaultStream);
     if (input.logEnabled !== undefined) this.settings.logEnabled = Boolean(input.logEnabled);
-    if (input.logAudit !== undefined) this.settings.logAudit = Boolean(input.logAudit);
-    if (input.logApiRequests !== undefined) this.settings.logApiRequests = Boolean(input.logApiRequests);
     if (input.logRetentionDays !== undefined) {
       if (!Number.isFinite(input.logRetentionDays) || input.logRetentionDays < 0) throw new Error("logRetentionDays must be at least 0");
       this.settings.logRetentionDays = Math.trunc(input.logRetentionDays);
