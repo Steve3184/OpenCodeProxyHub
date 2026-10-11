@@ -17,11 +17,20 @@ import { ResultStrip } from "../components/ResultStrip";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { formatCompactTokens } from "../lib/format";
 
+const rateLimitSummary = (proxy: ProxyNode) => {
+  const states = Object.values(proxy.rateLimitStates || {});
+  const maxConsecutive = Math.max(proxy.consecutiveRateLimitCount, ...states.map((state) => state.consecutiveRateLimitCount));
+  const hasAutoDisabledModel = states.some((state) => state.autoDisabledBy429);
+  const hasActiveModelCooldown = states.some((state) => state.cooldownUntil && Date.parse(state.cooldownUntil) > Date.now());
+  return { maxConsecutive, hasAutoDisabledModel, hasActiveModelCooldown };
+};
+
 const stateBadge = (proxy: ProxyNode): { label: string; variant: "muted" | "warning" | "info" | "destructive" | "success" } => {
-  if (!proxy.enabled && proxy.autoDisabledBy429) return { label: "429 自动禁用", variant: "warning" };
+  const rateLimit = rateLimitSummary(proxy);
+  if ((!proxy.enabled && proxy.autoDisabledBy429) || rateLimit.hasAutoDisabledModel) return { label: "429 自动隔离", variant: "warning" };
   if (!proxy.enabled) return { label: "已禁用", variant: "muted" };
-  if (proxy.consecutiveRateLimitCount >= 3) return { label: "429 风险", variant: "warning" };
-  if (proxy.cooldownUntil && Date.parse(proxy.cooldownUntil) > Date.now()) return { label: "冷却中", variant: "info" };
+  if (rateLimit.maxConsecutive >= 3) return { label: "429 风险", variant: "warning" };
+  if ((proxy.cooldownUntil && Date.parse(proxy.cooldownUntil) > Date.now()) || rateLimit.hasActiveModelCooldown) return { label: "冷却中", variant: "info" };
   if (proxy.lastError) return { label: "异常", variant: "destructive" };
   return { label: "健康", variant: "success" };
 };
@@ -176,7 +185,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
                   <MeterBar label="今日用量" current={proxy.dailyRequestCount} max={proxy.dailyRequestLimit} />
                   <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
                     <span>并发 <strong className="ml-1 tabular-nums text-foreground">{proxy.currentConcurrency}/{proxy.maxConcurrency}</strong></span>
-                    <span>连续 429 <strong className="ml-1 tabular-nums text-foreground">{proxy.consecutiveRateLimitCount || 0}/5</strong></span>
+                    <span>连续 429 <strong className="ml-1 tabular-nums text-foreground">{rateLimitSummary(proxy).maxConsecutive || 0}/5</strong></span>
                   </div>
                 </div>
 

@@ -79,6 +79,14 @@ export interface ProxyPage {
   pageCount: number;
 }
 
+export interface ProxyRateLimitState {
+  consecutiveRateLimitCount: number;
+  autoDisabledBy429: boolean;
+  lastRecoveryTestAt: string | null;
+  cooldownUntil: string | null;
+  lastError: string | null;
+}
+
 export interface ProxyNode {
   id: string;
   name: string;
@@ -105,6 +113,7 @@ export interface ProxyNode {
   lastError: string | null;
   lastUsedAt: string | null;
   lastCheckedAt: string | null;
+  rateLimitStates?: Record<string, ProxyRateLimitState>;
 }
 
 export interface HealthPayload {

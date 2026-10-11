@@ -1,6 +1,7 @@
 import https from "node:https";
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import type { ServerResponse } from "node:http";
+import { registerResponseAttempt } from "../runtime/responseLifecycle.js";
 import { ocId } from "../utils/ids.js";
 import type { AppConfig } from "../config/env.js";
 import type { ZenFullResponse } from "../types/api.js";
@@ -553,7 +554,7 @@ export const pipeZenOpenAIResponse = (
     return;
   }
 
-  res.on("close", () => {
+  registerResponseAttempt(res, () => {
     if (!settled && !retryStarted) {
       settled = true;
       if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);

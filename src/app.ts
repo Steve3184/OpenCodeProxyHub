@@ -79,6 +79,7 @@ export const buildApp = async (config: AppConfig) => {
   };
   const proxyPool = new ProxyPoolStore(config.proxiesFile, settingsStore, {
     persistDebounceMs: config.proxyPersistDebounceMs,
+    cooldownMs: config.proxyCooldownMs,
     recoveryConcurrency: config.proxyRecoveryConcurrency,
     recoveryBatchSize: config.proxyRecoveryBatchSize,
   });

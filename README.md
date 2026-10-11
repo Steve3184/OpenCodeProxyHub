@@ -353,6 +353,7 @@ PROXY_HEALTH_CHECK_TIMEOUT_MS=10000     # 单次恢复探测超时（毫秒）
 PROXY_RECOVERY_INTERVAL_MS=600000       # 429/异常自动恢复探测间隔（默认 10 分钟）
 PROXY_RECOVERY_CONCURRENCY=2            # 每轮恢复探测并发数（小机器建议 1-2）
 PROXY_RECOVERY_BATCH_SIZE=32            # 每轮最多探测节点数，避免大代理池打满 CPU
+PROXY_COOLDOWN_MS=300000              # 单代理/模型遇到 429 或临时错误后的冷却时间（毫秒，默认 5 分钟）
 PROXY_PERSIST_DEBOUNCE_MS=1000          # 代理状态批量落盘延迟，避免每次请求全量写文件
 PROXY_LARGE_POOL_WARNING_THRESHOLD=10000 # 超过此规模启动时输出性能保护警告
 ```

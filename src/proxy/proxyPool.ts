@@ -9,6 +9,14 @@ import { ocId } from "../utils/ids.js";
 
 export type ProxyType = "http" | "https" | "socks5";
 
+export interface ProxyRateLimitState {
+  consecutiveRateLimitCount: number;
+  autoDisabledBy429: boolean;
+  lastRecoveryTestAt: string | null;
+  cooldownUntil: string | null;
+  lastError: string | null;
+}
+
 export interface ProxyNode {
   id: string;
   name: string;
@@ -35,6 +43,7 @@ export interface ProxyNode {
   lastError: string | null;
   lastUsedAt: string | null;
   lastCheckedAt: string | null;
+  rateLimitStates?: Record<string, ProxyRateLimitState>;
 }
 
 export interface ProxyRequestResult {
@@ -69,6 +78,7 @@ interface ProxyState {
   lastError: string | null;
   lastUsedAt: string | null;
   lastCheckedAt: string | null;
+  rateLimitStates?: Record<string, ProxyRateLimitState>;
 }
 
 interface ProxyStateFile {
@@ -95,6 +105,7 @@ export interface ProxyInput {
 
 export interface ProxyLease {
   node: ProxyNode | null;
+  model?: string;
   /** Unique lease token used to make settlement/release idempotent. */
   leaseId?: string;
   agent?: https.Agent;
@@ -118,6 +129,8 @@ export interface ProxyRecoverySummary {
 
 export interface ProxyPoolOptions {
   persistDebounceMs?: number;
+  cooldownMs?: number;
+  max429Failures?: number;
   recoveryConcurrency?: number;
   recoveryBatchSize?: number;
 }
@@ -157,12 +170,14 @@ export class ProxyPoolStore {
   private readonly stateStore: JsonFileStore<ProxyStateFile>;
   private readonly stateJournal: JsonFileStore<ProxyStateJournalEntry>;
   private readonly persistDebounceMs: number;
+  private readonly cooldownMs: number;
+  private readonly max429Failures: number;
   private readonly recoveryConcurrency: number;
   private readonly recoveryBatchSize: number;
   private proxies: ProxyNode[] = [];
   private readonly proxiesById = new Map<string, ProxyNode>();
   private readonly recoveryTestsInFlight = new Set<string>();
-  private readonly activeLeases = new Map<string, string>();
+  private readonly activeLeases = new Map<string, { nodeId: string; model?: string }>();
   private recoveryRunInFlight = false;
   private configPersistTimer: NodeJS.Timeout | undefined;
   private statePersistTimer: NodeJS.Timeout | undefined;
@@ -179,6 +194,8 @@ export class ProxyPoolStore {
     this.stateStore = new JsonFileStore<ProxyStateFile>(`${proxiesFile}.state`);
     this.stateJournal = new JsonFileStore<ProxyStateJournalEntry>(`${proxiesFile}.state.log`);
     this.persistDebounceMs = Math.max(100, options.persistDebounceMs ?? 1000);
+    this.cooldownMs = Math.max(0, options.cooldownMs ?? DEFAULT_PROXY_COOLDOWN_MS);
+    this.max429Failures = Math.max(1, Math.trunc(options.max429Failures ?? 5));
     this.recoveryConcurrency = Math.max(1, Math.min(16, options.recoveryConcurrency ?? 2));
     this.recoveryBatchSize = Math.max(1, Math.min(1000, options.recoveryBatchSize ?? 32));
   }
@@ -258,6 +275,7 @@ export class ProxyPoolStore {
         node.consecutiveRateLimitCount = 0;
         node.autoDisabledBy429 = false;
         node.lastRecoveryTestAt = null;
+        node.rateLimitStates = {};
         if (node.lastError === "Disabled after 5 consecutive 429 responses") node.lastError = null;
       } else {
         // A manual disable must never be mistaken for a 429 circuit break.
@@ -280,8 +298,8 @@ export class ProxyPoolStore {
     const before = this.proxies.length;
     this.proxies = this.proxies.filter((node) => node.id !== id);
     if (this.proxies.length === before) return false;
-    for (const [leaseId, nodeId] of this.activeLeases) {
-      if (nodeId === id) this.activeLeases.delete(leaseId);
+    for (const [leaseId, lease] of this.activeLeases) {
+      if (lease.nodeId === id) this.activeLeases.delete(leaseId);
     }
     this.proxiesById.delete(id);
     this.persistConfig();
@@ -298,7 +316,10 @@ export class ProxyPoolStore {
     for (const candidate of this.proxies) {
       if (!candidate.enabled || excludeProxyIds.has(candidate.id)) continue;
       if (!isProxyCompatibleWithModel(candidate, model)) continue;
-      if (candidate.cooldownUntil && Date.parse(candidate.cooldownUntil) > now) continue;
+      const rateLimitState = model ? this.findRateLimitState(candidate, model) : undefined;
+      if (rateLimitState?.autoDisabledBy429) continue;
+      if (rateLimitState?.cooldownUntil && Date.parse(rateLimitState.cooldownUntil) > now) continue;
+      if (!model && candidate.cooldownUntil && Date.parse(candidate.cooldownUntil) > now) continue;
       if (candidate.dailyRequestLimit !== 0 && candidate.dailyRequestCount >= candidate.dailyRequestLimit) continue;
       if (candidate.currentConcurrency >= candidate.maxConcurrency) continue;
       if (!node || candidate.weight > node.weight) node = candidate;
@@ -315,7 +336,7 @@ export class ProxyPoolStore {
       node.failCount += 1;
       node.lastError = message;
       node.lastCheckedAt = new Date().toISOString();
-      node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
+      node.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
       node.lastRecoveryTestAt = null;
       this.recordResult(node, false, 502);
       this.persistState(node.id);
@@ -329,8 +350,8 @@ export class ProxyPoolStore {
     this.persistState(node.id);
 
     const leaseId = crypto.randomUUID();
-    this.activeLeases.set(leaseId, node.id);
-    return { node: { ...node }, leaseId, agent };
+    this.activeLeases.set(leaseId, { nodeId: node.id, model });
+    return { node: { ...node }, model, leaseId, agent };
   }
 
   release(id: string, leaseId?: string): void {
@@ -343,40 +364,72 @@ export class ProxyPoolStore {
   markSuccess(id: string, leaseId?: string, statusCode = 200): void {
     const node = this.find(id);
     if (!node) return;
-    if (!this.takeLease(id, leaseId)) return;
+    const lease = this.takeLease(id, leaseId);
+    if (!lease) return;
     node.successCount += 1;
-    if (!node.autoDisabledBy429) node.consecutiveRateLimitCount = 0;
-    if (!node.autoDisabledBy429) node.lastRecoveryTestAt = null;
+    const model = lease.model;
+    if (model) {
+      const state = this.rateLimitState(node, model);
+      state.consecutiveRateLimitCount = 0;
+      state.autoDisabledBy429 = false;
+      state.lastRecoveryTestAt = null;
+      state.cooldownUntil = null;
+      state.lastError = null;
+    } else {
+      node.consecutiveRateLimitCount = 0;
+      node.autoDisabledBy429 = false;
+      node.lastRecoveryTestAt = null;
+      node.cooldownUntil = null;
+      node.lastError = null;
+    }
     this.recordResult(node, true, statusCode);
-    if (!node.autoDisabledBy429) node.lastError = null;
     node.lastCheckedAt = new Date().toISOString();
     this.persistState(id);
   }
 
-  markFailure(id: string, error: string, options: { statusCode?: number; cooldownMs?: number; leaseId?: string } = {}): void {
+  markFailure(id: string, error: string, options: { statusCode?: number; cooldownMs?: number; leaseId?: string; model?: string } = {}): void {
     const node = this.find(id);
     if (!node) return;
-    if (!this.takeLease(id, options.leaseId)) return;
+    const lease = this.takeLease(id, options.leaseId);
+    if (!lease) return;
     node.failCount += 1;
     this.recordResult(node, false, options.statusCode || 502);
     node.lastError = error;
     node.lastCheckedAt = new Date().toISOString();
-    if (options.statusCode === 429) {
+    const model = options.model ?? lease.model;
+    if (model && options.statusCode === 429) {
+      const state = this.rateLimitState(node, model);
+      state.consecutiveRateLimitCount += 1;
+      state.lastError = error;
+      state.lastRecoveryTestAt = null;
+      state.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? this.cooldownMs)).toISOString();
+      if (state.consecutiveRateLimitCount >= this.max429Failures) {
+        state.autoDisabledBy429 = true;
+        state.cooldownUntil = null;
+        state.lastError = `Disabled after ${this.max429Failures} consecutive 429 responses for model ${model}`;
+      }
+    } else if (model) {
+      const state = this.rateLimitState(node, model);
+      state.consecutiveRateLimitCount = 0;
+      state.lastError = error;
+      state.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? this.cooldownMs)).toISOString();
+      state.lastRecoveryTestAt = null;
+    } else if (options.statusCode === 429) {
       node.consecutiveRateLimitCount += 1;
-      if (node.consecutiveRateLimitCount >= 5) {
+      if (node.consecutiveRateLimitCount >= this.max429Failures) {
         node.enabled = false;
         node.autoDisabledBy429 = true;
         node.lastRecoveryTestAt = null;
         node.cooldownUntil = null;
-        node.lastError = "Disabled after 5 consecutive 429 responses";
-      }
-    } else {
-      if (!node.autoDisabledBy429) {
-        node.consecutiveRateLimitCount = 0;
-        node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? DEFAULT_PROXY_COOLDOWN_MS)).toISOString();
-        // A new failure should be eligible for the next recovery cycle after its cooldown.
+        node.lastError = `Disabled after ${this.max429Failures} consecutive 429 responses`;
+      } else {
+        node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? this.cooldownMs)).toISOString();
         node.lastRecoveryTestAt = null;
       }
+    } else if (!node.autoDisabledBy429) {
+      node.consecutiveRateLimitCount = 0;
+      node.cooldownUntil = new Date(Date.now() + (options.cooldownMs ?? this.cooldownMs)).toISOString();
+      node.lastRecoveryTestAt = null;
     }
     this.persistState(id);
   }
@@ -416,25 +469,41 @@ export class ProxyPoolStore {
     }
 
     const checkedAt = new Date().toISOString();
+    const modelState = options.model ? this.rateLimitState(node, options.model) : undefined;
     try {
       const statusCode = await this.requestModelHealthCheck(node, options);
       if (statusCode < 200 || statusCode >= 300) {
         throw new Error(`Model health check returned HTTP ${statusCode}`);
       }
       node.lastCheckedAt = checkedAt;
-      if (node.autoDisabledBy429 && !node.enabled) node.lastRecoveryTestAt = checkedAt;
-      node.lastError = null;
-      if (!node.autoDisabledBy429) {
-        node.cooldownUntil = null;
+      if (modelState) {
+        modelState.autoDisabledBy429 = false;
+        modelState.consecutiveRateLimitCount = 0;
+        modelState.lastRecoveryTestAt = null;
+        modelState.cooldownUntil = null;
+        modelState.lastError = null;
+      } else {
+        node.autoDisabledBy429 = false;
+        node.consecutiveRateLimitCount = 0;
         node.lastRecoveryTestAt = null;
+        node.cooldownUntil = null;
+        node.lastError = null;
       }
       this.recordResult(node, true, statusCode);
       this.persistState(id);
       return { ...node };
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Model health check failed";
       node.lastCheckedAt = checkedAt;
-      if (node.autoDisabledBy429 && !node.enabled) node.lastRecoveryTestAt = checkedAt;
-      node.lastError = error instanceof Error ? error.message : "Model health check failed";
+      if (modelState) {
+        modelState.lastRecoveryTestAt = modelState.autoDisabledBy429 ? checkedAt : null;
+        modelState.lastError = message;
+        if (!modelState.autoDisabledBy429) modelState.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
+      } else {
+        node.lastRecoveryTestAt = node.autoDisabledBy429 && !node.enabled ? checkedAt : null;
+        node.lastError = message;
+        if (!node.autoDisabledBy429) node.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
+      }
       this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
       this.persistState(id);
       throw error;
@@ -451,10 +520,12 @@ export class ProxyPoolStore {
       const candidates = this.proxies.filter((node) => {
         if (this.recoveryTestsInFlight.has(node.id)) return false;
         if (!isProxyCompatibleWithModel(node, options.model)) return false;
-        return this.isRecoveryCandidate(node, now, recoveryIntervalMs);
+        return this.isRecoveryCandidate(node, now, recoveryIntervalMs, options.model);
       }).sort((a, b) => {
-        const aTime = a.lastRecoveryTestAt ? Date.parse(a.lastRecoveryTestAt) : 0;
-        const bTime = b.lastRecoveryTestAt ? Date.parse(b.lastRecoveryTestAt) : 0;
+        const aState = this.findRateLimitState(a, options.model);
+        const bState = this.findRateLimitState(b, options.model);
+        const aTime = aState?.lastRecoveryTestAt ? Date.parse(aState.lastRecoveryTestAt) : 0;
+        const bTime = bState?.lastRecoveryTestAt ? Date.parse(bState.lastRecoveryTestAt) : 0;
         return aTime - bTime;
       }).slice(0, this.recoveryBatchSize);
       if (candidates.length === 0) return { tested: 0, recovered: 0 };
@@ -467,47 +538,47 @@ export class ProxyPoolStore {
           const node = queue.shift();
           if (!node) return;
           const candidateNow = Date.now();
-          if (this.recoveryTestsInFlight.has(node.id) || !this.isRecoveryCandidate(node, candidateNow, recoveryIntervalMs)) continue;
+          if (this.recoveryTestsInFlight.has(node.id) || !this.isRecoveryCandidate(node, candidateNow, recoveryIntervalMs, options.model)) continue;
 
           this.recoveryTestsInFlight.add(node.id);
+          const state = this.rateLimitState(node, options.model);
           const recoveryTestAt = new Date().toISOString();
-          node.lastRecoveryTestAt = recoveryTestAt;
+          state.lastRecoveryTestAt = recoveryTestAt;
           this.persistState(node.id);
           tested += 1;
-          const wasAutoDisabled = node.autoDisabledBy429 && !node.enabled;
+          const wasAutoDisabled = state.autoDisabledBy429;
           const expectedState: RecoveryProbeState = {
             enabled: node.enabled,
-            autoDisabledBy429: node.autoDisabledBy429,
+            autoDisabledBy429: state.autoDisabledBy429,
             currentConcurrency: node.currentConcurrency,
-            lastError: node.lastError,
+            lastError: state.lastError,
             lastCheckedAt: node.lastCheckedAt,
             lastRecoveryTestAt: recoveryTestAt,
             endpoint: this.proxyEndpoint(node),
           };
           try {
             const statusCode = await this.requestModelHealthCheck(node, options);
-            if (!this.recoveryStateUnchanged(node, expectedState)) continue;
+            if (!this.recoveryStateUnchanged(node, expectedState, options.model)) continue;
             if (statusCode >= 200 && statusCode < 300) {
-              if (wasAutoDisabled) {
-                node.enabled = true;
-                node.autoDisabledBy429 = false;
-                node.consecutiveRateLimitCount = 0;
-              }
-              node.cooldownUntil = null;
-              node.lastRecoveryTestAt = null;
-              node.lastError = null;
+              state.autoDisabledBy429 = false;
+              state.consecutiveRateLimitCount = 0;
+              state.cooldownUntil = null;
+              state.lastRecoveryTestAt = null;
+              state.lastError = null;
               recovered += 1;
             } else {
-              node.lastError = `Model health check returned HTTP ${statusCode}`;
-              if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
+              state.lastError = `Model health check returned HTTP ${statusCode}`;
+              if (!wasAutoDisabled) state.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
             }
             node.lastCheckedAt = new Date().toISOString();
+            node.lastError = state.lastError;
             this.recordResult(node, statusCode >= 200 && statusCode < 300, statusCode);
           } catch (error) {
-            if (this.recoveryStateUnchanged(node, expectedState)) {
-              node.lastError = error instanceof Error ? error.message : "Model health check failed";
-              if (!wasAutoDisabled) node.cooldownUntil = new Date(Date.now() + DEFAULT_PROXY_COOLDOWN_MS).toISOString();
+            if (this.recoveryStateUnchanged(node, expectedState, options.model)) {
+              state.lastError = error instanceof Error ? error.message : "Model health check failed";
+              if (!wasAutoDisabled) state.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
               node.lastCheckedAt = new Date().toISOString();
+              node.lastError = state.lastError;
               this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
             }
           } finally {
@@ -598,12 +669,27 @@ export class ProxyPoolStore {
     const dailyCountDate = node.dailyCountDate || current;
     const dailyTokensDate = node.dailyTokensDate || current;
     const recentResults = Array.isArray(node.recentResults) ? node.recentResults : [];
+    const legacyAutoDisabledBy429 = Boolean(node.autoDisabledBy429 || (!node.enabled && node.lastError === "Disabled after 5 consecutive 429 responses"));
+    const rateLimitStates = Object.fromEntries(Object.entries(node.rateLimitStates || {}).flatMap(([model, raw]) => {
+      if (!raw || typeof raw !== "object") return [];
+      const state = raw as Partial<ProxyRateLimitState>;
+      return [[model, {
+        consecutiveRateLimitCount: Number.isFinite(state.consecutiveRateLimitCount) ? Math.max(0, Math.trunc(state.consecutiveRateLimitCount as number)) : 0,
+        autoDisabledBy429: Boolean(state.autoDisabledBy429),
+        lastRecoveryTestAt: state.lastRecoveryTestAt || null,
+        cooldownUntil: state.cooldownUntil || null,
+        lastError: state.lastError || null,
+      } satisfies ProxyRateLimitState]];
+    }));
     return {
       ...node,
       name: typeof node.name === "string" && node.name.trim() ? node.name : "未命名代理",
       type: node.type || "http",
       url: typeof node.url === "string" ? node.url : "",
-      enabled: node.enabled !== false,
+      // Legacy node-wide 429 circuit breaks cannot safely be attributed to a
+      // model after an upgrade. Keep manual disables, but make old 429 breaks
+      // eligible again and track new failures per model.
+      enabled: legacyAutoDisabledBy429 ? true : node.enabled !== false,
       weight: Number.isFinite(node.weight) ? Math.max(1, Math.trunc(node.weight)) : 1,
       maxConcurrency: Number.isFinite(node.maxConcurrency) ? Math.max(1, Math.trunc(node.maxConcurrency)) : 10,
       currentConcurrency: 0,
@@ -612,7 +698,7 @@ export class ProxyPoolStore {
       dailyRequestCount: dailyCountDate === current && Number.isFinite(node.dailyRequestCount) ? Math.max(0, Math.trunc(node.dailyRequestCount)) : 0,
       autoDisableWhenDailyLimitReached: Boolean(node.autoDisableWhenDailyLimitReached),
       consecutiveRateLimitCount: Number.isFinite(node.consecutiveRateLimitCount) ? Math.max(0, Math.trunc(node.consecutiveRateLimitCount)) : 0,
-      autoDisabledBy429: Boolean(node.autoDisabledBy429 || (!node.enabled && node.lastError === "Disabled after 5 consecutive 429 responses")),
+      autoDisabledBy429: legacyAutoDisabledBy429 && !node.enabled ? false : Boolean(node.autoDisabledBy429),
       lastRecoveryTestAt: node.lastRecoveryTestAt || null,
       cooldownUntil: node.cooldownUntil || null,
       successCount: Number.isFinite(node.successCount) ? Math.max(0, Math.trunc(node.successCount)) : 0,
@@ -624,6 +710,7 @@ export class ProxyPoolStore {
       lastError: node.lastError || null,
       lastUsedAt: node.lastUsedAt || null,
       lastCheckedAt: node.lastCheckedAt || null,
+      rateLimitStates,
     };
   }
 
@@ -640,8 +727,18 @@ export class ProxyPoolStore {
     node.lastError = "Daily request limit reached";
   }
 
-  private isRecoveryCandidate(node: ProxyNode, now: number, recoveryIntervalMs: number): boolean {
+  private isRecoveryCandidate(node: ProxyNode, now: number, recoveryIntervalMs: number, model?: string): boolean {
     if (node.currentConcurrency > 0) return false;
+    if (model) {
+      const state = this.findRateLimitState(node, model);
+      if (!state) return false;
+      const cooldownAt = state.cooldownUntil ? Date.parse(state.cooldownUntil) : Number.NaN;
+      const cooldownExpired = !state.cooldownUntil || !Number.isFinite(cooldownAt) || cooldownAt <= now;
+      if (!state.autoDisabledBy429 && (!state.lastError || !cooldownExpired)) return false;
+      if (!state.lastRecoveryTestAt) return true;
+      const lastTestAt = Date.parse(state.lastRecoveryTestAt);
+      return !Number.isFinite(lastTestAt) || now - lastTestAt >= recoveryIntervalMs;
+    }
     const autoDisabledBy429 = !node.enabled && node.autoDisabledBy429;
     const cooldownUntil = node.cooldownUntil ? Date.parse(node.cooldownUntil) : Number.NaN;
     const cooldownExpired = !node.cooldownUntil || !Number.isFinite(cooldownUntil) || cooldownUntil <= now;
@@ -652,13 +749,14 @@ export class ProxyPoolStore {
     return !Number.isFinite(lastTestAt) || now - lastTestAt >= recoveryIntervalMs;
   }
 
-  private recoveryStateUnchanged(node: ProxyNode, expected: RecoveryProbeState): boolean {
+  private recoveryStateUnchanged(node: ProxyNode, expected: RecoveryProbeState, model?: string): boolean {
+    const state = model ? this.findRateLimitState(node, model) : undefined;
     return node.enabled === expected.enabled
-      && node.autoDisabledBy429 === expected.autoDisabledBy429
+      && (state ? state.autoDisabledBy429 === expected.autoDisabledBy429 : node.autoDisabledBy429 === expected.autoDisabledBy429)
       && node.currentConcurrency === expected.currentConcurrency
-      && node.lastError === expected.lastError
+      && (state ? state.lastError === expected.lastError : node.lastError === expected.lastError)
       && node.lastCheckedAt === expected.lastCheckedAt
-      && node.lastRecoveryTestAt === expected.lastRecoveryTestAt
+      && (state ? state.lastRecoveryTestAt === expected.lastRecoveryTestAt : node.lastRecoveryTestAt === expected.lastRecoveryTestAt)
       && this.proxyEndpoint(node) === expected.endpoint;
   }
 
@@ -808,19 +906,43 @@ export class ProxyPoolStore {
     return this.proxiesById.get(id);
   }
 
-  private takeLease(id: string, leaseId?: string): boolean {
+  private takeLease(id: string, leaseId?: string): { nodeId: string; model?: string } | null {
     const node = this.find(id);
-    if (!node) return false;
+    if (!node) return null;
+    let lease: { nodeId: string; model?: string } | undefined;
     if (leaseId !== undefined) {
-      if (this.activeLeases.get(leaseId) !== id) return false;
+      const candidate = this.activeLeases.get(leaseId);
+      if (!candidate || candidate.nodeId !== id) return null;
+      lease = candidate;
       this.activeLeases.delete(leaseId);
     } else {
-      const legacyLease = [...this.activeLeases.entries()].find(([, nodeId]) => nodeId === id);
-      if (!legacyLease) return false;
+      const legacyLease = [...this.activeLeases.entries()].find(([, candidate]) => candidate.nodeId === id);
+      if (!legacyLease) return null;
+      lease = legacyLease[1];
       this.activeLeases.delete(legacyLease[0]);
     }
     node.currentConcurrency = Math.max(0, node.currentConcurrency - 1);
-    return true;
+    return lease;
+  }
+
+  private rateLimitState(node: ProxyNode, model: string): ProxyRateLimitState {
+    const key = model.trim() || "__default__";
+    node.rateLimitStates ??= {};
+    const existing = node.rateLimitStates[key];
+    if (existing) return existing;
+    const state: ProxyRateLimitState = {
+      consecutiveRateLimitCount: 0,
+      autoDisabledBy429: false,
+      lastRecoveryTestAt: null,
+      cooldownUntil: null,
+      lastError: null,
+    };
+    node.rateLimitStates[key] = state;
+    return state;
+  }
+
+  private findRateLimitState(node: ProxyNode, model: string): ProxyRateLimitState | undefined {
+    return node.rateLimitStates?.[model.trim() || "__default__"];
   }
 
   /** Flush pending config/state writes before shutdown or an administrative export. */
@@ -959,6 +1081,7 @@ export class ProxyPoolStore {
       lastError: node.lastError,
       lastUsedAt: node.lastUsedAt,
       lastCheckedAt: node.lastCheckedAt,
+      rateLimitStates: node.rateLimitStates,
     };
   }
 

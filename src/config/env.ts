@@ -56,6 +56,7 @@ export interface AppConfig {
   proxyRecoveryConcurrency: number;
   proxyRecoveryBatchSize: number;
   proxyPersistDebounceMs: number;
+  proxyCooldownMs: number;
   proxyLargePoolWarningThreshold: number;
 }
 
@@ -93,6 +94,7 @@ export const loadConfig = (): AppConfig => {
     proxyRecoveryConcurrency: Math.max(1, Math.min(16, intFromEnv("PROXY_RECOVERY_CONCURRENCY", 2))),
     proxyRecoveryBatchSize: Math.max(1, Math.min(1000, intFromEnv("PROXY_RECOVERY_BATCH_SIZE", 32))),
     proxyPersistDebounceMs: Math.max(100, Math.min(60000, intFromEnv("PROXY_PERSIST_DEBOUNCE_MS", 1000))),
+    proxyCooldownMs: Math.max(0, intFromEnv("PROXY_COOLDOWN_MS", 5 * 60 * 1000)),
     proxyLargePoolWarningThreshold: Math.max(1000, intFromEnv("PROXY_LARGE_POOL_WARNING_THRESHOLD", 10000)),
   };
 };

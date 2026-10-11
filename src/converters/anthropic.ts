@@ -1,6 +1,7 @@
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import https from "node:https";
 import type { ServerResponse } from "node:http";
+import { registerResponseAttempt } from "../runtime/responseLifecycle.js";
 import { ocId } from "../utils/ids.js";
 import type { AnthropicMessageRequest, ZenFullResponse } from "../types/api.js";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
@@ -440,7 +441,7 @@ export const pipeZenAsAnthropic = (
     });
   });
 
-  res.on("close", () => {
+  registerResponseAttempt(res, () => {
     if (!settled && !retryStarted) {
       settled = true;
       if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);

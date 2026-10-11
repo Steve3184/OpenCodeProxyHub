@@ -1,6 +1,7 @@
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import https from "node:https";
 import type { ServerResponse } from "node:http";
+import { registerResponseAttempt } from "../runtime/responseLifecycle.js";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
 import type { ProxyPoolStore } from "../proxy/proxyPool.js";
 import type { MetricsStore } from "../observability/metrics.js";
@@ -320,7 +321,7 @@ export const pipeOpenAiStreamStrippingThink = (
     });
   });
 
-  res.on("close", () => {
+  registerResponseAttempt(res, () => {
     if (!settled && !retryStarted) {
       settled = true;
       if (prepared.lease?.node && proxyPool) proxyPool.release(prepared.lease.node.id, prepared.lease.leaseId);
