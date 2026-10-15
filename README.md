@@ -120,6 +120,19 @@ npm start            # 运行已构建的 dist/main.js
 
 > 首次启动会在 `api-keys.json` 自动生成 `admin` 与 `user-default` 两个 Key，明文仅在启动日志中显示一次，文件里只保存 SHA-256 哈希。控制台密码来自 `ADMIN_PASSWORD`（未配置时仅保留开发环境默认值），**对外暴露前务必设置强密码并通过 HTTPS 访问**。控制台登录后由服务端签发临时会话令牌，后续管理请求不再携带管理员密码。
 
+### OpenCode 2 兼容性检查
+
+2026-10-15 的上游适配已对照官方 `@opencode/cli@2.0.29` 抓包验证：此次 403 的根因是会话 ID 使用了升序时间戳，已改为官方的倒序编码。正式请求、重试与代理健康检查同时统一发送新旧会话头；旧头仍能携带有效的倒序 ID，新头属于协议对齐，并非单独修复条件。消息与工具调用 ID 保持原有编码。
+
+```bash
+npm run check:opencode-compat   # 离线回归：会话编码、各协议请求头、健康检查、重试
+npm run build
+# 使用受保护文件中的第一条 HTTP(S) 代理 URL；不会打印代理凭据
+PROXY_MODE=required PROXY_URL_FILE=/path/to/private-proxies.txt node scripts/check-models.mjs big-pickle
+```
+
+模型检查脚本复用正式请求构造和 SSE 聚合逻辑；可在命令行指定模型，省略时检查内置列表。上游模型可用性、配额和协议支持仍独立变化：例如 `big-pickle` 的下游 Responses 兼容接口应保持 Chat 上游，开启该模型的“使用 Responses 上游”会收到上游“不支持此协议”。
+
 更多健康检查、冒烟测试、备份、反向代理与升级说明见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)。公网部署建议在前面再放一层 Nginx/Caddy 等 HTTPS 反向代理（请求体上限需至少放行 `1 GiB`，并保留 `Authorization`/`x-api-key` 头、支持长连接 SSE、关闭对流式路径的缓冲）。
 
 ## 二进制部署（Linux）

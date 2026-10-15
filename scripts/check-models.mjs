@@ -1,103 +1,45 @@
-import https from "node:https";
-import crypto from "node:crypto";
+import fs from "node:fs";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { loadConfig } from "../dist/config/env.js";
+import { DEFAULT_MODELS } from "../dist/models/catalog.js";
+import { prepareZenRequest, requestZenFull } from "../dist/providers/zenClient.js";
+import { createToolNameMapper } from "../dist/converters/toolMapping.js";
+import { ocSessionId } from "../dist/utils/ids.js";
 
-const ZEN_HOST = "opencode.ai";
-const ZEN_PATH = "/zen/v1/chat/completions";
-const SYSTEMONE_PATH = "/zen/v1/systemone";
-const OC_VERSION = "1.15.0";
-const TIMEOUT_MS = 120000;
+// Share production headers, identifiers, tool declarations and SSE aggregation.
+const config = loadConfig();
+const ZEN_HOST = config.zenHost;
+const ZEN_PATH = config.zenPath;
+const requestedModels = process.argv.slice(2);
+const MODELS = requestedModels.length ? requestedModels : [...DEFAULT_MODELS];
+const proxyUrl = process.env.PROXY_URL_FILE
+  ? fs.readFileSync(process.env.PROXY_URL_FILE, "utf8").split(String.fromCharCode(10)).map(line => line.trim()).find(Boolean)
+  : process.env.PROXY_URL;
+if (process.env.PROXY_URL_FILE && !proxyUrl) throw new Error("PROXY_URL_FILE contains no proxy URL");
+if (!proxyUrl && config.proxyMode === "required") throw new Error("Set PROXY_URL_FILE or PROXY_URL when PROXY_MODE=required");
+const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl, { timeout: config.upstreamTimeoutMs }) : undefined;
 
-const MODELS = [
-  "big-pickle",
-  "nemotron-3-ultra-free",
-  "nemotron-3.5-lightning-free",
-  "mimo-v2.5-free",
-  "ling-3.0-flash-fin-free",
-  "muse-spark-1.2-contributor-free",
-  "muse-spark-1.3-contributor-free",
-  "mimo-v2.6-flash-free",
-  "jev-1.13-free",
-];
-
-const ocId = (prefix) => {
-  const ts = Date.now().toString(16);
-  const rnd = crypto.randomBytes(12).toString("base64url").slice(0, 16);
-  return `${prefix}_${ts}${rnd}`;
-};
-
-const testModel = (model) => {
-  return new Promise((resolve) => {
-    const started = Date.now();
-    const systemone = model === "jev-1.13-free";
-    const body = JSON.stringify(systemone ? {
-      model,
+const testModel = async (model) => {
+  const started = Date.now();
+  const systemone = model === "jev-1.13-free";
+  const prepared = prepareZenRequest(config, {
+    model, sessionId: ocSessionId(), toolMapper: createToolNameMapper([]),
+    protocol: systemone ? "systemone" : "chat_completions",
+    messages: [{ role: "user", content: "Reply with exactly: OK" }],
+    parameters: { max_tokens: 512 },
+    ...(systemone ? { responseBody: {
       state: "Reply with exactly: OK",
       questions: { answer: { type: "choice", instructions: "What is the answer?", criteria: { ok: "The answer is OK" } } },
-    } : {
-      model,
-      messages: [{ role: "user", content: "Reply with exactly: OK" }],
-      stream: false,
-    });
-    const options = {
-      hostname: ZEN_HOST,
-      port: 443,
-      path: systemone ? SYSTEMONE_PATH : ZEN_PATH,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-        Authorization: "Bearer public",
-        "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
-        "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": ocId("msg"),
-        "x-opencode-session": ocId("ses"),
-      },
-      timeout: TIMEOUT_MS,
-    };
-
-    const req = https.request(options, (res) => {
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        const durationMs = Date.now() - started;
-        const raw = Buffer.concat(chunks).toString();
-        let data = null;
-        try { data = JSON.parse(raw); } catch {}
-        resolve({
-          model,
-          status: res.statusCode,
-          durationMs,
-          data,
-          raw: raw.slice(0, 500),
-        });
-      });
-    });
-
-    req.on("error", (error) => {
-      resolve({
-        model,
-        status: 0,
-        durationMs: Date.now() - started,
-        data: null,
-        raw: `ERROR: ${error.message}`,
-      });
-    });
-
-    req.on("timeout", () => {
-      req.destroy();
-      resolve({
-        model,
-        status: 0,
-        durationMs: Date.now() - started,
-        data: null,
-        raw: "TIMEOUT",
-      });
-    });
-
-    req.write(body);
-    req.end();
+    } } : {}),
   });
+  if (agent) prepared.options.agent = agent;
+  try {
+    const response = await requestZenFull(prepared, undefined, undefined, undefined, 0, systemone ? "systemone" : "chat_completions");
+    return { model, ...response, durationMs: Date.now() - started };
+  } catch {
+    // Transport exception text can contain a proxy credential.
+    return { model, status: 0, durationMs: Date.now() - started, data: { error: { message: "Upstream transport failed (connection or timeout)" } }, raw: "Transport failure" };
+  }
 };
 
 const formatDuration = (ms) => {
@@ -107,6 +49,12 @@ const formatDuration = (ms) => {
 
 const padRight = (str, len) => str.padEnd(len);
 const padLeft = (str, len) => str.padStart(len);
+
+const isAvailable = (result) => result.status === 200
+  && !result.data?.error && result.data?.type !== "error"
+  && (result.model === "jev-1.13-free"
+    ? result.data?.answers && typeof result.data.answers === "object"
+    : result.data?.choices?.some(choice => typeof choice.message?.content === "string" && choice.message.content.trim()));
 
 const startTime = Date.now();
 
@@ -125,13 +73,13 @@ for (const model of MODELS) {
   const result = await testModel(model);
   results.push(result);
 
-  if (result.status === 200 && result.data?.choices?.[0]?.message?.content) {
+  if (isAvailable(result) && result.data?.choices?.[0]?.message?.content) {
     const content = result.data.choices[0].message.content.slice(0, 50);
     console.log(`✅ ${result.status} | ${formatDuration(result.durationMs)} | reply: "${content}"`);
-  } else if (result.status === 200) {
+  } else if (isAvailable(result)) {
     console.log(`✅ ${result.status} | ${formatDuration(result.durationMs)} | (response received)`);
   } else {
-    const errMsg = result.data?.error?.message || result.data?.type || result.raw?.slice(0, 150);
+    const errMsg = result.data?.error?.message || result.data?.type || "No usable response output";
     console.log(`❌ ${result.status} | ${formatDuration(result.durationMs)} | ${errMsg}`);
   }
 }
@@ -144,8 +92,8 @@ console.log("SUMMARY");
 console.log("=".repeat(80));
 console.log("");
 
-const available = results.filter(r => r.status === 200 && (r.model === "jev-1.13-free" ? Boolean(r.data?.answers) : r.data?.choices?.length > 0));
-const failed = results.filter(r => !(r.status === 200 && (r.model === "jev-1.13-free" ? Boolean(r.data?.answers) : r.data?.choices?.length > 0)));
+const available = results.filter(isAvailable);
+const failed = results.filter(r => !isAvailable(r));
 
 console.log(`✅ Available: ${available.length}/${results.length}`);
 console.log(`❌ Failed:     ${failed.length}/${results.length}`);
@@ -175,3 +123,5 @@ if (failed.length === 0) {
   console.log("⚠️  Some models are not available.");
   process.exitCode = 1;
 }
+
+agent?.destroy();

@@ -1471,3 +1471,30 @@ Verified:
 - `GET /health` returns `status=ok`.
 - `GET /admin/settings` shows `openAiStreamTransformModels` persisted with `qwen3.6-plus-free` in Docker data.
 - Manual `qwen3.6-plus-free` streaming validation in local development returned OpenAI `data:` chunks with `reasoning_content`, final `content`, and terminal `data: [DONE]` without Anthropic `event:` frames.
+
+## 2026-10-15 — OpenCode 2 inference compatibility
+
+Reproduction and isolation:
+
+- The v1 package, opencode-ai, still resolves to 1.19.0. OpenCode 2 ships as @opencode/cli; the isolated client used for this investigation reports 2.0.29.
+- Captured the official v2 client's request with a loopback HTTP mock, then replayed controlled variants through the user-supplied HTTP proxies. Proxy credentials stayed in private temporary files and are not part of the repository.
+- The original gateway request returned FreeTierError / HTTP 403 on three proxies, while model discovery returned 200. Replaying the official request returned 200 and a complete OK answer.
+- User-Agent replacement alone failed. Adding the canonical x-opencode-session-id with a captured valid session succeeded; generating it with the gateway's ascending timestamp still failed. Inverting the timestamp component, as the official SessionID.create() does, restored successful inference.
+- Final isolation confirmed that a valid descending session also works through the legacy header, and the old User-Agent is accepted. Timestamp encoding is the root cause; adding the canonical header is protocol alignment, not an independently necessary fix.
+- Trace headers, the official system prompt and the complete v2 tool catalog were unnecessary for the successful reduced request. Existing tool declarations and conversion behavior were retained.
+
+Implementation:
+
+- Centralized inference and health-check headers in src/providers/opencodeHeaders.ts, including canonical and legacy session headers and the captured v2 User-Agent format.
+- Added descending session identifiers without changing ascending message/tool identifiers. Each attempt and health probe still gets a fresh session.
+- Added check:opencode-compat for exact identifier encoding, all upstream protocol headers, health probes and proxy retry/lease settlement; included it in binary CI.
+- Updated scripts/check-models.mjs to use the production request builder/aggregator, accept selected models and a private HTTP(S) proxy URL file, and reject empty/error responses even when HTTP status is 200.
+
+Validation:
+
+- typecheck, check:opencode-compat, check:tools, check:proxy-routing, check:responses, check:models-transport, check:systemone, check:proxy-rate-limit, check:response-lifecycle and build:all passed.
+- Isolated gateway requests through the supplied proxies returned complete OK text for big-pickle and mimo-v2.6-flash-free across Chat Completions, Responses conversion and Anthropic, each with streaming on and off: 12/12 passed.
+- Chat proxy health check passed. The production-backed model diagnostic passed for big-pickle and jev-1.13-free (System One).
+- Native Responses upstream for big-pickle returned HTTP 400, "Model does not support this protocol." Its downstream Responses conversion works with the default Chat upstream; this is a separate upstream model capability limit.
+- Official @opencode/cli 2.0.29 connected to the isolated gateway over loopback: its main conversation returned OK and exited 0. Background auxiliary requests also produced 400/403 responses, so this does not establish compatibility with every automatically selected auxiliary model.
+- No deployment, persistent proxy import or global OpenCode upgrade was performed.

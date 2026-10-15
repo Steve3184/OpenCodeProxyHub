@@ -2,7 +2,7 @@ import https from "node:https";
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import type { ServerResponse } from "node:http";
 import { registerResponseAttempt } from "../runtime/responseLifecycle.js";
-import { ocId } from "../utils/ids.js";
+import { createOpenCodeHeaders } from "./opencodeHeaders.js";
 import type { AppConfig } from "../config/env.js";
 import type { ZenFullResponse } from "../types/api.js";
 import type { ProxyLease, ProxyPoolStore } from "../proxy/proxyPool.js";
@@ -13,7 +13,6 @@ import { aggregateUpstreamBody, type UpstreamProtocol } from "../converters/stre
 import { DownstreamToolCallFilter, ResponsesStreamToolFilter, applyToolFilterToChatCompletion, applyToolFilterToResponsesResponse, toUpstreamMessages, toUpstreamToolChoice, toUpstreamTools, type ToolNameMapper } from "../converters/toolMapping.js";
 import { isOpenCodeProxyAccessError, isUpstreamRateLimitError, shouldRetryWithAnotherProxy } from "./opencodeAccessErrors.js";
 
-const OC_VERSION = "1.18.31";
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
 export interface ZenRequestInput {
@@ -93,7 +92,6 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
   }
 
   const body = JSON.stringify(requestBody);
-  const requestId = ocId("msg");
 
   const lease = proxyPool?.acquire(excludeProxyIds, input.model);
   return {
@@ -105,17 +103,7 @@ export const prepareZenRequest = (config: AppConfig, input: ZenRequestInput, pro
         ? config.zenResponsesPath
         : protocol === "systemone" ? config.zenSystemonePath : config.zenPath,
       method: "POST",
-      headers: {
-        "Accept-Encoding": "identity",
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-        Authorization: "Bearer public",
-        "User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
-        "x-opencode-client": "cli",
-        "x-opencode-project": "global",
-        "x-opencode-request": requestId,
-        "x-opencode-session": input.sessionId,
-      },
+      headers: createOpenCodeHeaders(body, input.sessionId),
       ...(lease?.agent ? { agent: lease.agent } : {}),
       timeout: config.upstreamTimeoutMs,
     },

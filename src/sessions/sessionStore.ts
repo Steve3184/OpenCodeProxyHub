@@ -1,4 +1,4 @@
-import { ocId } from "../utils/ids.js";
+import { ocId, ocSessionId } from "../utils/ids.js";
 
 const firstHeader = (value: string | string[] | undefined): string | undefined => Array.isArray(value) ? value[0] : value;
 
@@ -9,7 +9,7 @@ export class SessionStore {
    * OpenCode" 403, so each upstream attempt gets a fresh session id.
    */
   getSession(_scope: string): string {
-    return ocId("ses");
+    return ocSessionId();
   }
 }
 

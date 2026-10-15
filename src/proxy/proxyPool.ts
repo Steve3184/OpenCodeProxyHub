@@ -5,8 +5,9 @@ import { SocksProxyAgent } from "socks-proxy-agent";
 import { JsonFileStore } from "../storage/jsonFile.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { HttpPreProxyToHttpAgent, HttpPreProxyToSocksAgent } from "./chainedAgent.js";
-import { ocId } from "../utils/ids.js";
+import { ocSessionId } from "../utils/ids.js";
 import { isConsoleProviderError } from "../providers/opencodeAccessErrors.js";
+import { createOpenCodeHeaders } from "../providers/opencodeHeaders.js";
 
 export type ProxyType = "http" | "https" | "socks5";
 
@@ -808,17 +809,7 @@ export class ProxyPoolStore {
         port: 443,
         path: options.path,
         method: "POST",
-        headers: {
-          "Accept-Encoding": "identity",
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-          Authorization: "Bearer public",
-          "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
-          "x-opencode-client": "cli",
-          "x-opencode-project": "global",
-          "x-opencode-request": ocId("proxy-health"),
-          "x-opencode-session": ocId("ses"),
-        },
+        headers: createOpenCodeHeaders(body, ocSessionId()),
         agent: this.createAgent(node),
         timeout: options.timeoutMs,
       }, (res) => {

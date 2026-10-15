@@ -105,6 +105,7 @@ jobs:
           npm run check:logging
           npm run check:models-transport
           npm run check:proxy-routing
+          npm run check:opencode-compat
           npm run check:proxy-rate-limit
           npm run check:response-lifecycle
 

@@ -6,14 +6,15 @@ const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 let lastTimestamp = 0;
 let counter = 0;
 
-export const ocId = (prefix: string): string => {
+export const ocId = (prefix: string, descending = false): string => {
   const currentTimestamp = Date.now();
   if (currentTimestamp !== lastTimestamp) {
     lastTimestamp = currentTimestamp;
     counter = 0;
   }
   counter++;
-  const now = BigInt(currentTimestamp) * BigInt(0x1000) + BigInt(counter);
+  const current = BigInt(currentTimestamp) * BigInt(0x1000) + BigInt(counter);
+  const now = descending ? ~current : current;
   const timeBytes = Buffer.alloc(6);
   for (let i = 0; i < 6; i++) {
     timeBytes[i] = Number((now >> BigInt(40 - 8 * i)) & BigInt(0xff));
@@ -21,3 +22,7 @@ export const ocId = (prefix: string): string => {
   const rnd = Array.from(crypto.randomBytes(14), (b) => BASE62[b % 62]).join("");
   return `${prefix}_${timeBytes.toString("hex")}${rnd}`;
 };
+
+// OpenCode SessionID.create() uses descending identifiers, while message and
+// tool IDs ascend. The upstream validates this timestamp encoding.
+export const ocSessionId = (): string => ocId("ses", true);
