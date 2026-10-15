@@ -31,6 +31,7 @@ export interface ModelItem {
   created: number;
   displayName?: string;
   useResponses?: boolean;
+  responsesOnly?: boolean;
   systemOneOnly?: boolean;
 }
 

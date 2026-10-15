@@ -32,14 +32,13 @@ OpenCodeProxyHub 默认内置以下免费模型；其中 Jev 可通过 TypeSafe 
 | `big-pickle` | OpenCode 免费模型 |
 | `nemotron-3-ultra-free` | Nvidia Nemotron 3 Ultra 免费模型 |
 | `nemotron-3.5-lightning-free` | Nvidia Nemotron 3.5 Lightning 免费模型 |
-| `mimo-v2.5-free` | Mimo v2.5 免费模型 |
 | `ling-3.0-flash-fin-free` | Ling 3.0 Flash Fin 免费模型 |
-| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 Contributor 免费模型 |
-| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 Contributor 免费模型 |
+| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 Contributor 免费模型（固定使用 Responses 上游） |
+| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 Contributor 免费模型（固定使用 Responses 上游） |
 | `mimo-v2.6-flash-free` | Mimo v2.6 Flash 免费模型 |
 | `jev-1.13-free` | Jev 1.13 免费模型（**仅 System One，不支持聊天/Responses/Anthropic 协议**） |
 
-新部署会自动生成以上默认模型；已有部署升级后，缺失的默认免费模型会自动追加到已有 `models.json`，不会覆盖用户已修改的模型配置。已下线的模型（如 `deepseek-v4-flash-free`、`hy3-free`、`laguna-s-2.1-free`）会在升级时自动禁用并标记下线原因，用户无需手动清理。
+新部署会自动生成以上默认模型；已有部署升级后，缺失的默认免费模型会自动追加到已有 `models.json`，保留用户的启用状态和可选协议设置。`muse-` 开头的模型仅支持 Responses 上游，已有配置会自动迁移，控制台对应复选框固定勾选且不可关闭；下游仍可使用 OpenAI Chat Completions、Responses 和 Anthropic 兼容接口。已下线的模型（如 `mimo-v2.5-free`、`deepseek-v4-flash-free`、`hy3-free`、`laguna-s-2.1-free`）会在升级时自动禁用并标记下线原因，用户无需手动清理。
 
 ## 部署方式
 

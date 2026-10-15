@@ -4,13 +4,15 @@ export const DEFAULT_MODELS = [
   "big-pickle",
   "nemotron-3-ultra-free",
   "nemotron-3.5-lightning-free",
-  "mimo-v2.5-free",
   "ling-3.0-flash-fin-free",
   "muse-spark-1.2-contributor-free",
   "muse-spark-1.3-contributor-free",
   "mimo-v2.6-flash-free",
   "jev-1.13-free",
 ] as const;
+
+/** Muse models only accept the upstream Responses protocol. */
+export const isResponsesOnlyModel = (modelId: string): boolean => modelId.startsWith("muse-");
 
 /**
  * Models that upstream only serves through the TypeSafe System One endpoint.
@@ -29,6 +31,7 @@ export const SYSTEMONE_ONLY_MODELS: ReadonlySet<string> = new Set([
  * startup so existing deployments don't encounter 401 errors after upgrade.
  */
 export const RETIRED_MODELS: ReadonlyArray<{ id: string; reason: string }> = [
+  { id: "mimo-v2.5-free", reason: "Model no longer supported by upstream" },
   { id: "deepseek-v4-flash-free", reason: "Model no longer offered as a free model by upstream" },
   { id: "hy3-free", reason: "Model no longer offered as a free model by upstream" },
   { id: "laguna-s-2.1-free", reason: "Model no longer offered as a free model by upstream" },
@@ -55,6 +58,8 @@ export interface ModelConfig {
   displayName?: string;
   /** Route this model to the upstream OpenAI Responses endpoint. */
   useResponses?: boolean;
+  /** Derived (never persisted): this id requires the upstream Responses endpoint. */
+  responsesOnly?: boolean;
   /** Derived (never persisted): this id only exists on the upstream System One endpoint. */
   systemOneOnly?: boolean;
 }
@@ -87,7 +92,11 @@ export class ModelConfigStore {
   }
 
   list(): ModelConfig[] {
-    return this.models.map((model) => ({ ...model, systemOneOnly: SYSTEMONE_ONLY_MODELS.has(model.id) }));
+    return this.models.map((model) => ({
+      ...model,
+      responsesOnly: isResponsesOnlyModel(model.id),
+      systemOneOnly: SYSTEMONE_ONLY_MODELS.has(model.id),
+    }));
   }
 
   listEnabled(): ModelConfig[] {
@@ -99,7 +108,7 @@ export class ModelConfigStore {
   }
 
   usesResponses(modelId: string): boolean {
-    return this.models.some((model) => model.id === modelId && model.useResponses === true);
+    return isResponsesOnlyModel(modelId) || this.models.some((model) => model.id === modelId && model.useResponses === true);
   }
 
   /**
@@ -125,6 +134,9 @@ export class ModelConfigStore {
   upsert(id: string, input: ModelUpdateInput): ModelConfig {
     const cleanId = id.trim();
     if (!cleanId) throw new Error("Model id is required");
+    if (isResponsesOnlyModel(cleanId) && input.useResponses === false) {
+      throw new Error(`Model ${cleanId} only supports the Responses upstream protocol`);
+    }
 
     let model = this.models.find((item) => item.id === cleanId);
     if (!model) {
@@ -137,9 +149,10 @@ export class ModelConfigStore {
     if (input.created !== undefined) model.created = input.created;
     if (input.displayName !== undefined) model.displayName = input.displayName.trim() || undefined;
     if (input.useResponses !== undefined) model.useResponses = input.useResponses;
+    if (isResponsesOnlyModel(cleanId)) model.useResponses = true;
 
     this.persist();
-    return { ...model };
+    return { ...model, responsesOnly: isResponsesOnlyModel(cleanId), systemOneOnly: SYSTEMONE_ONLY_MODELS.has(cleanId) };
   }
 
   delete(id: string): boolean {
@@ -159,6 +172,10 @@ export class ModelConfigStore {
     const existingIds = new Set(merged.map((model) => model.id));
     for (const model of this.defaultModels()) {
       if (!existingIds.has(model.id)) merged.push(model);
+    }
+    // Migrate saved Chat settings and cover newly discovered Muse models.
+    for (const model of merged) {
+      if (isResponsesOnlyModel(model.id)) model.useResponses = true;
     }
     // Auto-disable retired models on startup
     for (const retired of RETIRED_MODELS) {

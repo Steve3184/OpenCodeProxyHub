@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
@@ -30,8 +30,26 @@ const assertHeaders = (headers: Record<string, unknown>) => {
   assert.equal(headers["content-encoding"], undefined);
 };
 try {
+  const fresh = new ModelConfigStore(path.join(tempDir, "fresh-models.json"));
+  fresh.load();
+  assert.equal(fresh.list().some((model) => model.id === "mimo-v2.5-free"), false);
+  assert.ok(fresh.list().filter((model) => model.id.startsWith("muse-")).every((model) => model.useResponses && model.responsesOnly));
+  const muse = "muse-spark-1.3-contributor-free";
+  const newMuse = "muse-future-free";
+  await writeFile(config.modelsFile, JSON.stringify({ version: 1, models: [
+    { id: "mimo-v2.5-free", enabled: true, ownedBy: "saved-owner", created: 1, displayName: "Saved MiMo" },
+    { id: muse, enabled: true, ownedBy: "saved-owner", created: 2, useResponses: false },
+    { id: "muse-spark-1.2-contributor-free", enabled: false, ownedBy: "saved-owner", created: 3 },
+  ] }));
   const built = await buildApp(config);
   app = built.app;
+  const migrated = (JSON.parse(await readFile(config.modelsFile, "utf8")) as { models: ModelConfig[] }).models;
+  assert.equal(migrated.find((model) => model.id === "mimo-v2.5-free")?.enabled, false);
+  assert.match(migrated.find((model) => model.id === "mimo-v2.5-free")?.displayName || "", /^Saved MiMo \(retired:/);
+  assert.equal(migrated.find((model) => model.id === muse)?.useResponses, true);
+  assert.equal(migrated.find((model) => model.id === "muse-spark-1.2-contributor-free")?.enabled, false);
+  assert.equal(migrated.find((model) => model.id === "muse-spark-1.2-contributor-free")?.useResponses, true);
+  assert.ok(migrated.every((model) => model.responsesOnly === undefined));
   const login = await app.inject({ method: "POST", url: "/admin/login", payload: { password: "test-only" } });
   assert.equal(login.statusCode, 200);
   assertHeaders(login.headers);
@@ -46,8 +64,14 @@ try {
     const reply = await app!.inject({ method: "PATCH", url: "/admin/settings", headers: admin, payload });
     assert.equal(reply.statusCode, 200);
   };
+  const refused = await app.inject({ method: "PUT", url: `/admin/models/${muse}`, headers: admin, payload: { enabled: false, useResponses: false } });
+  assert.equal(refused.statusCode, 400);
+  assert.match(refused.json().error.message, /only supports the Responses/);
+  const afterRefused = ((await app.inject({ url: "/admin/models", headers: admin })).json().data as ModelConfig[]).find((model) => model.id === muse);
+  assert.equal(afterRefused?.enabled, true, "Rejected protocol edits must not partially change the model");
+  assert.equal(afterRefused?.useResponses, true);
+  console.log("[pass] fresh defaults omit retired MiMo; saved models migrate without changing Muse enabled states; Chat overrides are refused atomically");
   await setModel("big-pickle", { enabled: false, useResponses: true, displayName: "My disabled model" });
-  await setModel("mimo-v2.5-free", { enabled: false });
   await setModel("custom-free", { enabled: true });
   await setSettings({ openAiStreamTransformModels: ["big-pickle"], reasoningTagModels: ["mimo-v2.5-free"] });
   let upstreamFails = false;
@@ -58,12 +82,13 @@ try {
     assert.equal(new Headers(init?.headers).get("accept-encoding"), "identity");
     syncRequests++;
     if (upstreamFails) return new Response("Unavailable", { status: 503 });
-    return Response.json({ data: ["big-pickle", "mimo-v2.5-free", "custom-free", "discovered-free", "paid-model"].map((id) => ({ id, owned_by: "updated-owner", created: 1234567890 })) });
+    return Response.json({ data: ["big-pickle", "mimo-v2.5-free", "custom-free", "discovered-free", muse, newMuse, "deepseek-v4-flash-free", "paid-model"].map((id) => ({ id, owned_by: "updated-owner", created: 1234567890 })) });
   };
   for (let i = 0; i < 2; i++) {
     const sync = await app.inject({ method: "POST", url: "/admin/models/sync-free", headers: admin });
     assert.equal(sync.statusCode, 200);
-    assert.equal(sync.json().data.synced, 4);
+    assert.equal(sync.json().data.synced, 5);
+    assert.equal(sync.json().data.models.includes("mimo-v2.5-free"), false);
     assertHeaders(sync.headers);
   }
   const catalog = (await app.inject({ url: "/admin/models", headers: admin })).json().data as ModelConfig[];
@@ -76,6 +101,13 @@ try {
   assert.equal(catalog.find((m) => m.id === "custom-free")?.enabled, true);
   assert.equal(catalog.find((m) => m.id === "discovered-free")?.enabled, true);
   assert.equal(catalog.some((m) => m.id === "paid-model"), false);
+  assert.equal(catalog.some((m) => m.id === "deepseek-v4-flash-free"), false);
+  for (const id of [muse, newMuse]) {
+    const model = catalog.find((m) => m.id === id);
+    assert.equal(model?.enabled, true);
+    assert.equal(model?.useResponses, true);
+    assert.equal(model?.responsesOnly, true);
+  }
   const settings = (await app.inject({ url: "/admin/settings", headers: admin })).json().data;
   assert.deepEqual(settings.openAiStreamTransformModels, ["big-pickle"]);
   assert.deepEqual(settings.reasoningTagModels, ["mimo-v2.5-free"]);
@@ -84,9 +116,13 @@ try {
   assert.equal(reloaded.isEnabled("big-pickle"), false);
   assert.equal(reloaded.isEnabled("mimo-v2.5-free"), false);
   assert.equal(reloaded.usesResponses("big-pickle"), true);
+  assert.equal(reloaded.usesResponses(muse), true);
+  assert.equal(reloaded.usesResponses(newMuse), true);
+  assert.deepEqual(reloaded.list(), catalog, "Repeated startup preserves migration results");
   const publicModels = await app.inject({ url: "/v1/models" });
   assertHeaders(publicModels.headers);
   assert.equal(publicModels.json().data.some((m: ModelConfig) => m.id === "big-pickle"), false);
+  assert.equal(publicModels.json().data.some((m: ModelConfig) => m.id === "mimo-v2.5-free"), false);
   upstreamFails = true;
   const failed = await app.inject({ method: "POST", url: "/admin/models/sync-free", headers: admin });
   assert.equal(failed.statusCode, 500);
@@ -109,15 +145,18 @@ try {
   let upstreamStatus = 200;
   let upstreamError: string | undefined;
   let splitError = false;
+  const capturedRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
   const chatBody = 'data: {"id":"test","object":"chat.completion.chunk","model":"big-pickle","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\ndata: {"id":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
   const anthropicBody = 'event: message_start\ndata: {"type":"message_start","message":{"id":"test","usage":{"input_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
   const responsesBody = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hello"}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_test","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}]}}\n\n';
   https.request = ((options: https.RequestOptions, callback: (response: EventEmitter) => void) => {
     assert.equal((options.headers as Record<string, string>)["Accept-Encoding"], "identity");
-    const request = new EventEmitter() as EventEmitter & { write: () => void; end: () => void; destroy: () => void };
-    request.write = () => {};
+    let requestBody = "";
+    const request = new EventEmitter() as EventEmitter & { write: (chunk: string | Buffer) => void; end: () => void; destroy: () => void };
+    request.write = (chunk) => { requestBody += chunk.toString(); };
     request.destroy = () => {};
     request.end = () => queueMicrotask(() => {
+      capturedRequests.push({ path: String(options.path), body: JSON.parse(requestBody) });
       const response = Object.assign(new EventEmitter(), { statusCode: upstreamStatus, resume: () => {} });
       callback(response);
       const body = upstreamError ?? (upstreamStatus !== 200 ? '{"error":{"message":"test upstream error"}}' : wire === "anthropic" ? anthropicBody : wire === "responses" ? responsesBody : wire === "systemone" ? '{"answer":"Hello"}' : chatBody);
@@ -147,6 +186,34 @@ try {
       assert.doesNotThrow(() => JSON.parse(result.body));
     }
   };
+  built.modelAliasStore.update({ aliases: [{ downstreamModelId: "friendly-muse", upstreamModelId: muse }] });
+  wire = "responses";
+  for (const model of [muse, newMuse, "friendly-muse"]) {
+    for (const url of ["/v1/chat/completions", "/v1/responses", "/v1/messages"]) {
+      for (const stream of [false, true]) {
+        const before = capturedRequests.length;
+        const result = await app.inject({ method: "POST", url, headers: client, payload: { ...payloadFor(url, stream), model } });
+        assert.equal(result.statusCode, 200, `${model} ${url}: ${result.body}`);
+        assert.equal(capturedRequests.length, before + 1);
+        const upstream = capturedRequests.at(-1)!;
+        assert.equal(upstream.path, config.zenResponsesPath);
+        assert.equal(upstream.body.model, model === "friendly-muse" ? muse : model);
+        assert.ok(upstream.body.input);
+        assert.equal(upstream.body.messages, undefined);
+        assert.equal(upstream.body.stream, true);
+        assert.ok(result.body.includes("Hello"));
+        if (stream) {
+          assert.match(String(result.headers["content-type"]), /text\/event-stream/);
+          assert.ok(result.body.includes(url === "/v1/chat/completions" ? "[DONE]" : url === "/v1/responses" ? "response.completed" : "message_stop"));
+        } else {
+          const body = result.json();
+          const text = url === "/v1/chat/completions" ? body.choices[0].message.content : url === "/v1/responses" ? body.output[0].content[0].text : body.content[0].text;
+          assert.equal(text, "Hello");
+        }
+      }
+    }
+  }
+  console.log("[pass] saved, newly synced and aliased Muse models use Responses upstream across all three downstream protocols, streaming and JSON");
   for (const useResponses of [false, true]) {
     await setModel("big-pickle", { useResponses });
     wire = useResponses ? "responses" : "chat";

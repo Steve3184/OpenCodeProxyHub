@@ -3,7 +3,6 @@ import { Activity, RefreshCw } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { fadeIn } from "@/lib/motion";
 import type { ConsoleData } from "../hooks/useConsoleData";
@@ -52,6 +51,7 @@ export function ModelsView({ data }: { data: ConsoleData }) {
                 const reasoningEnabled = Boolean(settings?.reasoningTagModels?.includes(model.id));
                 const responsesEnabled = Boolean(model.useResponses);
                 const systemOneOnly = Boolean(model.systemOneOnly);
+                const responsesOnly = Boolean(model.responsesOnly);
                 return (
                   <tr key={model.id} className={cn("transition-colors hover:bg-muted/30", !model.enabled && "bg-muted/15")}>
                     <th scope="row" className="max-w-[320px] px-4 py-4 font-normal">
@@ -66,13 +66,13 @@ export function ModelsView({ data }: { data: ConsoleData }) {
                       <Badge variant={model.enabled ? "success" : "muted"}>{model.enabled ? "启用" : "禁用"}</Badge>
                     </td>
                     <td className="px-4 py-4">
-                      <ModelSetting label={`${model.id} 使用 Responses 上游`} desc={systemOneOnly ? "仅支持 /v1/systemone" : responsesEnabled ? "/responses" : "Chat Completions"} checked={responsesEnabled} disabled={busy || systemOneOnly} onToggle={() => toggleUseResponses(model)} />
+                      <ModelSetting label={`${model.id} 使用 Responses 上游${responsesOnly ? "（上游仅支持 Responses）" : ""}`} checked={responsesEnabled} disabled={busy || systemOneOnly || responsesOnly} onToggle={() => toggleUseResponses(model)} />
                     </td>
                     <td className="px-4 py-4">
-                      <ModelSetting label={`${model.id} OpenAI 流式转换`} desc={transformEnabled ? "Anthropic → OpenAI" : "直通上游 SSE"} checked={transformEnabled} disabled={busy || !settings} onToggle={() => toggleOpenAiStreamTransform(model)} />
+                      <ModelSetting label={`${model.id} OpenAI 流式转换`} checked={transformEnabled} disabled={busy || !settings} onToggle={() => toggleOpenAiStreamTransform(model)} />
                     </td>
                     <td className="px-4 py-4">
-                      <ModelSetting label={`${model.id} 思考标签抽取`} desc={reasoningEnabled ? "reasoning_content" : "保留原始标签"} checked={reasoningEnabled} disabled={busy || !settings} onToggle={() => toggleReasoningTag(model)} />
+                      <ModelSetting label={`${model.id} 思考标签抽取`} checked={reasoningEnabled} disabled={busy || !settings} onToggle={() => toggleReasoningTag(model)} />
                     </td>
                     <td className="px-4 py-4 text-right">
                       <Button variant="outline" size="sm" disabled={busy} onClick={() => toggleModel(model)} aria-label={`${model.enabled ? "禁用" : "启用"}模型 ${model.id}`}>
@@ -91,17 +91,21 @@ export function ModelsView({ data }: { data: ConsoleData }) {
   );
 }
 
-function ModelSetting({ label, desc, checked, disabled, onToggle }: {
+function ModelSetting({ label, checked, disabled, onToggle }: {
   label: string;
-  desc: string;
   checked: boolean;
   disabled?: boolean;
   onToggle: () => void;
 }) {
   return (
-    <label className="flex cursor-pointer flex-col items-start gap-2">
-      <Switch aria-label={label} checked={checked} disabled={disabled} onCheckedChange={onToggle} />
-      <span className="whitespace-nowrap text-[11px] text-muted-foreground">{desc}</span>
-    </label>
+    <input
+      type="checkbox"
+      aria-label={label}
+      title={label}
+      checked={checked}
+      disabled={disabled}
+      onChange={onToggle}
+      className="h-4 w-4 cursor-pointer rounded border-input accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50"
+    />
   );
 }

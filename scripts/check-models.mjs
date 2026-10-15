@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { loadConfig } from "../dist/config/env.js";
-import { DEFAULT_MODELS } from "../dist/models/catalog.js";
+import { DEFAULT_MODELS, SYSTEMONE_ONLY_MODELS, isResponsesOnlyModel } from "../dist/models/catalog.js";
+import { responsesToOpenAIChatResponse } from "../dist/converters/openAiResponses.js";
 import { prepareZenRequest, requestZenFull } from "../dist/providers/zenClient.js";
 import { createToolNameMapper } from "../dist/converters/toolMapping.js";
 import { ocSessionId } from "../dist/utils/ids.js";
@@ -21,20 +22,25 @@ const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl, { timeout: config.upstrea
 
 const testModel = async (model) => {
   const started = Date.now();
-  const systemone = model === "jev-1.13-free";
+  const systemone = SYSTEMONE_ONLY_MODELS.has(model);
+  const responses = isResponsesOnlyModel(model);
+  const protocol = systemone ? "systemone" : responses ? "responses" : "chat_completions";
   const prepared = prepareZenRequest(config, {
     model, sessionId: ocSessionId(), toolMapper: createToolNameMapper([]),
-    protocol: systemone ? "systemone" : "chat_completions",
+    protocol,
     messages: [{ role: "user", content: "Reply with exactly: OK" }],
     parameters: { max_tokens: 512 },
     ...(systemone ? { responseBody: {
       state: "Reply with exactly: OK",
       questions: { answer: { type: "choice", instructions: "What is the answer?", criteria: { ok: "The answer is OK" } } },
-    } } : {}),
+    } } : responses ? { responseBody: { input: "Reply with exactly: OK", max_output_tokens: 512 } } : {}),
   });
   if (agent) prepared.options.agent = agent;
   try {
-    const response = await requestZenFull(prepared, undefined, undefined, undefined, 0, systemone ? "systemone" : "chat_completions");
+    const response = await requestZenFull(prepared, undefined, undefined, undefined, 0, protocol);
+    if (responses && response.status === 200 && !response.data?.error && response.data?.type !== "error") {
+      response.data = responsesToOpenAIChatResponse(response.data, model);
+    }
     return { model, ...response, durationMs: Date.now() - started };
   } catch {
     // Transport exception text can contain a proxy credential.
@@ -52,7 +58,7 @@ const padLeft = (str, len) => str.padStart(len);
 
 const isAvailable = (result) => result.status === 200
   && !result.data?.error && result.data?.type !== "error"
-  && (result.model === "jev-1.13-free"
+  && (SYSTEMONE_ONLY_MODELS.has(result.model)
     ? result.data?.answers && typeof result.data.answers === "object"
     : result.data?.choices?.some(choice => typeof choice.message?.content === "string" && choice.message.content.trim()));
 

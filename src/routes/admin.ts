@@ -3,7 +3,7 @@ import type { ApiKeyPolicy, ApiKeyStore } from "../auth/apiKeys.js";
 import type { AppConfig } from "../config/env.js";
 import { adminAuthMode, isAdminRequest, passwordMatches, tokenFromRequest } from "../auth/adminAuth.js";
 import type { AdminSessionStore } from "../auth/adminSessions.js";
-import type { ModelConfigStore, ModelUpdateInput } from "../models/catalog.js";
+import { RETIRED_MODELS, type ModelConfigStore, type ModelUpdateInput } from "../models/catalog.js";
 import type { ModelAliasStore, ModelAliasUpdateInput } from "../models/aliases.js";
 import type { SettingsStore, SystemSettingsUpdate } from "../settings/settingsStore.js";
 import type { ProxyInput, ProxyPoolStore } from "../proxy/proxyPool.js";
@@ -159,8 +159,9 @@ export const registerAdminRoutes = async (
         throw new Error("Invalid response format from upstream");
       }
 
+      const retiredIds = new Set(RETIRED_MODELS.map((model) => model.id));
       const freeModels = data.data.filter((model) =>
-        model.id.endsWith("-free") || model.id === "big-pickle"
+        (model.id.endsWith("-free") || model.id === "big-pickle") && !retiredIds.has(model.id)
       );
 
       let syncedCount = 0;
