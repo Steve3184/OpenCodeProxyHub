@@ -8,6 +8,7 @@ import { HttpPreProxyToHttpAgent, HttpPreProxyToSocksAgent } from "./chainedAgen
 import { ocSessionId } from "../utils/ids.js";
 import { isConsoleProviderError, parseUpstreamErrorPayload } from "../providers/opencodeAccessErrors.js";
 import { createOpenCodeHeaders } from "../providers/opencodeHeaders.js";
+import { isProxyConnectFailure, ProxyConnectError, trackProxyConnection, type ProxyConnectionState } from "./connectionState.js";
 
 export type ProxyType = "http" | "https" | "socks5";
 
@@ -33,6 +34,11 @@ export interface ProxyNode {
   dailyRequestCount: number;
   dailyCountDate: string;
   autoDisableWhenDailyLimitReached: boolean;
+  connectFailureCount: number;
+  autoDisabledByConnect: boolean;
+  lastConnectRecoveryTestAt: string | null;
+  connectCooldownUntil: string | null;
+  lastConnectError: string | null;
   consecutiveRateLimitCount: number;
   autoDisabledBy429: boolean;
   lastRecoveryTestAt: string | null;
@@ -66,6 +72,11 @@ type ProxyStaticNode = Pick<ProxyNode,
 
 interface ProxyState {
   enabled: boolean;
+  connectFailureCount: number;
+  autoDisabledByConnect: boolean;
+  lastConnectRecoveryTestAt: string | null;
+  connectCooldownUntil: string | null;
+  lastConnectError: string | null;
   dailyRequestCount: number;
   dailyCountDate: string;
   consecutiveRateLimitCount: number;
@@ -112,6 +123,7 @@ export interface ProxyLease {
   /** Unique lease token used to make settlement/release idempotent. */
   leaseId?: string;
   agent?: https.Agent;
+  connection?: ProxyConnectionState;
   requiredUnavailable?: boolean;
 }
 
@@ -144,8 +156,13 @@ interface RecoveryProbeState {
   currentConcurrency: number;
   lastError: string | null;
   lastCheckedAt: string | null;
-  lastRecoveryTestAt: string;
+  lastRecoveryTestAt: string | null;
   endpoint: string;
+  connectFailureCount: number;
+  autoDisabledByConnect: boolean;
+  lastConnectRecoveryTestAt: string | null;
+  dailyRequestCount: number;
+  dailyRequestLimit: number;
 }
 
 const DEFAULT_MODEL_TEST_OPTIONS: ProxyModelTestOptions = {
@@ -180,7 +197,7 @@ export class ProxyPoolStore {
   private proxies: ProxyNode[] = [];
   private readonly proxiesById = new Map<string, ProxyNode>();
   private readonly recoveryTestsInFlight = new Set<string>();
-  private readonly activeLeases = new Map<string, { nodeId: string; model?: string }>();
+  private readonly activeLeases = new Map<string, { nodeId: string; model?: string; connection?: ProxyConnectionState }>();
   private recoveryRunInFlight = false;
   private configPersistTimer: NodeJS.Timeout | undefined;
   private statePersistTimer: NodeJS.Timeout | undefined;
@@ -230,7 +247,7 @@ export class ProxyPoolStore {
     let dailyRequestCount = 0;
     let dailyTokens = 0;
     for (const proxy of this.proxies) {
-      if (proxy.enabled) enabled += 1;
+      if (proxy.enabled && !proxy.autoDisabledByConnect) enabled += 1;
       dailyRequestCount += proxy.dailyRequestCount;
       dailyTokens += proxy.dailyTokens;
     }
@@ -276,6 +293,7 @@ export class ProxyPoolStore {
     if (input.enabled !== undefined) {
       node.enabled = input.enabled;
       if (input.enabled) {
+        this.clearConnectFailure(node);
         node.consecutiveRateLimitCount = 0;
         node.autoDisabledBy429 = false;
         node.lastRecoveryTestAt = null;
@@ -294,6 +312,7 @@ export class ProxyPoolStore {
 
     this.validateNode(node);
     if (this.proxyEndpoint(node) !== previousEndpoint) {
+      this.clearConnectFailure(node);
       for (const state of Object.values(node.rateLimitStates || {})) state.lastSuccessAt = null;
     }
     this.persistConfig();
@@ -322,7 +341,7 @@ export class ProxyPoolStore {
     let node: ProxyNode | undefined;
     let bestHealthRank = -1;
     for (const candidate of this.proxies) {
-      if (!candidate.enabled || excludeProxyIds.has(candidate.id)) continue;
+      if (!candidate.enabled || candidate.autoDisabledByConnect || excludeProxyIds.has(candidate.id)) continue;
       if (!isProxyCompatibleWithModel(candidate, model)) continue;
       const rateLimitState = model ? this.findRateLimitState(candidate, model) : undefined;
       if (rateLimitState?.autoDisabledBy429) continue;
@@ -366,8 +385,9 @@ export class ProxyPoolStore {
     this.persistState(node.id);
 
     const leaseId = crypto.randomUUID();
-    this.activeLeases.set(leaseId, { nodeId: node.id, model });
-    return { node: { ...node }, model, leaseId, agent };
+    const connection = trackProxyConnection(agent);
+    this.activeLeases.set(leaseId, { nodeId: node.id, model, connection });
+    return { node: { ...node }, model, leaseId, agent, connection };
   }
 
   release(id: string, leaseId?: string): void {
@@ -412,16 +432,19 @@ export class ProxyPoolStore {
     if (!lease) return;
     // Settle the lease without penalizing a healthy proxy for a provider error.
     // Do not count this as success or clear previous genuine proxy failures.
-    if (isConsoleProviderError(options.upstreamBody ?? error)) {
+    const connectFailure = isProxyConnectFailure(lease.connection, options.upstreamBody ?? error);
+    if (!connectFailure && isConsoleProviderError(options.upstreamBody ?? error)) {
       this.persistState(id);
       return;
     }
     node.failCount += 1;
-    this.recordResult(node, false, options.statusCode || 502);
+    this.recordResult(node, false, lease.connection?.statusCode || options.statusCode || 502);
     node.lastError = error;
     node.lastCheckedAt = new Date().toISOString();
     const model = options.model ?? lease.model;
-    if (model && options.statusCode === 429) {
+    if (connectFailure) {
+      this.disableByConnectFailure(node, lease.connection?.message || error, options.cooldownMs);
+    } else if (model && options.statusCode === 429) {
       const state = this.rateLimitState(node, model);
       state.consecutiveRateLimitCount += 1;
       state.lastError = error;
@@ -500,6 +523,7 @@ export class ProxyPoolStore {
         throw new Error(`Model health check returned HTTP ${statusCode}`);
       }
       node.lastCheckedAt = checkedAt;
+      this.clearConnectFailure(node);
       if (modelState) {
         modelState.autoDisabledBy429 = false;
         modelState.consecutiveRateLimitCount = 0;
@@ -520,7 +544,10 @@ export class ProxyPoolStore {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Model health check failed";
       node.lastCheckedAt = checkedAt;
-      if (modelState) {
+      if (error instanceof ProxyConnectError) {
+        this.disableByConnectFailure(node, message);
+        node.lastConnectRecoveryTestAt = checkedAt;
+      } else if (modelState) {
         modelState.lastRecoveryTestAt = modelState.autoDisabledBy429 ? checkedAt : null;
         modelState.lastError = message;
         if (!modelState.autoDisabledBy429) modelState.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
@@ -549,8 +576,10 @@ export class ProxyPoolStore {
       }).sort((a, b) => {
         const aState = this.findRateLimitState(a, options.model);
         const bState = this.findRateLimitState(b, options.model);
-        const aTime = aState?.lastRecoveryTestAt ? Date.parse(aState.lastRecoveryTestAt) : 0;
-        const bTime = bState?.lastRecoveryTestAt ? Date.parse(bState.lastRecoveryTestAt) : 0;
+        const aTest = a.autoDisabledByConnect ? a.lastConnectRecoveryTestAt : aState?.lastRecoveryTestAt;
+        const bTest = b.autoDisabledByConnect ? b.lastConnectRecoveryTestAt : bState?.lastRecoveryTestAt;
+        const aTime = aTest ? Date.parse(aTest) : 0;
+        const bTime = bTest ? Date.parse(bTest) : 0;
         return aTime - bTime;
       }).slice(0, this.recoveryBatchSize);
       if (candidates.length === 0) return { tested: 0, recovered: 0 };
@@ -566,9 +595,11 @@ export class ProxyPoolStore {
           if (this.recoveryTestsInFlight.has(node.id) || !this.isRecoveryCandidate(node, candidateNow, recoveryIntervalMs, options.model)) continue;
 
           this.recoveryTestsInFlight.add(node.id);
+          const connectRecovery = node.autoDisabledByConnect;
           const state = this.rateLimitState(node, options.model);
           const recoveryTestAt = new Date().toISOString();
-          state.lastRecoveryTestAt = recoveryTestAt;
+          if (connectRecovery) node.lastConnectRecoveryTestAt = recoveryTestAt;
+          else state.lastRecoveryTestAt = recoveryTestAt;
           this.persistState(node.id);
           tested += 1;
           const wasAutoDisabled = state.autoDisabledBy429;
@@ -578,33 +609,50 @@ export class ProxyPoolStore {
             currentConcurrency: node.currentConcurrency,
             lastError: state.lastError,
             lastCheckedAt: node.lastCheckedAt,
-            lastRecoveryTestAt: recoveryTestAt,
+            lastRecoveryTestAt: state.lastRecoveryTestAt,
             endpoint: this.proxyEndpoint(node),
+            connectFailureCount: node.connectFailureCount,
+            autoDisabledByConnect: node.autoDisabledByConnect,
+            lastConnectRecoveryTestAt: node.lastConnectRecoveryTestAt,
+            dailyRequestCount: node.dailyRequestCount,
+            dailyRequestLimit: node.dailyRequestLimit,
+          };
+          const recordFailure = (message: string, error?: unknown) => {
+            if (connectRecovery || error instanceof ProxyConnectError) {
+              if (error instanceof ProxyConnectError) this.disableByConnectFailure(node, message);
+              node.lastConnectError = message;
+              node.lastConnectRecoveryTestAt = recoveryTestAt;
+              node.connectCooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
+            } else {
+              state.lastError = message;
+              if (!wasAutoDisabled) state.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
+            }
+            node.lastError = message;
           };
           try {
             const statusCode = await this.requestModelHealthCheck(node, options);
             if (!this.recoveryStateUnchanged(node, expectedState, options.model)) continue;
             if (statusCode >= 200 && statusCode < 300) {
-              state.autoDisabledBy429 = false;
-              state.consecutiveRateLimitCount = 0;
-              state.cooldownUntil = null;
-              state.lastRecoveryTestAt = null;
-              state.lastSuccessAt = new Date().toISOString();
-              state.lastError = null;
+              if (connectRecovery) this.clearConnectFailure(node);
+              else {
+                state.autoDisabledBy429 = false;
+                state.consecutiveRateLimitCount = 0;
+                state.cooldownUntil = null;
+                state.lastRecoveryTestAt = null;
+                state.lastSuccessAt = new Date().toISOString();
+                state.lastError = null;
+                node.lastError = null;
+              }
               recovered += 1;
             } else {
-              state.lastError = `Model health check returned HTTP ${statusCode}`;
-              if (!wasAutoDisabled) state.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
+              recordFailure(`Model health check returned HTTP ${statusCode}`);
             }
             node.lastCheckedAt = new Date().toISOString();
-            node.lastError = state.lastError;
             this.recordResult(node, statusCode >= 200 && statusCode < 300, statusCode);
           } catch (error) {
             if (this.recoveryStateUnchanged(node, expectedState, options.model)) {
-              state.lastError = error instanceof Error ? error.message : "Model health check failed";
-              if (!wasAutoDisabled) state.cooldownUntil = new Date(Date.now() + this.cooldownMs).toISOString();
+              recordFailure(error instanceof Error ? error.message : "Model health check failed", error);
               node.lastCheckedAt = new Date().toISOString();
-              node.lastError = state.lastError;
               this.recordResult(node, false, this.statusCodeFromHealthCheckError(error));
             }
           } finally {
@@ -637,6 +685,11 @@ export class ProxyPoolStore {
       dailyRequestCount: 0,
       dailyCountDate: today(),
       autoDisableWhenDailyLimitReached: input.autoDisableWhenDailyLimitReached ?? false,
+      connectFailureCount: 0,
+      autoDisabledByConnect: false,
+      lastConnectRecoveryTestAt: null,
+      connectCooldownUntil: null,
+      lastConnectError: null,
       consecutiveRateLimitCount: 0,
       autoDisabledBy429: false,
       lastRecoveryTestAt: null,
@@ -724,6 +777,11 @@ export class ProxyPoolStore {
       dailyRequestLimit: Number.isFinite(node.dailyRequestLimit) ? Math.max(0, Math.trunc(node.dailyRequestLimit)) : 0,
       dailyRequestCount: dailyCountDate === current && Number.isFinite(node.dailyRequestCount) ? Math.max(0, Math.trunc(node.dailyRequestCount)) : 0,
       autoDisableWhenDailyLimitReached: Boolean(node.autoDisableWhenDailyLimitReached),
+      connectFailureCount: Number.isFinite(node.connectFailureCount) ? Math.max(0, Math.trunc(node.connectFailureCount)) : 0,
+      autoDisabledByConnect: Boolean(node.autoDisabledByConnect),
+      lastConnectRecoveryTestAt: node.lastConnectRecoveryTestAt || null,
+      connectCooldownUntil: node.connectCooldownUntil || null,
+      lastConnectError: node.lastConnectError || null,
       consecutiveRateLimitCount: Number.isFinite(node.consecutiveRateLimitCount) ? Math.max(0, Math.trunc(node.consecutiveRateLimitCount)) : 0,
       autoDisabledBy429: legacyAutoDisabledBy429 && !node.enabled ? false : Boolean(node.autoDisabledBy429),
       lastRecoveryTestAt: node.lastRecoveryTestAt || null,
@@ -755,7 +813,14 @@ export class ProxyPoolStore {
   }
 
   private isRecoveryCandidate(node: ProxyNode, now: number, recoveryIntervalMs: number, model?: string): boolean {
-    if (node.currentConcurrency > 0) return false;
+    if (!node.enabled || node.currentConcurrency > 0) return false;
+    if (node.dailyRequestLimit !== 0 && node.dailyRequestCount >= node.dailyRequestLimit) return false;
+    if (node.autoDisabledByConnect) {
+      if (node.connectCooldownUntil && Date.parse(node.connectCooldownUntil) > now) return false;
+      if (!node.lastConnectRecoveryTestAt) return true;
+      const lastTestAt = Date.parse(node.lastConnectRecoveryTestAt);
+      return !Number.isFinite(lastTestAt) || now - lastTestAt >= recoveryIntervalMs;
+    }
     if (model) {
       const state = this.findRateLimitState(node, model);
       if (!state) return false;
@@ -781,6 +846,11 @@ export class ProxyPoolStore {
     return node.enabled === expected.enabled
       && (state ? state.autoDisabledBy429 === expected.autoDisabledBy429 : node.autoDisabledBy429 === expected.autoDisabledBy429)
       && node.currentConcurrency === expected.currentConcurrency
+      && node.connectFailureCount === expected.connectFailureCount
+      && node.autoDisabledByConnect === expected.autoDisabledByConnect
+      && node.lastConnectRecoveryTestAt === expected.lastConnectRecoveryTestAt
+      && node.dailyRequestCount === expected.dailyRequestCount
+      && node.dailyRequestLimit === expected.dailyRequestLimit
       && (state ? state.lastError === expected.lastError : node.lastError === expected.lastError)
       && node.lastCheckedAt === expected.lastCheckedAt
       && (state ? state.lastRecoveryTestAt === expected.lastRecoveryTestAt : node.lastRecoveryTestAt === expected.lastRecoveryTestAt)
@@ -788,7 +858,28 @@ export class ProxyPoolStore {
   }
 
   private proxyEndpoint(node: ProxyNode): string {
-    return `${node.type}\n${node.url}`;
+    const settings = this.settingsStore.get();
+    return `${node.type}\n${node.url}\n${settings.outboundPreProxyEnabled ? settings.outboundPreProxyUrl : ""}`;
+  }
+
+  private disableByConnectFailure(node: ProxyNode, message: string, cooldownMs = this.cooldownMs): void {
+    node.connectFailureCount += 1;
+    // A failed tunnel cannot carry any model. Isolate immediately; keep enabled
+    // as the user's intent so recovery never undoes a manual/daily disable.
+    node.autoDisabledByConnect = true;
+    node.lastConnectRecoveryTestAt = null;
+    node.connectCooldownUntil = new Date(Date.now() + cooldownMs).toISOString();
+    node.lastConnectError = message;
+    node.lastError = message;
+  }
+
+  private clearConnectFailure(node: ProxyNode): void {
+    if (node.lastError === node.lastConnectError) node.lastError = null;
+    node.connectFailureCount = 0;
+    node.autoDisabledByConnect = false;
+    node.lastConnectRecoveryTestAt = null;
+    node.connectCooldownUntil = null;
+    node.lastConnectError = null;
   }
 
   private requestModelHealthCheck(node: ProxyNode, options: ProxyModelTestOptions): Promise<number> {
@@ -817,10 +908,17 @@ export class ProxyPoolStore {
           tools: tools.map(({ type, name, description, parameters }) => ({ type, function: { name, description, parameters } })),
         });
     return new Promise((resolve, reject) => {
+      const agent = this.createAgent(node);
+      const connection = trackProxyConnection(agent);
+      const healthCheckError = (error: Error): Error => isProxyConnectFailure(connection, error.message)
+        ? new ProxyConnectError(connection.message || error.message, connection.statusCode || this.statusCodeFromHealthCheckError(error))
+        : error;
       let settled = false;
+      let deadline: NodeJS.Timeout | undefined;
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
+        if (deadline) clearTimeout(deadline);
         callback();
       };
       const req = https.request({
@@ -829,7 +927,7 @@ export class ProxyPoolStore {
         path: options.path,
         method: "POST",
         headers: createOpenCodeHeaders(body, ocSessionId()),
-        agent: this.createAgent(node),
+        agent,
         timeout: options.timeoutMs,
       }, (res) => {
         const statusCode = res.statusCode || 502;
@@ -845,6 +943,10 @@ export class ProxyPoolStore {
         });
         res.once("end", () => finish(() => {
           const raw = Buffer.concat(chunks).toString("utf8");
+          if (isProxyConnectFailure(connection, raw)) {
+            reject(new ProxyConnectError(connection.message || `Proxy CONNECT failed with HTTP ${statusCode}`, connection.statusCode || statusCode));
+            return;
+          }
           if (statusCode >= 200 && statusCode < 300) {
             try {
               // The health check streams, so the body is SSE. Only the JSON
@@ -897,13 +999,19 @@ export class ProxyPoolStore {
           }
           resolve(statusCode);
         }));
-        res.once("error", (error) => finish(() => reject(error)));
+        res.once("error", (error) => finish(() => reject(healthCheckError(error))));
       });
-      req.once("error", (error) => finish(() => reject(error)));
+      req.once("error", (error) => finish(() => reject(healthCheckError(error))));
       req.once("timeout", () => {
         req.destroy();
         finish(() => reject(new Error("Proxy model health check timeout")));
       });
+      // ClientRequest's socket timeout starts only after the agent supplies a
+      // socket. Bound the whole probe, including a stalled CONNECT handshake.
+      deadline = setTimeout(() => {
+        finish(() => reject(new Error("Proxy model health check timeout")));
+        req.destroy();
+      }, options.timeoutMs);
       req.write(body);
       req.end();
     });
@@ -921,10 +1029,10 @@ export class ProxyPoolStore {
     return this.proxiesById.get(id);
   }
 
-  private takeLease(id: string, leaseId?: string): { nodeId: string; model?: string } | null {
+  private takeLease(id: string, leaseId?: string): { nodeId: string; model?: string; connection?: ProxyConnectionState } | null {
     const node = this.find(id);
     if (!node) return null;
-    let lease: { nodeId: string; model?: string } | undefined;
+    let lease: { nodeId: string; model?: string; connection?: ProxyConnectionState } | undefined;
     if (leaseId !== undefined) {
       const candidate = this.activeLeases.get(leaseId);
       if (!candidate || candidate.nodeId !== id) return null;
@@ -1082,6 +1190,11 @@ export class ProxyPoolStore {
   private stateForNode(node: ProxyNode): ProxyState {
     return {
       enabled: node.enabled,
+      connectFailureCount: node.connectFailureCount,
+      autoDisabledByConnect: node.autoDisabledByConnect,
+      lastConnectRecoveryTestAt: node.lastConnectRecoveryTestAt,
+      connectCooldownUntil: node.connectCooldownUntil,
+      lastConnectError: node.lastConnectError,
       dailyRequestCount: node.dailyRequestCount,
       dailyCountDate: node.dailyCountDate,
       consecutiveRateLimitCount: node.consecutiveRateLimitCount,

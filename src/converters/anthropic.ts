@@ -1,3 +1,4 @@
+import { isProxyConnectFailure } from "../proxy/connectionState.js";
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import https from "node:https";
 import type { ServerResponse } from "node:http";
@@ -188,26 +189,26 @@ export const pipeZenAsAnthropic = (
   let markedFailure = false;
   let retryStarted = false;
   let settled = false;
+  const retryWithAnotherProxy = (): boolean => {
+    if (retryCount >= maxRetries || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
+    const excluded = new Set<string>([prepared.lease.node.id]);
+    const retryPrepared = retryPrepare(excluded);
+    if (retryPrepared.lease?.requiredUnavailable) return false;
+    retryStarted = true;
+    const nextRetryPrepare = (additional: ReadonlySet<string>) => {
+      const allExcluded = new Set(excluded);
+      for (const id of additional) allExcluded.add(id);
+      return retryPrepare(allExcluded);
+    };
+    pipeZenAsAnthropic(retryPrepared, model, res, inputTokens, proxyPool, metrics, nextRetryPrepare, retryCount + 1, toolMapper, maxRetries);
+    return true;
+  };
+
   const req = https.request(prepared.options, (zenRes) => {
     let headersSent = false;
     let buffer = "";
     let outputTokens = 0;
     const usageAccumulator = createTokenUsageAccumulator();
-
-    const retryWithAnotherProxy = (): boolean => {
-      if (retryCount >= maxRetries || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
-      const excluded = new Set<string>([prepared.lease.node.id]);
-      const retryPrepared = retryPrepare(excluded);
-      if (retryPrepared.lease?.requiredUnavailable) return false;
-      retryStarted = true;
-      const nextRetryPrepare = (additional: ReadonlySet<string>) => {
-        const allExcluded = new Set(excluded);
-        for (const id of additional) allExcluded.add(id);
-        return retryPrepare(allExcluded);
-      };
-      pipeZenAsAnthropic(retryPrepared, model, res, inputTokens, proxyPool, metrics, nextRetryPrepare, retryCount + 1, toolMapper, maxRetries);
-      return true;
-    };
 
     const sendSSE = (event: string, data: unknown) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -379,7 +380,7 @@ export const pipeZenAsAnthropic = (
         markedFailure = true;
       }
       metrics?.recordUpstream({ statusCode: failure.statusCode, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-      if ((failure.rateLimited || failure.proxyAccessError) && retryWithAnotherProxy()) return;
+      if ((failure.rateLimited || failure.proxyAccessError || isProxyConnectFailure(prepared.lease?.connection, failure.body)) && retryWithAnotherProxy()) return;
       const body = JSON.stringify({ type: "error", error: { type: failure.rateLimited ? "rate_limit_error" : "upstream_error", message: failure.message } });
       if (!res.headersSent) {
         res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
@@ -403,6 +404,7 @@ export const pipeZenAsAnthropic = (
     settled = true;
     if (prepared.lease?.node && proxyPool && !markedFailure) proxyPool.markFailure(prepared.lease.node.id, error.message, { leaseId: prepared.lease.leaseId });
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
+    if (isProxyConnectFailure(prepared.lease?.connection, error.message) && retryWithAnotherProxy()) return;
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ type: "error", error: { type: "upstream_error", message: error.message } }));
@@ -415,6 +417,7 @@ export const pipeZenAsAnthropic = (
     req.destroy();
     if (prepared.lease?.node && proxyPool && !markedFailure) proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout", { statusCode: 504, leaseId: prepared.lease.leaseId });
     metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });
+    if (isProxyConnectFailure(prepared.lease?.connection) && retryWithAnotherProxy()) return;
     if (!res.headersSent) {
       res.writeHead(504, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ type: "error", error: { type: "timeout_error", message: "Upstream timeout" } }));

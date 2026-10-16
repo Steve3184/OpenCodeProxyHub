@@ -13,6 +13,7 @@ import { aggregateUpstreamBody, type UpstreamProtocol } from "../converters/stre
 import { DownstreamToolCallFilter, ResponsesStreamToolFilter, applyToolFilterToChatCompletion, applyToolFilterToResponsesResponse, toUpstreamMessages, toUpstreamToolChoice, toUpstreamTools, type ToolNameMapper } from "../converters/toolMapping.js";
 import type { UpstreamErrorPayload } from "./opencodeAccessErrors.js";
 import { readUpstreamResponse } from "./upstreamResponse.js";
+import { isProxyConnectFailure } from "../proxy/connectionState.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -129,6 +130,19 @@ export const requestZenFull = (
     const started = process.hrtime.bigint();
     const durationMs = () => Number(process.hrtime.bigint() - started) / 1_000_000;
     let settled = false;
+    const retryWithAnotherProxy = (): boolean => {
+      if (retryCount >= maxRetries || !retryPrepare || !proxyPool || !prepared.lease?.node?.id) return false;
+      const excluded = new Set<string>([prepared.lease.node.id]);
+      const retryPrepared = retryPrepare(excluded);
+      if (retryPrepared.lease?.requiredUnavailable) return false;
+      const nextRetryPrepare = (additional: ReadonlySet<string>) => {
+        const allExcluded = new Set(excluded);
+        for (const id of additional) allExcluded.add(id);
+        return retryPrepare(allExcluded);
+      };
+      requestZenFull(retryPrepared, proxyPool, metrics, nextRetryPrepare, retryCount + 1, protocol, maxRetries).then(resolve, reject);
+      return true;
+    };
     let req: ReturnType<typeof https.request>;
     try {
       req = https.request(prepared.options, (zenRes) => {
@@ -147,7 +161,7 @@ export const requestZenFull = (
         const protocolError = !data || Boolean(data.error) || data.type === "error";
         const rateLimited = failure?.rateLimited ?? false;
         const proxyAccessError = failure?.proxyAccessError ?? false;
-        const retryableProxyError = rateLimited || proxyAccessError;
+        const retryableProxyError = rateLimited || proxyAccessError || isProxyConnectFailure(prepared.lease?.connection, upstreamRaw);
         const effectiveErrorStatus = failure?.statusCode ?? (protocolError ? 502 : status);
         if (prepared.lease?.node && proxyPool) {
           if (rateLimited) proxyPool.markFailure(prepared.lease.node.id, failure?.message ?? "Upstream returned 429", { statusCode: 429, leaseId: prepared.lease.leaseId, upstreamBody: raw });
@@ -160,19 +174,7 @@ export const requestZenFull = (
           }
         }
         metrics?.recordUpstream({ statusCode: effectiveErrorStatus, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-        if (retryableProxyError && retryCount < maxRetries && retryPrepare && proxyPool && prepared.lease?.node?.id) {
-          const excluded = new Set<string>([prepared.lease.node.id]);
-          const retryPrepared = retryPrepare(excluded);
-          if (retryPrepared.lease?.node || !retryPrepared.lease?.requiredUnavailable) {
-            const nextRetryPrepare = (additional: ReadonlySet<string>) => {
-              const allExcluded = new Set(excluded);
-              for (const id of additional) allExcluded.add(id);
-              return retryPrepare(allExcluded);
-            };
-            requestZenFull(retryPrepared, proxyPool, metrics, nextRetryPrepare, retryCount + 1, protocol, maxRetries).then(resolve, reject);
-            return;
-          }
-        }
+        if (retryableProxyError && retryWithAnotherProxy()) return;
         try {
           resolve({ status: effectiveErrorStatus, data, raw });
         } catch {
@@ -195,6 +197,7 @@ export const requestZenFull = (
       settled = true;
       if (prepared.lease?.node && proxyPool) proxyPool.markFailure(prepared.lease.node.id, error.message, { leaseId: prepared.lease.leaseId });
       metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
+      if (isProxyConnectFailure(prepared.lease?.connection, error.message) && retryWithAnotherProxy()) return;
       reject(error);
     });
     req.on("timeout", () => {
@@ -203,6 +206,7 @@ export const requestZenFull = (
       req.destroy();
       if (prepared.lease?.node && proxyPool) proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout", { statusCode: 504, leaseId: prepared.lease.leaseId });
       metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });
+      if (isProxyConnectFailure(prepared.lease?.connection) && retryWithAnotherProxy()) return;
       reject(new Error("Upstream timeout"));
     });
     try {
@@ -477,7 +481,7 @@ export const pipeZenOpenAIResponse = (
         markedFailure = true;
       }
       metrics?.recordUpstream({ statusCode: failure.statusCode, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-      if ((failure.rateLimited || failure.proxyAccessError) && retryWithAnotherProxy()) return;
+      if ((failure.rateLimited || failure.proxyAccessError || isProxyConnectFailure(prepared.lease?.connection, failure.body)) && retryWithAnotherProxy()) return;
       const body = errorBody(failure.message, failure.rateLimited);
       if (!res.headersSent) {
         res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
@@ -507,6 +511,7 @@ export const pipeZenOpenAIResponse = (
     if (prepared.lease?.node && proxyPool && !markedFailure) proxyPool.markFailure(prepared.lease.node.id, error.message, { leaseId: prepared.lease.leaseId });
     markedFailure = true;
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
+    if (isProxyConnectFailure(prepared.lease?.connection, error.message) && retryWithAnotherProxy()) return;
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(errorBody(`Upstream error: ${error.message}`, false));
@@ -521,6 +526,7 @@ export const pipeZenOpenAIResponse = (
     if (prepared.lease?.node && proxyPool && !markedFailure) proxyPool.markFailure(prepared.lease.node.id, "Upstream timeout", { statusCode: 504, leaseId: prepared.lease.leaseId });
     markedFailure = true;
     metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });
+    if (isProxyConnectFailure(prepared.lease?.connection) && retryWithAnotherProxy()) return;
     if (!res.headersSent) {
       res.writeHead(504, { "Content-Type": "application/json" });
       res.end(errorBody("Upstream timeout", false));

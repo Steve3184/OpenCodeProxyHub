@@ -1,3 +1,4 @@
+import { isProxyConnectFailure } from "../proxy/connectionState.js";
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import https from "node:https";
 import { readUpstreamResponse } from "../providers/upstreamResponse.js";
@@ -286,7 +287,7 @@ export const pipeAnthropicSseAsOpenAI = (
         markedFailure = true;
       }
       metrics?.recordUpstream({ statusCode: failure.statusCode, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-      if ((failure.rateLimited || failure.proxyAccessError) && retryRateLimited()) return;
+      if ((failure.rateLimited || failure.proxyAccessError || isProxyConnectFailure(prepared.lease?.connection, failure.body)) && retryRateLimited()) return;
       const body = JSON.stringify({ error: { message: failure.message, type: failure.rateLimited ? "rate_limit_error" : "upstream_error", ...(failure.rateLimited ? { code: "rate_limit_exceeded" } : {}) } });
       if (!res.headersSent) {
         res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
@@ -314,6 +315,7 @@ export const pipeAnthropicSseAsOpenAI = (
       markedFailure = true;
     }
     metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: error.message });
+    if (isProxyConnectFailure(prepared.lease?.connection, error.message) && retryRateLimited()) return;
     if (!res.headersSent) {
       writeOpenAiError(res, 502, `Upstream error: ${error.message}`);
     } else if (!res.writableEnded) {
@@ -331,6 +333,7 @@ export const pipeAnthropicSseAsOpenAI = (
       markedFailure = true;
     }
     metrics?.recordUpstream({ statusCode: 504, durationMs: durationMs(), proxyId: prepared.lease?.node?.id, error: "Upstream timeout" });
+    if (isProxyConnectFailure(prepared.lease?.connection) && retryRateLimited()) return;
     if (!res.headersSent) {
       res.writeHead(504, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { message: "Upstream timeout", type: "timeout_error" } }));

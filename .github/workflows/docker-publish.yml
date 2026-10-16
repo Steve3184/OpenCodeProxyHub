@@ -107,6 +107,7 @@ jobs:
           npm run check:proxy-routing
           npm run check:opencode-compat
           npm run check:proxy-rate-limit
+          npm run check:proxy-connect
           npm run check:response-lifecycle
 
       - name: Build standalone distribution

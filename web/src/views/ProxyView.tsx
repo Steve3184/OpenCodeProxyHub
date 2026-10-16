@@ -27,8 +27,9 @@ const rateLimitSummary = (proxy: ProxyNode) => {
 
 const stateBadge = (proxy: ProxyNode): { label: string; variant: "muted" | "warning" | "info" | "destructive" | "success" } => {
   const rateLimit = rateLimitSummary(proxy);
-  if ((!proxy.enabled && proxy.autoDisabledBy429) || rateLimit.hasAutoDisabledModel) return { label: "429 自动隔离", variant: "warning" };
   if (!proxy.enabled) return { label: "已禁用", variant: "muted" };
+  if (proxy.autoDisabledByConnect) return { label: "CONNECT 自动隔离", variant: "warning" };
+  if (proxy.autoDisabledBy429 || rateLimit.hasAutoDisabledModel) return { label: "429 自动隔离", variant: "warning" };
   if (rateLimit.maxConsecutive >= 3) return { label: "429 风险", variant: "warning" };
   if ((proxy.cooldownUntil && Date.parse(proxy.cooldownUntil) > Date.now()) || rateLimit.hasActiveModelCooldown) return { label: "冷却中", variant: "info" };
   if (proxy.lastError) return { label: "异常", variant: "destructive" };
@@ -61,7 +62,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
     const now = Date.now();
     return (
       [...proxies]
-        .filter((p) => p.enabled)
+        .filter((p) => p.enabled && !p.autoDisabledByConnect)
         .filter((p) => !p.cooldownUntil || Date.parse(p.cooldownUntil) <= now)
         .filter((p) => p.dailyRequestLimit === 0 || p.dailyRequestCount < p.dailyRequestLimit)
         .filter((p) => p.currentConcurrency < p.maxConcurrency)
@@ -81,7 +82,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
           <InfoCard icon={<Route size={16} className="text-primary" />} title="当前策略" value="优先填充" sub="高权重优先，同权重优先使用该模型成功节点" />
         </motion.div>
         <motion.div variants={fadeUp}>
-          <InfoCard icon={<AlertTriangle size={16} className="text-warning" />} title="故障恢复" value="自动探测" sub="429 与冷却结束的异常节点每 10 分钟探测" />
+          <InfoCard icon={<AlertTriangle size={16} className="text-warning" />} title="故障恢复" value="自动探测" sub="CONNECT 失败立即隔离，每 10 分钟测活恢复" />
         </motion.div>
         <motion.div variants={fadeUp}>
           <InfoCard icon={<CheckCircle2 size={16} className="text-success" />} title="优先节点" value={prioritized?.name || "无可用"} sub="按权重与可用性选出" />

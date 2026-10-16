@@ -2,6 +2,7 @@ import https from "node:https";
 import type { Duplex } from "node:stream";
 import net from "node:net";
 import tls from "node:tls";
+import { ProxyConnectError } from "./connectionState.js";
 
 const readUntil = (socket: net.Socket, marker: Buffer): Promise<Buffer> => new Promise((resolve, reject) => {
   let buffer = Buffer.alloc(0);
@@ -72,7 +73,11 @@ const connectToPreProxy = async (preProxy: URL, timeout: number): Promise<net.So
 const httpConnect = async (socket: net.Socket, host: string, port: number, proxy?: URL, label = "Proxy"): Promise<void> => {
   socket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n${proxy ? authHeader(proxy) : ""}\r\n`);
   const response = await readUntil(socket, Buffer.from("\r\n\r\n"));
-  if (!response.toString("utf8").includes(" 200 ")) throw new Error(`${label} CONNECT failed`);
+  const statusCode = Number(response.toString("utf8").match(/^HTTP\/\d\.\d\s+(\d{3})\b/)?.[1]) || 502;
+  if (statusCode !== 200) {
+    socket.destroy();
+    throw new ProxyConnectError(`${label} CONNECT failed with HTTP ${statusCode}`, statusCode);
+  }
 };
 
 class ChainedAgentBase extends https.Agent {
@@ -87,7 +92,10 @@ class ChainedAgentBase extends https.Agent {
   override createConnection(options: any, callback?: (error: Error | null, socket: Duplex) => void): Duplex | null | undefined {
     this.createChainedConnection(options)
       .then((socket) => callback?.(null, socket))
-      .catch((error) => callback?.(error, new net.Socket()));
+      .catch((error) => {
+        this.emit("proxyConnectError", error);
+        callback?.(error, new net.Socket());
+      });
     return undefined;
   }
 

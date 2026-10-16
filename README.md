@@ -386,9 +386,9 @@ PROXY_MODE=optional                     # 代理使用模式：direct / optional
 OUTBOUND_PRE_PROXY_ENABLED=false        # 是否启用链式前置代理
 OUTBOUND_PRE_PROXY_URL=                 # 前置代理地址（http/https）
 REQUIRE_PROXY=false                     # 兼容旧配置；未设置 PROXY_MODE 时 true 等价于 required
-PROXY_HEALTH_CHECK_MODEL=big-pickle        # 429/异常自动恢复探测使用的模型
+PROXY_HEALTH_CHECK_MODEL=big-pickle        # CONNECT/429/异常自动恢复探测使用的模型
 PROXY_HEALTH_CHECK_TIMEOUT_MS=10000     # 单次恢复探测超时（毫秒）
-PROXY_RECOVERY_INTERVAL_MS=600000       # 429/异常自动恢复探测间隔（默认 10 分钟）
+PROXY_RECOVERY_INTERVAL_MS=600000       # CONNECT/429/异常自动恢复探测间隔（默认 10 分钟）
 PROXY_RECOVERY_CONCURRENCY=2            # 每轮恢复探测并发数（小机器建议 1-2）
 PROXY_RECOVERY_BATCH_SIZE=32            # 每轮最多探测节点数，避免大代理池打满 CPU
 PROXY_COOLDOWN_MS=300000              # 单代理/模型遇到 429 或临时错误后的冷却时间（毫秒，默认 5 分钟）
@@ -403,6 +403,10 @@ PROXY_LARGE_POOL_WARNING_THRESHOLD=10000 # 超过此规模启动时输出性能�
 代理池的静态配置保留在 `PROXIES_FILE`，运行时计数、租约相关状态和错误统计批量写入同目录的 `PROXIES_FILE.state.log` 增量日志，并在日志达到阈值时压缩到 `PROXIES_FILE.state`。请求路径不会再同步重写完整代理配置；状态更新会在短暂 debounce 后合并落盘，进程优雅退出时会主动 flush。
 
 恢复探测默认每轮最多探测 32 个节点、并发 2 个，可通过上面的环境变量调整。
+
+HTTP/HTTPS 代理 CONNECT 返回非 200（包括带宽耗尽的 429），以及 HTTP/SOCKS 建连、认证失败时，节点会立即自动隔离，所有模型都跳过该节点，并在重试预算内切换其他代理。节点的 `autoDisabledByConnect`、失败次数、最后错误及探测时间持久化保存；`enabled` 保留手动/每日限额开关的状态。CONNECT 隔离与模型级 429 计数独立。
+
+定时测活等待节点冷却结束后，通过原代理发起最小模型请求；CONNECT 成功且收到有效模型响应才解除隔离。失败后继续隔离并等待下一轮。手动禁用、达到每日限额的节点不会被自动恢复，已有的模型级 429 隔离也不会被 CONNECT 恢复清除。
 
 ## 出口代理与前置代理
 

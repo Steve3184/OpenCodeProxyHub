@@ -25,6 +25,7 @@
     "check:retry-settings": "tsx scripts/retry-settings-check.ts",
     "check:proxy-performance": "tsx scripts/proxy-pool-performance-check.ts",
     "check:proxy-rate-limit": "tsx scripts/proxy-rate-limit-check.ts",
+    "check:proxy-connect": "tsx scripts/proxy-connect-check.ts",
     "check:response-lifecycle": "tsx scripts/response-lifecycle-check.ts",
     "build:binary": "npm run build:all && node scripts/build-binary.mjs",
     "check:binary": "node scripts/binary-smoke.mjs",
