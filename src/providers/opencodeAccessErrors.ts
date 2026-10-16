@@ -3,12 +3,50 @@ const OPENCODE_PROXY_ACCESS_MESSAGES = [
   "your access has been restricted due to repeated policy violations",
 ] as const;
 
+export interface UpstreamErrorPayload {
+  message: string;
+  statusCode: number;
+  rateLimited: boolean;
+  proxyAccessError: boolean;
+  body: string;
+}
+
+/** Parse an error payload from either a plain JSON reply or one SSE data event. */
+export const parseUpstreamErrorPayload = (statusCode: number, body: string): UpstreamErrorPayload | null => {
+  let parsed: { error?: unknown; type?: unknown; message?: unknown; response?: { error?: unknown } } | null = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // HTTP failures may have a non-JSON body.
+  }
+  const hasError = parsed && typeof parsed === "object"
+    && (parsed.error || parsed.type === "error" || (parsed.type === "response.failed" && parsed.response?.error));
+  if (statusCode < 400 && !hasError) return null;
+  const error = parsed?.error ?? (parsed?.type === "response.failed" ? parsed.response?.error : undefined);
+  const errorMessage = typeof error === "string"
+    ? error
+    : error && typeof error === "object" && "message" in error && typeof error.message === "string"
+      ? error.message
+      : undefined;
+  const message = errorMessage || (typeof parsed?.message === "string" ? parsed.message : statusCode >= 400 ? `Upstream returned HTTP ${statusCode}` : "Upstream error");
+  const rateLimited = isUpstreamRateLimitError(statusCode, body);
+  const proxyAccessError = isOpenCodeProxyAccessError(statusCode, body);
+  return {
+    message,
+    statusCode: rateLimited ? 429 : proxyAccessError ? 403 : statusCode >= 400 ? statusCode : 502,
+    rateLimited,
+    proxyAccessError,
+    body,
+  };
+};
+
 /** Zen labels errors returned by the Console provider; these are not proxy failures. */
 export const isConsoleProviderError = (body: string): boolean => {
   let message = body;
   try {
     const parsed = JSON.parse(body);
-    message = parsed?.error?.message ?? parsed?.message ?? body;
+    message = parsed?.error?.message ?? parsed?.message
+      ?? (parsed?.type === "response.failed" ? parsed?.response?.error?.message : undefined) ?? body;
   } catch {
     // Callers may already have extracted the upstream message.
   }
@@ -26,6 +64,8 @@ export const isUpstreamRateLimitError = (statusCode: number, body: string): bool
   return statusCode === 429
     || body.includes("FreeUsageLimitError")
     || body.includes("rate_limit_error")
+    || body.includes("rate_limit_exceeded")
+    || normalized.includes("upstream returned http 429")
     || normalized.includes("rate limit");
 };
 

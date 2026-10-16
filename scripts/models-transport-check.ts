@@ -18,7 +18,7 @@ const config = {
   proxiesFile: path.join(tempDir, "proxies.json"), logsDir: path.join(tempDir, "logs"),
   adminPassword: "test-only", redisUrl: "", proxyMode: "direct" as const,
   outboundPreProxyEnabled: false, zenHost: "example.invalid",
-  globalRequestsPerMinute: 1000, apiKeyRequestsPerMinute: 1000,
+  globalRequestsPerMinute: 10000, apiKeyRequestsPerMinute: 10000,
   proxyRecoveryIntervalMs: 3_600_000, proxyCooldownMs: 0, shutdownDrainTimeoutMs: 1000,
 };
 let app: Awaited<ReturnType<typeof buildApp>>["app"] | undefined;
@@ -145,6 +145,8 @@ try {
   let upstreamStatus = 200;
   let upstreamError: string | undefined;
   let splitError = false;
+  let chunkSize = 0;
+  const upstreamReplies: Array<{ status: number; body: string }> = [];
   const capturedRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
   const chatBody = 'data: {"id":"test","object":"chat.completion.chunk","model":"big-pickle","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\ndata: {"id":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
   const anthropicBody = 'event: message_start\ndata: {"type":"message_start","message":{"id":"test","usage":{"input_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
@@ -157,10 +159,14 @@ try {
     request.destroy = () => {};
     request.end = () => queueMicrotask(() => {
       capturedRequests.push({ path: String(options.path), body: JSON.parse(requestBody) });
-      const response = Object.assign(new EventEmitter(), { statusCode: upstreamStatus, resume: () => {} });
+      const queued = upstreamReplies.shift();
+      const response = Object.assign(new EventEmitter(), { statusCode: queued?.status ?? upstreamStatus, resume: () => {} });
       callback(response);
-      const body = upstreamError ?? (upstreamStatus !== 200 ? '{"error":{"message":"test upstream error"}}' : wire === "anthropic" ? anthropicBody : wire === "responses" ? responsesBody : wire === "systemone" ? '{"answer":"Hello"}' : chatBody);
-      if (splitError) {
+      const body = queued?.body ?? upstreamError ?? (upstreamStatus !== 200 ? '{"error":{"message":"test upstream error"}}' : wire === "anthropic" ? anthropicBody : wire === "responses" ? responsesBody : wire === "systemone" ? '{"answer":"Hello"}' : chatBody);
+      if (chunkSize) {
+        const bytes = Buffer.from(body);
+        for (let i = 0; i < bytes.length; i += chunkSize) response.emit("data", bytes.subarray(i, i + chunkSize));
+      } else if (splitError) {
         const middle = Math.floor(body.length / 2);
         response.emit("data", Buffer.from(body.slice(0, middle)));
         response.emit("data", Buffer.from(body.slice(middle)));
@@ -297,6 +303,125 @@ try {
     assert.equal(node.currentConcurrency, 0);
   }
   console.log("[pass] ordinary anonymous 429s still isolate the affected model after five failures without appending a message suffix");
+
+  const reportedMessage = "Upstream returned HTTP 429";
+  const reportedError = JSON.stringify({ error: { message: reportedMessage, type: "rate_limit_error", code: "rate_limit_exceeded" } });
+  const errorEvent = `event: error\ndata: ${reportedError}\n\n`;
+  const paths = ["/v1/chat/completions", "/v1/responses", "/v1/messages"];
+  const routes = paths.flatMap((url) => [false, true].flatMap((useResponses) => [false, true].map((stream) => ({ url, useResponses, stream, setting: "", wire: useResponses ? "responses" : "chat" }))));
+  routes.push(...["reasoningTagModels", "openAiStreamTransformModels"].map((setting) => ({ url: paths[0]!, useResponses: false, stream: true, setting, wire: setting === "openAiStreamTransformModels" ? "anthropic" : "chat" })));
+  routes.push(...["/v1/systemone", "/zen/v1/systemone"].map((url) => ({ url, useResponses: false, stream: false, setting: "", wire: "systemone" })));
+  await setSettings({ autoRetryCount: 1 });
+  let caseId = 0;
+  const configureRoute = async (route: typeof routes[number], model: string) => {
+    await setModel(model, { enabled: true, useResponses: route.useResponses });
+    await setSettings({ openAiStreamTransformModels: [], reasoningTagModels: [], ...(route.setting ? { [route.setting]: [model] } : {}) });
+    wire = route.wire;
+  };
+  const injectRoute = (route: typeof routes[number], model: string) => app!.inject({ method: "POST", url: route.url, headers: client, payload: { ...payloadFor(route.url, route.stream), model } });
+  for (const format of ["http-json", "http-sse", "json", "sse", "sse-crlf", "sse-eof", "responses-failed", "code-only", "message-only"]) {
+    for (const route of routes) {
+      const model = `rate-limit-${caseId++}-free`;
+      await configureRoute(route, model);
+      upstreamStatus = format.startsWith("http-") ? 429 : 200;
+      upstreamError = format.endsWith("json") ? reportedError
+        : format === "code-only" ? `data: ${JSON.stringify({ error: { message: reportedMessage, code: "rate_limit_exceeded" } })}\n\n`
+        : format === "message-only" ? `data: ${JSON.stringify({ error: { message: reportedMessage } })}\n\n`
+        : format === "responses-failed" ? `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: { error: JSON.parse(reportedError).error } })}\n\n`
+        : format === "sse-crlf" ? `: keepalive\r\n\r\nevent: error\r\ndata:${reportedError}\r\n\r\n`
+        : format === "sse-eof" ? errorEvent.trimEnd() : errorEvent;
+      // Byte-sized chunks split prefixes, JSON fields, and CRLF event boundaries.
+      chunkSize = 1;
+      const before = await getProxies();
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const requestsBefore = capturedRequests.length;
+        const result = await injectRoute(route, model);
+        assert.equal(result.statusCode, 429, `${format} ${route.url} ${route.setting}: ${result.body}`);
+        assert.equal(result.json().error.message, reportedMessage);
+        assert.equal(capturedRequests.length - requestsBefore, 2, "each failed attempt retries once on a different node");
+        for (const node of await getProxies()) {
+          const previous = before.find((item: any) => item.id === node.id);
+          assert.equal(node.failCount - previous.failCount, attempt, "a lease must be penalized exactly once");
+          assert.equal(node.successCount, previous.successCount, "errors must never be settled as success");
+          assert.equal(node.rateLimitStates?.[model]?.consecutiveRateLimitCount, attempt);
+          assert.equal(node.rateLimitStates?.[model]?.autoDisabledBy429, attempt === 5);
+          assert.equal(node.currentConcurrency, 0);
+          assert.equal(node.enabled, true, "429 isolation is scoped to the affected model");
+        }
+      }
+      const requestsBefore = capturedRequests.length;
+      assert.ok((await injectRoute(route, model)).statusCode >= 500);
+      assert.equal(capturedRequests.length, requestsBefore, "isolated nodes must not receive a sixth request");
+    }
+  }
+  console.log("[pass] exact reported 429 JSON and HTTP-200 SSE errors (byte splits, CRLF, EOF, Responses failures) isolate each affected model after five failures across every protocol and converter");
+
+  for (const route of routes) {
+    const model = `retry-success-${caseId++}-free`;
+    await configureRoute(route, model);
+    upstreamReplies.push({ status: 200, body: errorEvent }, { status: 200, body: wire === "anthropic" ? anthropicBody : wire === "responses" ? responsesBody : wire === "systemone" ? '{"answer":"Hello"}' : chatBody });
+    const before = await getProxies();
+    const requestsBefore = capturedRequests.length;
+    const result = await injectRoute(route, model);
+    assert.equal(result.statusCode, 200, result.body);
+    assert.ok(result.body.includes("Hello"));
+    assert.equal(capturedRequests.length - requestsBefore, 2);
+    const after = await getProxies();
+    assert.equal(after.reduce((sum: number, node: any) => sum + node.failCount, 0) - before.reduce((sum: number, node: any) => sum + node.failCount, 0), 1);
+    assert.equal(after.reduce((sum: number, node: any) => sum + node.successCount, 0) - before.reduce((sum: number, node: any) => sum + node.successCount, 0), 1);
+    assert.ok(after.every((node: any) => node.currentConcurrency === 0));
+  }
+  console.log("[pass] an initial SSE 429 retries onto a healthy node and settles failure/success leases once across every protocol and converter");
+
+  for (const route of routes.filter((item) => item.stream)) {
+    const model = `late-error-${caseId++}-free`;
+    await configureRoute(route, model);
+    const prefix = wire === "anthropic" ? anthropicBody.split("event: message_stop")[0]
+      : wire === "responses" ? responsesBody.split("event: response.completed")[0]
+      : chatBody.split('data: {"id":"test","choices"')[0];
+    upstreamStatus = 200;
+    upstreamError = prefix + errorEvent;
+    const before = await getProxies();
+    const requestsBefore = capturedRequests.length;
+    for (let i = 0; i < 10; i++) {
+      const result = await injectRoute(route, model);
+      assert.equal(result.statusCode, 200, "an open SSE stream retains its HTTP status");
+      assert.ok(result.body.includes(reportedMessage), "the client must receive the late error");
+      assert.ok(!result.body.includes("[DONE]") && !result.body.includes("message_stop") && !result.body.includes("response.completed"), "an error must not be followed by a successful completion");
+    }
+    assert.equal(capturedRequests.length - requestsBefore, 10, "open streams must not retry or duplicate output");
+    for (const node of await getProxies()) {
+      assert.equal(node.rateLimitStates?.[model]?.autoDisabledBy429, true);
+      assert.equal(node.rateLimitStates?.[model]?.consecutiveRateLimitCount, 5);
+      assert.equal(node.successCount, before.find((item: any) => item.id === node.id).successCount);
+      assert.equal(node.currentConcurrency, 0);
+    }
+  }
+  console.log("[pass] late SSE errors terminate with an error, do not retry or emit success, and still trigger model isolation");
+
+  for (const route of routes) {
+    const model = `console-sse-${caseId++}-free`;
+    await configureRoute(route, model);
+    const message = "Error from provider (Console): Rate limit exceeded. 稍后重试。";
+    for (const type of ["error", "response.failed"]) {
+      const error = { message, type: "rate_limit_error" };
+      const payload = type === "response.failed" ? { type, response: { error } } : { error };
+      upstreamError = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+      for (const status of [200, 429]) {
+        upstreamStatus = status;
+        const before = await getProxies();
+        const result = await injectRoute(route, model);
+        assert.equal(result.statusCode, 429, result.body);
+        assert.equal(result.json().error.message, message);
+        for (const node of await getProxies()) {
+          assert.equal(node.failCount, before.find((item: any) => item.id === node.id).failCount, "Console provider errors must not penalize proxies");
+          assert.equal(node.rateLimitStates?.[model]?.consecutiveRateLimitCount ?? 0, 0);
+          assert.equal(node.currentConcurrency, 0);
+        }
+      }
+    }
+  }
+  console.log("[pass] split UTF-8 Console errors retain their message and never penalize proxies when wrapped as SSE");
 } finally {
   globalThis.fetch = originalFetch;
   https.request = originalRequest;

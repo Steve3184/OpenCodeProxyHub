@@ -1,5 +1,6 @@
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import https from "node:https";
+import { readUpstreamResponse } from "../providers/upstreamResponse.js";
 import type { ServerResponse } from "node:http";
 import { registerResponseAttempt } from "../runtime/responseLifecycle.js";
 import { ocId } from "../utils/ids.js";
@@ -99,11 +100,6 @@ const extractSseBlocks = (buffer: string): { blocks: SseBlock[]; rest: string } 
   const parts = normalized.split("\n\n");
   const rest = parts.pop() || "";
   return { blocks: parts.map(parseSseBlock).filter((block): block is SseBlock => Boolean(block)), rest };
-};
-
-const isPlainJson = (text: string): boolean => {
-  const trimmed = text.trim();
-  return trimmed.startsWith("{") && trimmed.endsWith("}");
 };
 
 const writeOpenAiError = (res: ServerResponse, statusCode: number, message: string): void => {
@@ -235,38 +231,10 @@ export const pipeAnthropicSseAsOpenAI = (
   };
 
   const req = https.request(prepared.options, (zenRes) => {
-    zenRes.on("data", (chunk: Buffer) => {
+    readUpstreamResponse(zenRes, (chunk) => {
       if (settled || retryStarted) return;
       receivedData = true;
       buffer += chunk.toString();
-
-      if (!res.headersSent && isPlainJson(buffer)) {
-        try {
-          const parsed = JSON.parse(buffer);
-          if (parsed.error || parsed.type === "error" || zenRes.statusCode === 429) {
-            const message = parsed.error?.message || parsed.message || "Upstream error";
-            const rateLimited = zenRes.statusCode === 429 || buffer.includes("FreeUsageLimitError") || buffer.includes("rate_limit_error") || buffer.toLowerCase().includes("rate limit");
-            if (prepared.lease?.node && proxyPool && !markedFailure) {
-              proxyPool.markFailure(prepared.lease.node.id, message, { statusCode: rateLimited ? 429 : 502, leaseId: prepared.lease.leaseId });
-              markedFailure = true;
-            }
-            if (rateLimited && retryRateLimited()) {
-              settled = true;
-              zenRes.resume();
-              return;
-            }
-            settled = true;
-            const upstreamStatus = zenRes.statusCode || 502;
-            const responseStatus = rateLimited ? 429 : (upstreamStatus >= 400 ? upstreamStatus : 502);
-            writeOpenAiError(res, responseStatus, message);
-            metrics?.recordUpstream({ statusCode: responseStatus, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-            zenRes.resume();
-            return;
-          }
-        } catch {
-          // Continue parsing as SSE if this is not a complete JSON error body.
-        }
-      }
 
       const extracted = extractSseBlocks(buffer);
       buffer = extracted.rest;
@@ -287,26 +255,11 @@ export const pipeAnthropicSseAsOpenAI = (
           // Ignore malformed SSE payloads rather than corrupting the OpenAI stream.
         }
       }
-    });
-
-    zenRes.on("end", () => {
+    }, () => {
       if (settled || retryStarted) return;
       settled = true;
       const status = zenRes.statusCode || 502;
-      if (status >= 400) {
-        const rateLimited = status === 429 || buffer.includes("FreeUsageLimitError") || buffer.includes("rate_limit_error") || buffer.toLowerCase().includes("rate limit");
-        if (prepared.lease?.node && proxyPool && !markedFailure) {
-          proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${status}`, { statusCode: rateLimited ? 429 : status, leaseId: prepared.lease.leaseId, upstreamBody: buffer });
-          markedFailure = true;
-        }
-        if (rateLimited && retryRateLimited()) return;
-        writeOpenAiError(res, rateLimited ? 429 : status, rateLimited ? "Upstream returned 429" : `Upstream returned HTTP ${status}`);
-        if (!res.writableEnded) res.end();
-        metrics?.recordUpstream({ statusCode: rateLimited ? 429 : status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-        return;
-      }
       if (prepared.lease?.node && proxyPool && !markedFailure) {
-        const status = zenRes.statusCode || 502;
         if (status >= 200 && status < 300) proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
         else {
           proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${status}`, { statusCode: status, leaseId: prepared.lease.leaseId });
@@ -315,7 +268,7 @@ export const pipeAnthropicSseAsOpenAI = (
         const inputTokens = Math.ceil(prepared.body.length / 4);
         if (status >= 200 && status < 300) proxyPool.recordTokenUsage(prepared.lease.node.id, usageAccumulator.totalTokens() ?? (inputTokens + Math.ceil(observedOutputChars / 4)));
       }
-      metrics?.recordUpstream({ statusCode: zenRes.statusCode || 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+      metrics?.recordUpstream({ statusCode: status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
 
       if (!receivedData && !res.headersSent) {
         writeOpenAiError(res, 502, "Empty response from upstream");
@@ -323,6 +276,24 @@ export const pipeAnthropicSseAsOpenAI = (
       }
       if (!state.doneSent && !res.writableEnded) sendDone(state, res);
       if (!res.writableEnded) res.end();
+    }, (failure) => {
+      if (settled || retryStarted) return;
+      settled = true;
+      if (prepared.lease?.node && proxyPool && !markedFailure) {
+        proxyPool.markFailure(prepared.lease.node.id, failure.message, {
+          statusCode: failure.statusCode, leaseId: prepared.lease.leaseId, upstreamBody: failure.body,
+        });
+        markedFailure = true;
+      }
+      metrics?.recordUpstream({ statusCode: failure.statusCode, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+      if ((failure.rateLimited || failure.proxyAccessError) && retryRateLimited()) return;
+      const body = JSON.stringify({ error: { message: failure.message, type: failure.rateLimited ? "rate_limit_error" : "upstream_error", ...(failure.rateLimited ? { code: "rate_limit_exceeded" } : {}) } });
+      if (!res.headersSent) {
+        res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
+        res.end(body);
+      } else if (!res.writableEnded) {
+        res.end(`event: error\ndata: ${body}\n\n`);
+      }
     });
   });
 

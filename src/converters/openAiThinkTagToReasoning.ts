@@ -1,5 +1,6 @@
 import { SSE_RESPONSE_HEADERS } from "../utils/responseHeaders.js";
 import https from "node:https";
+import { readUpstreamResponse } from "../providers/upstreamResponse.js";
 import type { ServerResponse } from "node:http";
 import { registerResponseAttempt } from "../runtime/responseLifecycle.js";
 import type { ZenPreparedRequest } from "../providers/zenClient.js";
@@ -160,13 +161,10 @@ export const pipeOpenAiStreamStrippingThink = (
   let buffer = "";
   let markedFailure = false;
   let receivedData = false;
-  let firstChunkChecked = false;
-  let aborted = false;
   let retryStarted = false;
   let settled = false;
   const usageAccumulator = createTokenUsageAccumulator();
   let observedOutputChars = 0;
-  let rateLimitBody = "";
 
   const retryRateLimited = (): boolean => {
     if (retryCount >= maxRetries || !retryPrepare || !proxyPool || !prepared.lease?.node?.id || res.headersSent) return false;
@@ -186,54 +184,13 @@ export const pipeOpenAiStreamStrippingThink = (
   const toolFilter = toolMapper ? new DownstreamToolCallFilter(toolMapper) : undefined;
 
   const req = https.request(prepared.options, (zenRes) => {
-    zenRes.on("data", (chunk: Buffer) => {
-      if (settled || retryStarted || aborted) return;
-      if ((zenRes.statusCode || 502) >= 400) {
-        rateLimitBody += chunk.toString();
-        return;
-      }
+    readUpstreamResponse(zenRes, (chunk) => {
+      if (settled || retryStarted) return;
       receivedData = true;
       buffer += chunk.toString();
 
-      // First-chunk error/rate-limit detection (mirrors pipeZenOpenAIResponse).
-      if (!firstChunkChecked) {
-        const str = buffer.trim();
-        if (str.startsWith("{")) {
-          try {
-            const parsed = JSON.parse(str);
-            const rateLimited = zenRes.statusCode === 429 || str.includes("FreeUsageLimitError") || str.includes("rate_limit_error") || str.toLowerCase().includes("rate limit");
-            if (parsed.error || parsed.type === "error") {
-              firstChunkChecked = true;
-              aborted = true;
-              const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
-              if (prepared.lease?.node && proxyPool && !markedFailure) {
-                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : 502, leaseId: prepared.lease.leaseId });
-                markedFailure = true;
-              }
-              if (rateLimited && retryRateLimited()) {
-                settled = true;
-                zenRes.resume();
-                return;
-              }
-              settled = true;
-              if (!res.headersSent) {
-                const responseStatus = rateLimited ? 429 : 502;
-                res.writeHead(responseStatus, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: { message: errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
-              }
-              metrics?.recordUpstream({ statusCode: rateLimited ? 429 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-              zenRes.resume();
-              return;
-            }
-          } catch {
-            // Not a complete JSON error body yet; fall through and keep buffering as SSE.
-          }
-        }
-      }
-
       const extracted = extractSseBlocks(buffer);
       buffer = extracted.rest;
-      if (extracted.blocks.length > 0) firstChunkChecked = true;
 
       for (const block of extracted.blocks) {
         if (block.data === "[DONE]") {
@@ -256,38 +213,11 @@ export const pipeOpenAiStreamStrippingThink = (
           res.write(`data: ${block.data}\n\n`);
         }
       }
-    });
-
-    zenRes.on("end", () => {
+    }, () => {
       if (settled || retryStarted) return;
       settled = true;
       const status = zenRes.statusCode || 502;
-      if (status >= 400) {
-        const rateLimited = status === 429 || rateLimitBody.includes("FreeUsageLimitError") || rateLimitBody.includes("rate_limit_error") || rateLimitBody.toLowerCase().includes("rate limit");
-        let errMsg = rateLimited ? "Upstream returned 429" : `Upstream returned HTTP ${status}`;
-        try {
-          const parsed = JSON.parse(rateLimitBody);
-          errMsg = parsed.error?.message || parsed.message || errMsg;
-        } catch {
-          // Keep the generic upstream message for malformed bodies.
-        }
-        if (prepared.lease?.node && proxyPool && !markedFailure) {
-          proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : status, leaseId: prepared.lease.leaseId });
-          markedFailure = true;
-        }
-        if (rateLimited && retryRateLimited()) return;
-        if (!res.headersSent) {
-          const responseStatus = rateLimited ? 429 : status;
-          res.writeHead(responseStatus, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: errMsg, type: rateLimited ? "rate_limit_error" : "upstream_error", ...(rateLimited ? { code: "rate_limit_exceeded" } : {}) } }));
-        } else if (!res.writableEnded) {
-          res.end();
-        }
-        metrics?.recordUpstream({ statusCode: rateLimited ? 429 : status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-        return;
-      }
       if (prepared.lease?.node && proxyPool && !markedFailure) {
-        const status = zenRes.statusCode || 502;
         if (status >= 200 && status < 300) {
           proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
           proxyPool.recordTokenUsage(prepared.lease.node.id, usageAccumulator.totalTokens() ?? (Math.ceil(prepared.body.length / 4) + Math.ceil(observedOutputChars / 4)));
@@ -296,12 +226,8 @@ export const pipeOpenAiStreamStrippingThink = (
           markedFailure = true;
         }
       }
-      metrics?.recordUpstream({ statusCode: zenRes.statusCode || 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+      metrics?.recordUpstream({ statusCode: status, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
 
-      if (aborted) {
-        if (!res.writableEnded) res.end();
-        return;
-      }
       if (!receivedData && !res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "Empty response from upstream", type: "upstream_error" } }));
@@ -318,6 +244,24 @@ export const pipeOpenAiStreamStrippingThink = (
         });
       }
       if (!res.writableEnded) res.end();
+    }, (failure) => {
+      if (settled || retryStarted) return;
+      settled = true;
+      if (prepared.lease?.node && proxyPool && !markedFailure) {
+        proxyPool.markFailure(prepared.lease.node.id, failure.message, {
+          statusCode: failure.statusCode, leaseId: prepared.lease.leaseId, upstreamBody: failure.body,
+        });
+        markedFailure = true;
+      }
+      metrics?.recordUpstream({ statusCode: failure.statusCode, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+      if ((failure.rateLimited || failure.proxyAccessError) && retryRateLimited()) return;
+      const body = JSON.stringify({ error: { message: failure.message, type: failure.rateLimited ? "rate_limit_error" : "upstream_error", ...(failure.rateLimited ? { code: "rate_limit_exceeded" } : {}) } });
+      if (!res.headersSent) {
+        res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
+        res.end(body);
+      } else if (!res.writableEnded) {
+        res.end(`event: error\ndata: ${body}\n\n`);
+      }
     });
   });
 

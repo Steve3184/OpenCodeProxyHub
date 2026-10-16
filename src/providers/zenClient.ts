@@ -11,7 +11,8 @@ import { createTokenUsageAccumulator, estimateTokens, extractTokenUsage } from "
 import { normalizeResponsesRequest } from "../converters/openAiResponses.js";
 import { aggregateUpstreamBody, type UpstreamProtocol } from "../converters/streamAggregator.js";
 import { DownstreamToolCallFilter, ResponsesStreamToolFilter, applyToolFilterToChatCompletion, applyToolFilterToResponsesResponse, toUpstreamMessages, toUpstreamToolChoice, toUpstreamTools, type ToolNameMapper } from "../converters/toolMapping.js";
-import { isOpenCodeProxyAccessError, isUpstreamRateLimitError, shouldRetryWithAnotherProxy } from "./opencodeAccessErrors.js";
+import type { UpstreamErrorPayload } from "./opencodeAccessErrors.js";
+import { readUpstreamResponse } from "./upstreamResponse.js";
 
 const noProxyAvailableError = "Proxy is required but no proxy node is available";
 
@@ -132,31 +133,30 @@ export const requestZenFull = (
     try {
       req = https.request(prepared.options, (zenRes) => {
       const chunks: Buffer[] = [];
-      zenRes.on("data", (chunk: Buffer) => chunks.push(chunk));
-      zenRes.on("end", () => {
+      const finish = (failure?: UpstreamErrorPayload) => {
         if (settled) return;
         settled = true;
-        const upstreamRaw = Buffer.concat(chunks).toString();
+        const upstreamRaw = failure?.body ?? Buffer.concat(chunks).toString();
         // The upstream always streams, so a successful body is SSE. Fold it back
         // into the complete JSON document the caller expects; error bodies and
         // non-SSE replies are passed through as-is.
         const aggregated = aggregateUpstreamBody(upstreamRaw, protocol);
-        const data: any = aggregated;
-        const raw = aggregated ? JSON.stringify(aggregated) : upstreamRaw;
+        const data: any = failure && !aggregated?.error ? { error: { message: failure.message } } : aggregated;
+        const raw = data ? JSON.stringify(data) : upstreamRaw;
         const status = zenRes.statusCode || 502;
         const protocolError = !data || Boolean(data.error) || data.type === "error";
-        const rateLimited = isUpstreamRateLimitError(status, raw);
-        const proxyAccessError = isOpenCodeProxyAccessError(status, raw);
+        const rateLimited = failure?.rateLimited ?? false;
+        const proxyAccessError = failure?.proxyAccessError ?? false;
         const retryableProxyError = rateLimited || proxyAccessError;
-        const effectiveErrorStatus = rateLimited ? 429 : (status >= 400 ? status : protocolError ? 502 : status);
+        const effectiveErrorStatus = failure?.statusCode ?? (protocolError ? 502 : status);
         if (prepared.lease?.node && proxyPool) {
-          if (rateLimited) proxyPool.markFailure(prepared.lease.node.id, "Upstream returned 429", { statusCode: 429, leaseId: prepared.lease.leaseId, upstreamBody: raw });
+          if (rateLimited) proxyPool.markFailure(prepared.lease.node.id, failure?.message ?? "Upstream returned 429", { statusCode: 429, leaseId: prepared.lease.leaseId, upstreamBody: raw });
           else if (status >= 200 && status < 300 && !protocolError) {
             proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
             const usage = extractTokenUsage(data);
             proxyPool.recordTokenUsage(prepared.lease.node.id, usage.totalTokens ?? estimateTokens(requestInputForTokenEstimate(prepared.body)) + estimateTokens(responseTextForTokenEstimate(data)));
           } else {
-            proxyPool.markFailure(prepared.lease.node.id, `Upstream returned HTTP ${effectiveErrorStatus}`, { statusCode: effectiveErrorStatus, leaseId: prepared.lease.leaseId, upstreamBody: raw });
+            proxyPool.markFailure(prepared.lease.node.id, failure?.message ?? `Upstream returned HTTP ${effectiveErrorStatus}`, { statusCode: effectiveErrorStatus, leaseId: prepared.lease.leaseId, upstreamBody: raw });
           }
         }
         metrics?.recordUpstream({ statusCode: effectiveErrorStatus, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
@@ -174,11 +174,12 @@ export const requestZenFull = (
           }
         }
         try {
-          resolve({ status, data, raw });
+          resolve({ status: effectiveErrorStatus, data, raw });
         } catch {
-          resolve({ status, data: null, raw });
+          resolve({ status: effectiveErrorStatus, data: null, raw });
         }
-      });
+      };
+      readUpstreamResponse(zenRes, (chunk) => chunks.push(chunk), () => finish(), finish);
       });
     } catch (error) {
       settled = true;
@@ -246,7 +247,6 @@ export const pipeZenOpenAIResponse = (
   let scanBuffer = "";
   const usageAccumulator = createTokenUsageAccumulator();
   let observedOutputChars = 0;
-  let responseErrorBody = "";
   let responseRewriteBuffer = "";
   // Upstream always streams; a non-streaming caller gets the stream folded back
   // into a single JSON body once the upstream has finished.
@@ -380,108 +380,40 @@ export const pipeZenOpenAIResponse = (
   let req: ReturnType<typeof https.request>;
   try {
     req = https.request(prepared.options, (zenRes) => {
-    let firstChunk: Buffer | null = null;
+    let receivedData = false;
     let headersSent = false;
 
-    zenRes.on("data", (chunk: Buffer) => {
+    readUpstreamResponse(zenRes, (chunk) => {
       if (settled || retryStarted) return;
-      const status = zenRes.statusCode || 502;
-      if (status >= 400) {
-        responseErrorBody += chunk.toString();
-        return;
-      }
-      if (!firstChunk) {
-        firstChunk = chunk;
-        const str = chunk.toString().trim();
-        if (str.startsWith("{")) {
-          try {
-            const parsed = JSON.parse(str);
-            const rateLimited = isUpstreamRateLimitError(status, str);
-            const proxyAccessError = isOpenCodeProxyAccessError(status, str);
-            if (parsed.error || parsed.type === "error") {
-              const errMsg = parsed.error?.message || parsed.message || "Rate limit exceeded";
-              const errorStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
-              if (prepared.lease?.node && proxyPool && !markedFailure) {
-                proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: errorStatus, leaseId: prepared.lease.leaseId });
-                markedFailure = true;
-              }
-              if ((rateLimited || proxyAccessError) && retryWithAnotherProxy()) {
-                settled = true;
-                zenRes.resume();
-                return;
-              }
-              settled = true;
-              if (!res.headersSent) {
-                const responseStatus = rateLimited ? 429 : proxyAccessError ? 403 : 502;
-                res.writeHead(responseStatus, { "Content-Type": "application/json" });
-                res.end(errorBody(errMsg, rateLimited));
-              }
-              metrics?.recordUpstream({ statusCode: rateLimited ? 429 : proxyAccessError ? 403 : 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
-              zenRes.resume();
-              return;
-            }
-          } catch {
-            // Continue with normal passthrough.
-          }
-        }
-
-        scanUsage(firstChunk);
-        if (aggregateUpstream) {
-          // Buffer the upstream stream so protocol errors and aliases are
-          // handled from the complete response before headers are sent.
-          nonStreamChunks.push(firstChunk);
-          return;
-        }
-
-        headersSent = true;
-        res.writeHead(200, SSE_RESPONSE_HEADERS);
-        res.write(transformStreamChunk(firstChunk));
-        return;
-      }
-
+      receivedData = true;
       scanUsage(chunk);
       if (aggregateUpstream) {
         nonStreamChunks.push(chunk);
         return;
       }
-      if (headersSent) res.write(transformStreamChunk(chunk));
-    });
-
-    zenRes.on("end", () => {
+      if (!headersSent) {
+        headersSent = true;
+        res.writeHead(200, SSE_RESPONSE_HEADERS);
+      }
+      res.write(transformStreamChunk(chunk));
+    }, () => {
       if (settled || retryStarted) return;
       settled = true;
       const status = zenRes.statusCode || 502;
       const upstreamBody = aggregateUpstream ? Buffer.concat(nonStreamChunks).toString() : "";
-      // The upstream streams even for non-streaming callers, so fold the SSE
-      // body back into the complete JSON document they expect.
-      let nonStreamData: Record<string, unknown> | null = null;
-      let protocolError = false;
-      if (aggregateUpstream && status < 400) {
-        nonStreamData = aggregateUpstreamBody(upstreamBody, responsesProtocol ? "responses" : "chat_completions");
-        protocolError = !nonStreamData || Boolean(nonStreamData.error) || nonStreamData.type === "error";
-        if (nonStreamData) usageAccumulator.observe(nonStreamData);
-      }
-      const upstreamErrorRaw = status >= 400 ? responseErrorBody : upstreamBody;
-      const rateLimited = isUpstreamRateLimitError(status, upstreamErrorRaw);
-      const proxyAccessError = isOpenCodeProxyAccessError(status, upstreamErrorRaw);
-      if (status >= 400 || (aggregateUpstream && protocolError)) {
-        const parsed = (() => {
-          try { return JSON.parse(upstreamErrorRaw); } catch { return null; }
-        })();
-        const errMsg = parsed?.error?.message || parsed?.message || (status >= 400 ? `Upstream returned HTTP ${status}` : "Invalid upstream response");
-        if (prepared.lease?.node && proxyPool && !markedFailure) {
-          proxyPool.markFailure(prepared.lease.node.id, errMsg, { statusCode: rateLimited ? 429 : (status >= 400 ? status : 502), leaseId: prepared.lease.leaseId });
-          markedFailure = true;
+      const nonStreamData = aggregateUpstream
+        ? aggregateUpstreamBody(upstreamBody, responsesProtocol ? "responses" : "chat_completions")
+        : null;
+      if (aggregateUpstream && !nonStreamData) {
+        if (prepared.lease?.node && proxyPool) {
+          proxyPool.markFailure(prepared.lease.node.id, "Invalid upstream response", { statusCode: 502, leaseId: prepared.lease.leaseId });
         }
-        if ((rateLimited || proxyAccessError) && retryWithAnotherProxy()) return;
-        if (!res.headersSent) {
-          const responseStatus = rateLimited ? 429 : (status >= 400 ? status : 502);
-          res.writeHead(responseStatus, { "Content-Type": "application/json" });
-          res.end(errorBody(errMsg, rateLimited));
-        }
-        metrics?.recordUpstream({ statusCode: rateLimited ? 429 : (status >= 400 ? status : 502), durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+        metrics?.recordUpstream({ statusCode: 502, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(errorBody("Invalid upstream response", false));
         return;
       }
+      if (nonStreamData) usageAccumulator.observe(nonStreamData);
       if (prepared.lease?.node && proxyPool && !markedFailure) {
         if (status >= 200 && status < 300) {
           proxyPool.markSuccess(prepared.lease.node.id, prepared.lease.leaseId, status);
@@ -524,7 +456,7 @@ export const pipeZenOpenAIResponse = (
         if (!res.writableEnded) res.end(body);
         return;
       }
-      if (!headersSent && !firstChunk) {
+      if (!headersSent && !receivedData) {
         if (!res.headersSent) {
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(errorBody("Empty response from upstream", false));
@@ -534,6 +466,24 @@ export const pipeZenOpenAIResponse = (
       if (headersSent) {
         if (streamTransform || responseModel || responsesToolFilter) res.write(transformStreamChunk("", true));
         if (!res.writableEnded) res.end();
+      }
+    }, (failure) => {
+      if (settled || retryStarted) return;
+      settled = true;
+      if (prepared.lease?.node && proxyPool && !markedFailure) {
+        proxyPool.markFailure(prepared.lease.node.id, failure.message, {
+          statusCode: failure.statusCode, leaseId: prepared.lease.leaseId, upstreamBody: failure.body,
+        });
+        markedFailure = true;
+      }
+      metrics?.recordUpstream({ statusCode: failure.statusCode, durationMs: durationMs(), proxyId: prepared.lease?.node?.id });
+      if ((failure.rateLimited || failure.proxyAccessError) && retryWithAnotherProxy()) return;
+      const body = errorBody(failure.message, failure.rateLimited);
+      if (!res.headersSent) {
+        res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
+        res.end(body);
+      } else if (!res.writableEnded) {
+        res.end(`event: error\ndata: ${body}\n\n`);
       }
     });
     });
