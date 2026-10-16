@@ -6,7 +6,7 @@ import { JsonFileStore } from "../storage/jsonFile.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { HttpPreProxyToHttpAgent, HttpPreProxyToSocksAgent } from "./chainedAgent.js";
 import { ocSessionId } from "../utils/ids.js";
-import { isConsoleProviderError } from "../providers/opencodeAccessErrors.js";
+import { isConsoleProviderError, parseUpstreamErrorPayload } from "../providers/opencodeAccessErrors.js";
 import { createOpenCodeHeaders } from "../providers/opencodeHeaders.js";
 
 export type ProxyType = "http" | "https" | "socks5";
@@ -15,6 +15,7 @@ export interface ProxyRateLimitState {
   consecutiveRateLimitCount: number;
   autoDisabledBy429: boolean;
   lastRecoveryTestAt: string | null;
+  lastSuccessAt: string | null;
   cooldownUntil: string | null;
   lastError: string | null;
 }
@@ -267,6 +268,7 @@ export class ProxyPoolStore {
   update(id: string, input: ProxyInput): ProxyNode {
     const node = this.find(id);
     if (!node) throw new Error("Proxy not found");
+    const previousEndpoint = this.proxyEndpoint(node);
 
     if (input.name !== undefined) node.name = input.name.trim();
     if (input.type !== undefined) node.type = input.type;
@@ -291,6 +293,9 @@ export class ProxyPoolStore {
     if (input.autoDisableWhenDailyLimitReached !== undefined) node.autoDisableWhenDailyLimitReached = input.autoDisableWhenDailyLimitReached;
 
     this.validateNode(node);
+    if (this.proxyEndpoint(node) !== previousEndpoint) {
+      for (const state of Object.values(node.rateLimitStates || {})) state.lastSuccessAt = null;
+    }
     this.persistConfig();
     this.persistState(node.id);
     return { ...node };
@@ -315,6 +320,7 @@ export class ProxyPoolStore {
     // Do not sort the entire pool for every request. With tens of thousands of
     // nodes this changes acquire from O(n log n) to a single O(n) scan.
     let node: ProxyNode | undefined;
+    let bestHealthRank = -1;
     for (const candidate of this.proxies) {
       if (!candidate.enabled || excludeProxyIds.has(candidate.id)) continue;
       if (!isProxyCompatibleWithModel(candidate, model)) continue;
@@ -324,7 +330,15 @@ export class ProxyPoolStore {
       if (!model && candidate.cooldownUntil && Date.parse(candidate.cooldownUntil) > now) continue;
       if (candidate.dailyRequestLimit !== 0 && candidate.dailyRequestCount >= candidate.dailyRequestLimit) continue;
       if (candidate.currentConcurrency >= candidate.maxConcurrency) continue;
-      if (!node || candidate.weight > node.weight) node = candidate;
+      // Preserve priority filling by weight. Within the same weight, use a
+      // proven success for this model before untested nodes, then nodes whose
+      // last model attempt failed. Expired cooldowns must not keep consuming
+      // the retry budget ahead of a working node later in a large pool.
+      const healthRank = rateLimitState?.lastError ? 0 : rateLimitState?.lastSuccessAt ? 2 : 1;
+      if (!node || candidate.weight > node.weight || (candidate.weight === node.weight && healthRank > bestHealthRank)) {
+        node = candidate;
+        bestHealthRank = healthRank;
+      }
     }
     if (!node) return { node: null, requiredUnavailable: this.settingsStore.get().proxyMode === "required" };
 
@@ -369,12 +383,14 @@ export class ProxyPoolStore {
     const lease = this.takeLease(id, leaseId);
     if (!lease) return;
     node.successCount += 1;
+    const checkedAt = new Date().toISOString();
     const model = lease.model;
     if (model) {
       const state = this.rateLimitState(node, model);
       state.consecutiveRateLimitCount = 0;
       state.autoDisabledBy429 = false;
       state.lastRecoveryTestAt = null;
+      state.lastSuccessAt = checkedAt;
       state.cooldownUntil = null;
       state.lastError = null;
     } else {
@@ -385,7 +401,7 @@ export class ProxyPoolStore {
       node.lastError = null;
     }
     this.recordResult(node, true, statusCode);
-    node.lastCheckedAt = new Date().toISOString();
+    node.lastCheckedAt = checkedAt;
     this.persistState(id);
   }
 
@@ -488,6 +504,7 @@ export class ProxyPoolStore {
         modelState.autoDisabledBy429 = false;
         modelState.consecutiveRateLimitCount = 0;
         modelState.lastRecoveryTestAt = null;
+        modelState.lastSuccessAt = new Date().toISOString();
         modelState.cooldownUntil = null;
         modelState.lastError = null;
       } else {
@@ -572,6 +589,7 @@ export class ProxyPoolStore {
               state.consecutiveRateLimitCount = 0;
               state.cooldownUntil = null;
               state.lastRecoveryTestAt = null;
+              state.lastSuccessAt = new Date().toISOString();
               state.lastError = null;
               recovered += 1;
             } else {
@@ -685,6 +703,7 @@ export class ProxyPoolStore {
         consecutiveRateLimitCount: Number.isFinite(state.consecutiveRateLimitCount) ? Math.max(0, Math.trunc(state.consecutiveRateLimitCount as number)) : 0,
         autoDisabledBy429: Boolean(state.autoDisabledBy429),
         lastRecoveryTestAt: state.lastRecoveryTestAt || null,
+        lastSuccessAt: typeof state.lastSuccessAt === "string" && Number.isFinite(Date.parse(state.lastSuccessAt)) ? state.lastSuccessAt : null,
         cooldownUntil: state.cooldownUntil || null,
         lastError: state.lastError || null,
       } satisfies ProxyRateLimitState]];
@@ -846,12 +865,10 @@ export class ProxyPoolStore {
                   }
                 }
               }
-              const errorPayload = payloads.find((entry) => entry.error || entry.type === "error");
-              if (errorPayload || raw.includes("FreeUsageLimitError") || raw.includes("rate_limit_error")) {
-                const errorValue = errorPayload?.error;
-                const message = typeof errorValue === "string" ? errorValue : (errorValue as { message?: string } | undefined)?.message;
-                const error = new Error(`Model health check returned an upstream error${message ? `: ${message}` : ""}`) as Error & { statusCode?: number };
-                error.statusCode = statusCode;
+              const upstreamError = payloads.map((entry) => parseUpstreamErrorPayload(statusCode, JSON.stringify(entry))).find((error) => error !== null);
+              if (upstreamError) {
+                const error = new Error(`Model health check returned an upstream error: ${upstreamError.message}`) as Error & { statusCode?: number };
+                error.statusCode = upstreamError.statusCode;
                 reject(error);
                 return;
               }
@@ -932,6 +949,7 @@ export class ProxyPoolStore {
       consecutiveRateLimitCount: 0,
       autoDisabledBy429: false,
       lastRecoveryTestAt: null,
+      lastSuccessAt: null,
       cooldownUntil: null,
       lastError: null,
     };

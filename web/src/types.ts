@@ -82,6 +82,7 @@ export interface ProxyRateLimitState {
   consecutiveRateLimitCount: number;
   autoDisabledBy429: boolean;
   lastRecoveryTestAt: string | null;
+  lastSuccessAt: string | null;
   cooldownUntil: string | null;
   lastError: string | null;
 }

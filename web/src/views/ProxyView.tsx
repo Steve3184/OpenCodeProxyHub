@@ -78,7 +78,7 @@ export function ProxyView({ data }: { data: ConsoleData }) {
         className="grid grid-cols-1 gap-3 md:grid-cols-3"
       >
         <motion.div variants={fadeUp}>
-          <InfoCard icon={<Route size={16} className="text-primary" />} title="当前策略" value="优先填充" sub="高权重节点优先，同权重按顺序" />
+          <InfoCard icon={<Route size={16} className="text-primary" />} title="当前策略" value="优先填充" sub="高权重优先，同权重优先使用该模型成功节点" />
         </motion.div>
         <motion.div variants={fadeUp}>
           <InfoCard icon={<AlertTriangle size={16} className="text-warning" />} title="故障恢复" value="自动探测" sub="429 与冷却结束的异常节点每 10 分钟探测" />
