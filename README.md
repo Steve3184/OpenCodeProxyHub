@@ -132,6 +132,10 @@ PROXY_MODE=required PROXY_URL_FILE=/path/to/private-proxies.txt node scripts/che
 
 模型检查脚本复用正式请求构造和 SSE 聚合逻辑；可在命令行指定模型，省略时检查内置列表。上游模型可用性、配额和协议支持仍独立变化：例如 `big-pickle` 的下游 Responses 兼容接口应保持 Chat 上游，开启该模型的“使用 Responses 上游”会收到上游“不支持此协议”。
 
+2026-10-18 使用官方 `@opencode/cli@2.0.32` 对照 `glm-5.3-flash-free`：同一可用代理上的官方完整请求和现有网关请求均成功过，也均出现过 `429 / Endpoint is unavailable`；此前报错的另一个出口，即使使用官方提示词和完整工具仍返回 `403 / OpenCode Free Model Gateway Detect Abuse Traffic`。因此不能把此类拒绝当作缺少提示词或 stub tools，也不能把 CONNECT 成功等同于模型可用。
+
+明确的 Abuse Traffic 拒绝保持 403，不自动换代理重试、不注入额外提示词或工具；节点会停用并等待人工确认，后台恢复不会重新启用。健康检查保留非 2xx 的上游错误原因，以区分 CONNECT 故障、模型限流和访问限制。解除限制后由管理员明确启用。离线验证：`npm run check:upstream-abuse`。
+
 更多健康检查、冒烟测试、备份、反向代理与升级说明见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)。公网部署建议在前面再放一层 Nginx/Caddy 等 HTTPS 反向代理（请求体上限需至少放行 `1 GiB`，并保留 `Authorization`/`x-api-key` 头、支持长连接 SSE、关闭对流式路径的缓冲）。
 
 ## 二进制部署（Linux）

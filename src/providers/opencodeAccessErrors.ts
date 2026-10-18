@@ -3,6 +3,10 @@ const OPENCODE_PROXY_ACCESS_MESSAGES = [
   "your access has been restricted due to repeated policy violations",
 ] as const;
 
+export const isOpenCodeAbuseError = (body: string): boolean => (
+  body.toLowerCase().includes("opencode free model gateway detect abuse traffic")
+);
+
 export interface UpstreamErrorPayload {
   message: string;
   statusCode: number;
@@ -28,12 +32,13 @@ export const parseUpstreamErrorPayload = (statusCode: number, body: string): Ups
     : error && typeof error === "object" && "message" in error && typeof error.message === "string"
       ? error.message
       : undefined;
-  const message = errorMessage || (typeof parsed?.message === "string" ? parsed.message : statusCode >= 400 ? `Upstream returned HTTP ${statusCode}` : "Upstream error");
-  const rateLimited = isUpstreamRateLimitError(statusCode, body);
-  const proxyAccessError = isOpenCodeProxyAccessError(statusCode, body);
+  const abuseError = isOpenCodeAbuseError(body);
+  const message = errorMessage || (typeof parsed?.message === "string" ? parsed.message : abuseError ? "Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic" : statusCode >= 400 ? `Upstream returned HTTP ${statusCode}` : "Upstream error");
+  const rateLimited = !abuseError && isUpstreamRateLimitError(statusCode, body);
+  const proxyAccessError = !abuseError && isOpenCodeProxyAccessError(statusCode, body);
   return {
     message,
-    statusCode: rateLimited ? 429 : proxyAccessError ? 403 : statusCode >= 400 ? statusCode : 502,
+    statusCode: abuseError ? 403 : rateLimited ? 429 : proxyAccessError ? 403 : statusCode >= 400 ? statusCode : 502,
     rateLimited,
     proxyAccessError,
     body,
@@ -54,12 +59,14 @@ export const isConsoleProviderError = (body: string): boolean => {
 };
 
 export const isOpenCodeProxyAccessError = (statusCode: number, body: string): boolean => {
+  if (isOpenCodeAbuseError(body)) return false;
   if (statusCode !== 403 && !body.includes("status_code=403")) return false;
   const normalized = body.toLowerCase();
   return OPENCODE_PROXY_ACCESS_MESSAGES.some((message) => normalized.includes(message));
 };
 
 export const isUpstreamRateLimitError = (statusCode: number, body: string): boolean => {
+  if (isOpenCodeAbuseError(body)) return false;
   const normalized = body.toLowerCase();
   return statusCode === 429
     || body.includes("FreeUsageLimitError")

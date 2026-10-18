@@ -106,6 +106,7 @@ jobs:
           npm run check:models-transport
           npm run check:proxy-routing
           npm run check:opencode-compat
+          npm run check:upstream-abuse
           npm run check:proxy-rate-limit
           npm run check:proxy-connect
           npm run check:response-lifecycle

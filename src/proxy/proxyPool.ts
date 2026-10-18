@@ -6,7 +6,7 @@ import { JsonFileStore } from "../storage/jsonFile.js";
 import type { SettingsStore } from "../settings/settingsStore.js";
 import { HttpPreProxyToHttpAgent, HttpPreProxyToSocksAgent } from "./chainedAgent.js";
 import { ocSessionId } from "../utils/ids.js";
-import { isConsoleProviderError, parseUpstreamErrorPayload } from "../providers/opencodeAccessErrors.js";
+import { isConsoleProviderError, isOpenCodeAbuseError, parseUpstreamErrorPayload } from "../providers/opencodeAccessErrors.js";
 import { createOpenCodeHeaders } from "../providers/opencodeHeaders.js";
 import { isProxyConnectFailure, ProxyConnectError, trackProxyConnection, type ProxyConnectionState } from "./connectionState.js";
 
@@ -433,7 +433,8 @@ export class ProxyPoolStore {
     // Settle the lease without penalizing a healthy proxy for a provider error.
     // Do not count this as success or clear previous genuine proxy failures.
     const connectFailure = isProxyConnectFailure(lease.connection, options.upstreamBody ?? error);
-    if (!connectFailure && isConsoleProviderError(options.upstreamBody ?? error)) {
+    const abuseError = !connectFailure && isOpenCodeAbuseError(options.upstreamBody ?? error);
+    if (!connectFailure && !abuseError && isConsoleProviderError(options.upstreamBody ?? error)) {
       this.persistState(id);
       return;
     }
@@ -444,6 +445,8 @@ export class ProxyPoolStore {
     const model = options.model ?? lease.model;
     if (connectFailure) {
       this.disableByConnectFailure(node, lease.connection?.message || error, options.cooldownMs);
+    } else if (abuseError) {
+      this.disableByAbuseRestriction(node, error);
     } else if (model && options.statusCode === 429) {
       const state = this.rateLimitState(node, model);
       state.consecutiveRateLimitCount += 1;
@@ -547,6 +550,8 @@ export class ProxyPoolStore {
       if (error instanceof ProxyConnectError) {
         this.disableByConnectFailure(node, message);
         node.lastConnectRecoveryTestAt = checkedAt;
+      } else if (isOpenCodeAbuseError(message)) {
+        this.disableByAbuseRestriction(node, message);
       } else if (modelState) {
         modelState.lastRecoveryTestAt = modelState.autoDisabledBy429 ? checkedAt : null;
         modelState.lastError = message;
@@ -618,7 +623,9 @@ export class ProxyPoolStore {
             dailyRequestLimit: node.dailyRequestLimit,
           };
           const recordFailure = (message: string, error?: unknown) => {
-            if (connectRecovery || error instanceof ProxyConnectError) {
+            if (!(error instanceof ProxyConnectError) && isOpenCodeAbuseError(message)) {
+              this.disableByAbuseRestriction(node, message);
+            } else if (connectRecovery || error instanceof ProxyConnectError) {
               if (error instanceof ProxyConnectError) this.disableByConnectFailure(node, message);
               node.lastConnectError = message;
               node.lastConnectRecoveryTestAt = recoveryTestAt;
@@ -812,6 +819,15 @@ export class ProxyPoolStore {
     node.lastError = "Daily request limit reached";
   }
 
+  private disableByAbuseRestriction(node: ProxyNode, message: string): void {
+    node.enabled = false;
+    node.autoDisabledBy429 = false;
+    node.lastRecoveryTestAt = null;
+    node.cooldownUntil = null;
+    node.lastError = message;
+    this.persistConfig();
+  }
+
   private isRecoveryCandidate(node: ProxyNode, now: number, recoveryIntervalMs: number, model?: string): boolean {
     if (!node.enabled || node.currentConcurrency > 0) return false;
     if (node.dailyRequestLimit !== 0 && node.dailyRequestCount >= node.dailyRequestLimit) return false;
@@ -945,6 +961,13 @@ export class ProxyPoolStore {
           const raw = Buffer.concat(chunks).toString("utf8");
           if (isProxyConnectFailure(connection, raw)) {
             reject(new ProxyConnectError(connection.message || `Proxy CONNECT failed with HTTP ${statusCode}`, connection.statusCode || statusCode));
+            return;
+          }
+          if (statusCode >= 400) {
+            const failure = parseUpstreamErrorPayload(statusCode, raw);
+            const error = new Error(`Model health check returned HTTP ${statusCode}${failure ? `: ${failure.message}` : ""}`) as Error & { statusCode?: number };
+            error.statusCode = failure?.statusCode ?? statusCode;
+            reject(error);
             return;
           }
           if (statusCode >= 200 && statusCode < 300) {
