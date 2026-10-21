@@ -4,9 +4,6 @@ export const DEFAULT_MODELS = [
   "big-pickle",
   "nemotron-3-ultra-free",
   "nemotron-3.5-lightning-free",
-  "ling-3.0-flash-fin-free",
-  "muse-spark-1.2-contributor-free",
-  "muse-spark-1.3-contributor-free",
   "mimo-v2.6-flash-free",
   "jev-1.13-free",
 ] as const;
@@ -32,6 +29,12 @@ export const SYSTEMONE_ONLY_MODELS: ReadonlySet<string> = new Set([
  */
 export const RETIRED_MODELS: ReadonlyArray<{ id: string; reason: string }> = [
   { id: "mimo-v2.5-free", reason: "Model no longer supported by upstream" },
+  { id: "ling-3.0-flash-fin-free", reason: "Model no longer supported by upstream" },
+  { id: "muse-spark-1.2-contributor-free", reason: "Model no longer supported by upstream" },
+  { id: "muse-spark-1.3-contributor-free", reason: "Model no longer supported by upstream" },
+  { id: "step-5-preview-free", reason: "Model no longer supported by upstream" },
+  { id: "space-bunny-free", reason: "Model no longer supported by upstream" },
+  { id: "ll-alpha-free", reason: "Model no longer supported by upstream" },
   { id: "deepseek-v4-flash-free", reason: "Model no longer offered as a free model by upstream" },
   { id: "hy3-free", reason: "Model no longer offered as a free model by upstream" },
   { id: "laguna-s-2.1-free", reason: "Model no longer offered as a free model by upstream" },

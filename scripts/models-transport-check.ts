@@ -6,7 +6,17 @@ import os from "node:os";
 import path from "node:path";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config/env.js";
-import { ModelConfigStore, type ModelConfig } from "../src/models/catalog.js";
+import { ModelConfigStore, RETIRED_MODELS, type ModelConfig } from "../src/models/catalog.js";
+
+const newlyRetiredIds = [
+  "mimo-v2.5-free",
+  "ling-3.0-flash-fin-free",
+  "muse-spark-1.2-contributor-free",
+  "muse-spark-1.3-contributor-free",
+  "step-5-preview-free",
+  "space-bunny-free",
+  "ll-alpha-free",
+];
 
 const tempDir = await mkdtemp(path.join(os.tmpdir(), "oph-models-transport-"));
 const originalFetch = globalThis.fetch;
@@ -32,19 +42,29 @@ const assertHeaders = (headers: Record<string, unknown>) => {
 try {
   const fresh = new ModelConfigStore(path.join(tempDir, "fresh-models.json"));
   fresh.load();
-  assert.equal(fresh.list().some((model) => model.id === "mimo-v2.5-free"), false);
+  for (const id of newlyRetiredIds) {
+    assert.ok(RETIRED_MODELS.some((model) => model.id === id), `${id} must be retired`);
+    assert.equal(fresh.list().some((model) => model.id === id), false, `${id} must not be a fresh default`);
+  }
+  assert.equal(new Set(RETIRED_MODELS.map((model) => model.id)).size, RETIRED_MODELS.length);
   assert.ok(fresh.list().filter((model) => model.id.startsWith("muse-")).every((model) => model.useResponses && model.responsesOnly));
-  const muse = "muse-spark-1.3-contributor-free";
+  const muse = "muse-current-free";
   const newMuse = "muse-future-free";
   await writeFile(config.modelsFile, JSON.stringify({ version: 1, models: [
-    { id: "mimo-v2.5-free", enabled: true, ownedBy: "saved-owner", created: 1, displayName: "Saved MiMo" },
+    ...newlyRetiredIds.map((id) => ({
+      id, enabled: id !== "muse-spark-1.2-contributor-free", ownedBy: "saved-owner", created: 1,
+      displayName: id === "mimo-v2.5-free" ? "Saved MiMo" : undefined,
+    })),
     { id: muse, enabled: true, ownedBy: "saved-owner", created: 2, useResponses: false },
-    { id: "muse-spark-1.2-contributor-free", enabled: false, ownedBy: "saved-owner", created: 3 },
   ] }));
   const built = await buildApp(config);
   app = built.app;
   const migrated = (JSON.parse(await readFile(config.modelsFile, "utf8")) as { models: ModelConfig[] }).models;
-  assert.equal(migrated.find((model) => model.id === "mimo-v2.5-free")?.enabled, false);
+  for (const id of newlyRetiredIds) {
+    const model = migrated.find((model) => model.id === id);
+    assert.equal(model?.enabled, false, `${id} must be disabled on startup`);
+    if (id !== "muse-spark-1.2-contributor-free") assert.match(model?.displayName || "", /\(retired:/);
+  }
   assert.match(migrated.find((model) => model.id === "mimo-v2.5-free")?.displayName || "", /^Saved MiMo \(retired:/);
   assert.equal(migrated.find((model) => model.id === muse)?.useResponses, true);
   assert.equal(migrated.find((model) => model.id === "muse-spark-1.2-contributor-free")?.enabled, false);
@@ -70,7 +90,8 @@ try {
   const afterRefused = ((await app.inject({ url: "/admin/models", headers: admin })).json().data as ModelConfig[]).find((model) => model.id === muse);
   assert.equal(afterRefused?.enabled, true, "Rejected protocol edits must not partially change the model");
   assert.equal(afterRefused?.useResponses, true);
-  console.log("[pass] fresh defaults omit retired MiMo; saved models migrate without changing Muse enabled states; Chat overrides are refused atomically");
+  assert.equal(migrated.find((model) => model.id === "muse-spark-1.2-contributor-free")?.displayName, undefined);
+  console.log("[pass] fresh defaults omit all seven retired models; startup disables saved retired models and preserves manual choices; Muse Chat overrides are refused atomically");
   await setModel("big-pickle", { enabled: false, useResponses: true, displayName: "My disabled model" });
   await setModel("custom-free", { enabled: true });
   await setSettings({ openAiStreamTransformModels: ["big-pickle"], reasoningTagModels: ["mimo-v2.5-free"] });
@@ -82,18 +103,27 @@ try {
     assert.equal(new Headers(init?.headers).get("accept-encoding"), "identity");
     syncRequests++;
     if (upstreamFails) return new Response("Unavailable", { status: 503 });
-    return Response.json({ data: ["big-pickle", "mimo-v2.5-free", "custom-free", "discovered-free", muse, newMuse, "deepseek-v4-flash-free", "paid-model"].map((id) => ({ id, owned_by: "updated-owner", created: 1234567890 })) });
+    return Response.json({ data: ["big-pickle", ...RETIRED_MODELS.map((model) => model.id), "custom-free", "discovered-free", muse, newMuse, "paid-model"].map((id) => ({ id, owned_by: "updated-owner", created: 1234567890 })) });
   };
   for (let i = 0; i < 2; i++) {
     const sync = await app.inject({ method: "POST", url: "/admin/models/sync-free", headers: admin });
     assert.equal(sync.statusCode, 200);
     assert.equal(sync.json().data.synced, 5);
-    assert.equal(sync.json().data.models.includes("mimo-v2.5-free"), false);
+    assert.deepEqual(sync.json().data.models, ["big-pickle", "custom-free", "discovered-free", muse, newMuse]);
     assertHeaders(sync.headers);
   }
   const catalog = (await app.inject({ url: "/admin/models", headers: admin })).json().data as ModelConfig[];
   assert.equal(catalog.find((m) => m.id === "big-pickle")?.enabled, false);
-  assert.equal(catalog.find((m) => m.id === "mimo-v2.5-free")?.enabled, false);
+  for (const id of newlyRetiredIds) {
+    const model = catalog.find((m) => m.id === id);
+    assert.equal(model?.enabled, false, `${id} must stay disabled after sync`);
+    assert.equal(model?.ownedBy, "saved-owner", `${id} metadata must not be synced`);
+    assert.equal(model?.created, 1);
+    assert.equal(model?.displayName, migrated.find((m) => m.id === id)?.displayName);
+  }
+  for (const { id } of RETIRED_MODELS) {
+    if (!newlyRetiredIds.includes(id)) assert.equal(catalog.some((m) => m.id === id), false, `${id} must not be imported`);
+  }
   assert.equal(catalog.find((m) => m.id === "big-pickle")?.useResponses, true);
   assert.equal(catalog.find((m) => m.id === "big-pickle")?.displayName, "My disabled model");
   assert.equal(catalog.find((m) => m.id === "big-pickle")?.ownedBy, "updated-owner");
@@ -114,7 +144,7 @@ try {
   const reloaded = new ModelConfigStore(config.modelsFile);
   reloaded.load();
   assert.equal(reloaded.isEnabled("big-pickle"), false);
-  assert.equal(reloaded.isEnabled("mimo-v2.5-free"), false);
+  for (const id of newlyRetiredIds) assert.equal(reloaded.isEnabled(id), false);
   assert.equal(reloaded.usesResponses("big-pickle"), true);
   assert.equal(reloaded.usesResponses(muse), true);
   assert.equal(reloaded.usesResponses(newMuse), true);
@@ -122,7 +152,9 @@ try {
   const publicModels = await app.inject({ url: "/v1/models" });
   assertHeaders(publicModels.headers);
   assert.equal(publicModels.json().data.some((m: ModelConfig) => m.id === "big-pickle"), false);
-  assert.equal(publicModels.json().data.some((m: ModelConfig) => m.id === "mimo-v2.5-free"), false);
+  for (const id of newlyRetiredIds) {
+    assert.equal(publicModels.json().data.some((m: ModelConfig) => m.id === id), false, `${id} must not be listed publicly`);
+  }
   upstreamFails = true;
   const failed = await app.inject({ method: "POST", url: "/admin/models/sync-free", headers: admin });
   assert.equal(failed.statusCode, 500);
